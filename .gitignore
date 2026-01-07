@@ -5,3 +5,5 @@ out
 .config.old
 klippy/.version
 dict
+_test_output*
+_test_.log

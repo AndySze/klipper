@@ -128,7 +128,7 @@ func writeActual(path string, srcTest string, mode string, sections []mcuSection
         switch mode {
         case "stub":
             // Keep the section empty on purpose; it's a placeholder contract.
-        case "roundtrip", "copy-expected":
+        case "roundtrip", "copy-expected", "parsedump", "encode-raw":
             for _, ln := range sec.lines {
                 ln = strings.TrimSpace(ln)
                 if ln == "" {
@@ -165,7 +165,7 @@ func main() {
         suite   = flag.String("suite", "../test/go_migration/suites/minimal.txt", "suite file")
         outdir  = flag.String("outdir", "../test/go_migration/golden", "golden directory")
         only    = flag.String("only", "", "only generate for a single test (path or stem)")
-        mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip")
+        mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw")
         dictdir = flag.String("dictdir", "../dict", "dictionary directory")
     )
     flag.Parse()
@@ -248,6 +248,73 @@ func main() {
                     outLines = append(outLines, decoded)
                 }
                 sections[i].lines = outLines
+            }
+            if err := writeActual(actual, testRel, *mode, sections); err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+        case "parsedump":
+            sections, err := parseExpectedSections(expected)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+            for i := range sections {
+                dictPath := filepath.Join(*dictdir, sections[i].dict)
+                dict, err := protocol.LoadDictionary(dictPath)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: load dict %s: %v\n", dictPath, err)
+                    os.Exit(2)
+                }
+
+                rawPath := filepath.Join(caseDir, fmt.Sprintf("raw-%s.bin", sections[i].name))
+                raw, err := os.ReadFile(rawPath)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: read raw %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+                lines, err := protocol.DecodeDebugOutput(dict, raw)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: decode %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+                sections[i].lines = lines
+            }
+            if err := writeActual(actual, testRel, *mode, sections); err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+        case "encode-raw":
+            sections, err := parseExpectedSections(expected)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+            for i := range sections {
+                dictPath := filepath.Join(*dictdir, sections[i].dict)
+                dict, err := protocol.LoadDictionary(dictPath)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: load dict %s: %v\n", dictPath, err)
+                    os.Exit(2)
+                }
+                raw, err := protocol.EncodeDebugOutputFromText(dict, sections[i].lines)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: encode raw: %v\n", err)
+                    os.Exit(2)
+                }
+
+                rawPath := filepath.Join(caseDir, fmt.Sprintf("raw-go-%s.bin", sections[i].name))
+                if err := os.WriteFile(rawPath, raw, 0o644); err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: write raw %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+
+                lines, err := protocol.DecodeDebugOutput(dict, raw)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: decode raw-go %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+                sections[i].lines = lines
             }
             if err := writeActual(actual, testRel, *mode, sections); err != nil {
                 fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)

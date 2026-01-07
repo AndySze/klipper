@@ -14,6 +14,7 @@ import difflib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -323,6 +324,9 @@ def gen_one(
             "_test_.gcode",
         ):
             p.unlink()
+    # Clean previous preserved raw outputs
+    for p in case_dir.glob("raw-*.bin"):
+        p.unlink()
 
     config_path = (test_path.parent / config_rel).resolve()
     if not config_path.exists():
@@ -401,6 +405,12 @@ def gen_one(
         dict_path = (dictdir / dict_fname).resolve()
         if not dict_path.exists():
             raise Fatal(f"missing dict file: {dict_path}")
+
+        # Preserve the raw binary output alongside the decoded text so that the
+        # Go side can re-decode it without needing Python's parsedump.
+        raw_out = case_dir / f"raw-{mcu_name}.bin"
+        shutil.copyfile(str(op), str(raw_out))
+
         parsed = run_capture(
             [
                 python,
@@ -439,7 +449,12 @@ def gen_one(
         "should_fail": should_fail,
         "return_code": proc.returncode,
         "outputs": [
-            {"mcu": s["mcu"], "dict": s["dict"], "file": s["output_file"]}
+            {
+                "mcu": s["mcu"],
+                "dict": s["dict"],
+                "file": s["output_file"],
+                "raw": f"raw-{s['mcu']}.bin",
+            }
             for s in sections
         ],
         "generator": {"script": "scripts/go_migration_golden.py"},

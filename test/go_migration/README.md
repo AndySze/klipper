@@ -35,6 +35,7 @@ From the repo root:
 Outputs are written under `test/go_migration/golden/<testname>/`:
 
 - `expected.txt` – normalized human-readable MCU commands
+- `raw-<mcu>.bin` – raw binary debugoutput (input for Go parsedump decoder)
 - `stderr.txt` / `stdout.txt` – captured Klippy output for debugging
 - `meta.json` – provenance (source test, config, dict mapping)
 
@@ -62,6 +63,38 @@ Then run:
 
 ```sh
 ./scripts/go_migration_golden.py compare
+```
+
+## Go parsedump decoder (raw.bin -> actual.txt)
+
+Once you have generated the Python goldens (which now also include
+`raw-<mcu>.bin` files), you can have Go decode the raw binary stream and write
+`actual.txt`:
+
+```sh
+mkdir -p out/go-build-cache out/go-path
+(cd go && GOCACHE="$PWD/../out/go-build-cache" GOPATH="$PWD/../out/go-path" \
+  go run ./cmd/klipper-go-golden -mode parsedump -dictdir ../dict)
+```
+
+Then compare:
+
+```sh
+./scripts/go_migration_golden.py compare --mode strict --fail-missing
+```
+
+## Go raw encoder (expected.txt -> raw-go.bin -> actual.txt)
+
+This mode encodes the human-readable `expected.txt` lines back into binary
+msgblocks (`raw-go-<mcu>.bin`), then decodes them again to produce `actual.txt`.
+It exercises both Go encoding and Go parsedump decoding without implementing
+host logic yet.
+
+```sh
+mkdir -p out/go-build-cache out/go-path
+(cd go && GOCACHE="$PWD/../out/go-build-cache" GOPATH="$PWD/../out/go-path" \
+  go run ./cmd/klipper-go-golden -mode encode-raw -dictdir ../dict)
+./scripts/go_migration_golden.py compare --mode strict --fail-missing
 ```
 
 To focus on a single case while iterating:

@@ -33,8 +33,14 @@ func TestVLQ_KnownEncodings(t *testing.T) {
         {31, []byte{0x1f}},
         {32, []byte{0x20}},
         {96, []byte{0x80, 0x60}},
+        {128, []byte{0x81, 0x00}},
+        {0x2000, []byte{0xc0, 0x00}},
+        {0x3000, []byte{0x80, 0xe0, 0x00}},
         {-1, []byte{0x7f}},
         {-32, []byte{0x60}},
+        {-33, []byte{0xff, 0x5f}},
+        {-4096, []byte{0xe0, 0x00}},
+        {-4097, []byte{0xff, 0xdf, 0x7f}},
     }
     for _, tc := range cases {
         out := []byte{}

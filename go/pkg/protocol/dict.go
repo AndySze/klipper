@@ -36,19 +36,30 @@ func LoadDictionary(path string) (*Dictionary, error) {
     for k, v := range raw {
         switch k {
         case "commands":
-            _ = decodeMsgIDMap(d.Commands, v)
+            if err := decodeMsgIDMap(d.Commands, v); err != nil {
+                return nil, err
+            }
         case "responses":
-            _ = decodeMsgIDMap(d.Responses, v)
+            if err := decodeMsgIDMap(d.Responses, v); err != nil {
+                return nil, err
+            }
         case "output":
-            _ = decodeMsgIDMap(d.Output, v)
+            if err := decodeMsgIDMap(d.Output, v); err != nil {
+                return nil, err
+            }
         case "enumerations":
-            _ = decodeEnums(d.Enumerations, v)
+            if err := decodeEnums(d.Enumerations, v); err != nil {
+                return nil, err
+            }
         }
     }
     return d, nil
 }
 
 func decodeMsgIDMap(dst map[string]int, v any) error {
+    if v == nil {
+        return nil
+    }
     m, ok := v.(map[string]any)
     if !ok {
         return fmt.Errorf("expected object for messages")
@@ -66,6 +77,9 @@ func decodeMsgIDMap(dst map[string]int, v any) error {
 
 // decodeEnums supports both simple values and ranges like [start,count].
 func decodeEnums(dst map[string]map[string]int, v any) error {
+    if v == nil {
+        return nil
+    }
     m, ok := v.(map[string]any)
     if !ok {
         return fmt.Errorf("expected object for enumerations")
@@ -213,7 +227,7 @@ func parseFormat(msgformat string, enums map[string]map[string]int) (names []str
             pt = ptInt{}
         case "%c":
             pt = ptByte{}
-        case "%.*s", "%*s":
+        case "%s", "%.*s", "%*s":
             pt = ptBuffer{}
         default:
             pt = ptUint{} // fallback

@@ -108,8 +108,24 @@ automated changes by coding agents). It is intentionally separate from:
 
 ### 2026-01-07 — Add unit tests for Go protocol package
 
-- Summary: Added Go unit tests covering VLQ encoding, CRC16, msgblock framing, and encode/decode command roundtrips.
+- Summary: Added Go unit tests covering VLQ encoding (incl. boundary vectors), CRC16, msgblock framing, command encode/decode roundtrips, and enum/buffer literal helpers.
 - Rationale: Lock in protocol behavior before expanding Go host functionality.
 - User-visible impact: None (developer tooling).
 - Notable files/areas: `go/pkg/protocol/*_test.go`.
 - Validation: `cd go && GOCACHE=../out/go-build-cache GOPATH=../out/go-path go test ./...`.
+
+### 2026-01-07 — Add Go parsedump-equivalent decoder (raw debugoutput -> text)
+
+- Summary: Saved raw `_test_output` binaries during golden generation and added a Go decoder that reproduces `klippy/parsedump.py` text output from those binaries.
+- Rationale: Turn the Go harness from “roundtrip the expected text” into a real equivalence gate on the binary protocol stream.
+- User-visible impact: None (developer tooling).
+- Notable files/areas: `scripts/go_migration_golden.py`, `go/pkg/protocol/parsedump.go`, `go/cmd/klipper-go-golden/main.go`, `test/go_migration/README.md`.
+- Validation: `./scripts/go_migration_golden.py gen --dictdir dict --suite test/go_migration/suites/minimal.txt`, then `cd go && GOCACHE=../out/go-build-cache GOPATH=../out/go-path go run ./cmd/klipper-go-golden -mode parsedump`, then `./scripts/go_migration_golden.py compare --mode strict --fail-missing`.
+
+### 2026-01-07 — Add Go raw encoder (text -> msgblocks)
+
+- Summary: Added a Go encoder that packs parsedump-style message lines into msgblocks and writes `raw-go-<mcu>.bin`; `klipper-go-golden -mode encode-raw` now exercises encode+decode end-to-end.
+- Rationale: Validate Go-side msg framing and stream encoding before any host logic is ported.
+- User-visible impact: None (developer tooling).
+- Notable files/areas: `go/pkg/protocol/rawencode.go`, `go/cmd/klipper-go-golden/main.go`, `test/go_migration/README.md`.
+- Validation: `cd go && GOCACHE=../out/go-build-cache GOPATH=../out/go-path go run ./cmd/klipper-go-golden -mode encode-raw`, then `./scripts/go_migration_golden.py compare --mode strict --fail-missing`.
