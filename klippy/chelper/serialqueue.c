@@ -12,7 +12,16 @@
 // clock times, prioritizes commands, and handles retransmissions.  A
 // background thread is launched to do this work and minimize latency.
 
-#include <linux/can.h> // // struct can_frame
+#if defined(__linux__)
+#include <linux/can.h> // struct can_frame
+#else
+#include <stdint.h> // uint32_t
+struct can_frame {
+    uint32_t can_id;
+    uint8_t can_dlc;
+    uint8_t data[8];
+};
+#endif
 #include <math.h> // fabs
 #include <pthread.h> // pthread_mutex_lock
 #include <stddef.h> // offsetof

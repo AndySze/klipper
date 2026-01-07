@@ -10,16 +10,26 @@
 #include <stdio.h> // fprintf
 #include <string.h> // strerror
 #include <time.h> // struct timespec
-#include <sys/prctl.h>  // prctl
+#if defined(__linux__)
+#include <sys/prctl.h> // prctl
+#elif defined(__APPLE__)
+#include <pthread.h> // pthread_setname_np
+#endif
 #include "compiler.h" // __visible
 #include "pyhelper.h" // get_monotonic
+
+#if defined(CLOCK_MONOTONIC_RAW)
+#define KLIPPER_CLOCK_MONOTONIC CLOCK_MONOTONIC_RAW
+#else
+#define KLIPPER_CLOCK_MONOTONIC CLOCK_MONOTONIC
+#endif
 
 // Return the monotonic system time as a double
 double __visible
 get_monotonic(void)
 {
     struct timespec ts;
-    int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    int ret = clock_gettime(KLIPPER_CLOCK_MONOTONIC, &ts);
     if (ret) {
         report_errno("clock_gettime", ret);
         return 0.;
@@ -98,5 +108,13 @@ dump_string(char *outbuf, int outbuf_size, char *inbuf, int inbuf_size)
 int __visible
 set_thread_name(char name[16])
 {
+#if defined(__linux__)
     return prctl(PR_SET_NAME, name);
+#elif defined(__APPLE__)
+    name[15] = '\0';
+    return pthread_setname_np(name);
+#else
+    (void)name;
+    return 0;
+#endif
 }

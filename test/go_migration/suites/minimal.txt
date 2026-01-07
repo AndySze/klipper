@@ -1,0 +1,27 @@
+# Minimal baseline suite for Phase 0
+#
+# These are existing Klipper regression tests that:
+# - use a single CONFIG
+# - are small and stable
+# - cover basic motion/commands and an error path
+
+test/klippy/commands.test
+test/klippy/out_of_bounds.test
+test/klippy/gcode_arcs.test
+
+# Motion / planning / kinematics
+test/klippy/bed_screws.test
+
+# Extrusion
+test/klippy/extruders.test
+test/klippy/pressure_advance.test
+
+# Homing / probes / steppers
+test/klippy/manual_stepper.test
+test/klippy/bltouch.test
+
+# Temperature sensors (linux process mcu)
+test/klippy/linuxtest.test
+
+# Macros / templates
+test/klippy/macros.test

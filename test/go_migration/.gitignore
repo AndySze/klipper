@@ -1,0 +1,5 @@
+# Keep the scaffolding, ignore generated artifacts.
+
+# Work directories created by the generator
+golden/**/*
+!golden/README.md
