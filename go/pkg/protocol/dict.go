@@ -15,6 +15,7 @@ type Dictionary struct {
     Responses    map[string]int            `json:"responses"`
     Output       map[string]int            `json:"output"`
     Enumerations map[string]map[string]int `json:"enumerations"`
+    Config       map[string]any            `json:"config"`
 }
 
 // LoadDictionary reads a Klipper dict JSON file.
@@ -32,6 +33,7 @@ func LoadDictionary(path string) (*Dictionary, error) {
         Responses:    map[string]int{},
         Output:       map[string]int{},
         Enumerations: map[string]map[string]int{},
+        Config:       map[string]any{},
     }
     for k, v := range raw {
         switch k {
@@ -49,6 +51,10 @@ func LoadDictionary(path string) (*Dictionary, error) {
             }
         case "enumerations":
             if err := decodeEnums(d.Enumerations, v); err != nil {
+                return nil, err
+            }
+        case "config":
+            if err := decodeConfig(d.Config, v); err != nil {
                 return nil, err
             }
         }
@@ -126,6 +132,20 @@ func decodeEnums(dst map[string]map[string]int, v any) error {
                 return fmt.Errorf("bad enum value for %s: %T", key, val)
             }
         }
+    }
+    return nil
+}
+
+func decodeConfig(dst map[string]any, v any) error {
+    if v == nil {
+        return nil
+    }
+    m, ok := v.(map[string]any)
+    if !ok {
+        return fmt.Errorf("expected object for config")
+    }
+    for k, vv := range m {
+        dst[k] = vv
     }
     return nil
 }

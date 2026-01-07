@@ -101,6 +101,13 @@ func TestParseBufferLiteral(t *testing.T) {
     if string(b) != "A\n" {
         t.Fatalf("got %q want %q", string(b), "A\\n")
     }
+    b, err = parseBufferLiteral("313233")
+    if err != nil {
+        t.Fatalf("parseBufferLiteral hex: %v", err)
+    }
+    if string(b) != "123" {
+        t.Fatalf("got %q want %q", string(b), "123")
+    }
     if _, err := parseBufferLiteral("b\"unterminated"); err == nil {
         t.Fatalf("expected error for unterminated literal")
     }

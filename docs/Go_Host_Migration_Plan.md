@@ -198,6 +198,9 @@ Go Host 必须实现 `docs/API_Server.md` 中的 UDS JSON 协议（对象列表�
 
 - 实现/复刻数据字典解析（对应 `msgproto` 概念）
 - 实现消息块编码/解码（CRC、VLQ、sequence、重传/ack）
+
+> 进度提示：本地已落地 Phase 0/Phase 1 的关键工具链（golden + Go 协议包 + Go parsedump/encoder）。
+> 进入“真正 Host 迁移”的近期工作拆分见：`docs/Go_Host_Migration_Workplan.md`。
 - 实现 MCU 配置流程（`get_config`、`allocate_oids`、`config_*`、`finalize_config` 的最小子集）
 - clocksync：实现 print time / MCU clock / system time 转换与漂移处理（至少单 MCU）
 

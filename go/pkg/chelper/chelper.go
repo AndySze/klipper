@@ -1,0 +1,406 @@
+package chelper
+
+/*
+#cgo CFLAGS: -I${SRCDIR}/../../../klippy/chelper
+#cgo LDFLAGS: ${SRCDIR}/../../../klippy/chelper/c_helper.so
+
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "serialqueue.h"
+#include "itersolve.h"
+#include "steppersync.h"
+#include "stepcompress.h"
+#include "trapq.h"
+
+// kin_cartesian.c does not provide a public header; declare the symbol.
+struct stepper_kinematics *cartesian_stepper_alloc(char axis);
+*/
+import "C"
+
+import (
+    "fmt"
+    "strings"
+    "unsafe"
+)
+
+type SerialQueue struct {
+    ptr *C.struct_serialqueue
+}
+
+type CommandQueue struct {
+    ptr *C.struct_command_queue
+}
+
+type StepperSyncMgr struct {
+    ptr *C.struct_steppersyncmgr
+}
+
+type StepperSync struct {
+    ptr *C.struct_steppersync
+}
+
+type SyncEmitter struct {
+    ptr *C.struct_syncemitter
+}
+
+type Stepcompress struct {
+    ptr *C.struct_stepcompress
+}
+
+type TrapQ struct {
+    ptr *C.struct_trapq
+}
+
+type StepperKinematics struct {
+    ptr *C.struct_stepper_kinematics
+}
+
+type SerialStats struct {
+    BytesWrite    uint64
+    BytesRead     uint64
+    BytesInvalid  uint64
+    SendSeq       uint64
+    ReceiveSeq    uint64
+    ReadyBytes    uint64
+    UpcomingBytes uint64
+    Raw           string
+}
+
+func NewSerialQueue(fd int, fdType byte, clientID int, name string) (*SerialQueue, error) {
+    var cname [16]C.char
+    nb := []byte(name)
+    if len(nb) > 15 {
+        nb = nb[:15]
+    }
+    for i := 0; i < len(nb); i++ {
+        cname[i] = C.char(nb[i])
+    }
+    sq := C.serialqueue_alloc(C.int(fd), C.char(fdType), C.int(clientID), &cname[0])
+    if sq == nil {
+        return nil, fmt.Errorf("serialqueue_alloc failed")
+    }
+    return &SerialQueue{ptr: sq}, nil
+}
+
+func (sq *SerialQueue) SetClockEst(estFreq float64, convTime float64, convClock uint64, lastClock uint64) {
+    C.serialqueue_set_clock_est(sq.ptr, C.double(estFreq), C.double(convTime), C.uint64_t(convClock), C.uint64_t(lastClock))
+}
+
+func (sq *SerialQueue) GetStats() (SerialStats, error) {
+    if sq == nil || sq.ptr == nil {
+        return SerialStats{}, fmt.Errorf("serialqueue is nil")
+    }
+    buf := make([]byte, 4096)
+    C.serialqueue_get_stats(sq.ptr, (*C.char)(unsafe.Pointer(&buf[0])), C.int(len(buf)))
+    raw := string(buf)
+    if i := strings.IndexByte(raw, 0); i >= 0 {
+        raw = raw[:i]
+    }
+    s := SerialStats{Raw: strings.TrimSpace(raw)}
+    fields := strings.Fields(s.Raw)
+    for _, f := range fields {
+        kv := strings.SplitN(f, "=", 2)
+        if len(kv) != 2 {
+            continue
+        }
+        key, val := kv[0], kv[1]
+        var n uint64
+        for i := 0; i < len(val); i++ {
+            c := val[i]
+            if c < '0' || c > '9' {
+                n = 0
+                break
+            }
+            n = n*10 + uint64(c-'0')
+        }
+        switch key {
+        case "bytes_write":
+            s.BytesWrite = n
+        case "bytes_read":
+            s.BytesRead = n
+        case "bytes_invalid":
+            s.BytesInvalid = n
+        case "send_seq":
+            s.SendSeq = n
+        case "receive_seq":
+            s.ReceiveSeq = n
+        case "ready_bytes":
+            s.ReadyBytes = n
+        case "upcoming_bytes":
+            s.UpcomingBytes = n
+        }
+    }
+    return s, nil
+}
+
+func (sq *SerialQueue) Free() {
+    if sq == nil || sq.ptr == nil {
+        return
+    }
+    C.serialqueue_free(sq.ptr)
+    sq.ptr = nil
+}
+
+func NewCommandQueue() *CommandQueue {
+    cq := C.serialqueue_alloc_commandqueue()
+    if cq == nil {
+        return nil
+    }
+    return &CommandQueue{ptr: cq}
+}
+
+func (cq *CommandQueue) Free() {
+    if cq == nil || cq.ptr == nil {
+        return
+    }
+    C.serialqueue_free_commandqueue(cq.ptr)
+    cq.ptr = nil
+}
+
+func (sq *SerialQueue) Send(cq *CommandQueue, msg []byte, minClock uint64, reqClock uint64) error {
+    if sq == nil || sq.ptr == nil {
+        return fmt.Errorf("serialqueue is nil")
+    }
+    if cq == nil || cq.ptr == nil {
+        return fmt.Errorf("command queue is nil")
+    }
+    if len(msg) == 0 {
+        return nil
+    }
+    C.serialqueue_send(
+        sq.ptr,
+        cq.ptr,
+        (*C.uint8_t)(unsafe.Pointer(&msg[0])),
+        C.int(len(msg)),
+        C.uint64_t(minClock),
+        C.uint64_t(reqClock),
+        0,
+    )
+    return nil
+}
+
+func (sq *SerialQueue) Ptr() *C.struct_serialqueue { return sq.ptr }
+
+func NewStepperSyncMgr() (*StepperSyncMgr, error) {
+    ssm := C.steppersyncmgr_alloc()
+    if ssm == nil {
+        return nil, fmt.Errorf("steppersyncmgr_alloc failed")
+    }
+    return &StepperSyncMgr{ptr: ssm}, nil
+}
+
+func (ssm *StepperSyncMgr) Free() {
+    if ssm == nil || ssm.ptr == nil {
+        return
+    }
+    C.steppersyncmgr_free(ssm.ptr)
+    ssm.ptr = nil
+}
+
+func (ssm *StepperSyncMgr) AllocStepperSync() (*StepperSync, error) {
+    if ssm == nil || ssm.ptr == nil {
+        return nil, fmt.Errorf("steppersyncmgr is nil")
+    }
+    ss := C.steppersyncmgr_alloc_steppersync(ssm.ptr)
+    if ss == nil {
+        return nil, fmt.Errorf("steppersyncmgr_alloc_steppersync failed")
+    }
+    return &StepperSync{ptr: ss}, nil
+}
+
+func (ss *StepperSync) SetupMoveQueue(sq *SerialQueue, moveNum int) error {
+    if ss == nil || ss.ptr == nil {
+        return fmt.Errorf("steppersync is nil")
+    }
+    if sq == nil || sq.ptr == nil {
+        return fmt.Errorf("serialqueue is nil")
+    }
+    C.steppersync_setup_movequeue(ss.ptr, sq.ptr, C.int(moveNum))
+    return nil
+}
+
+func (ss *StepperSync) SetTime(timeOffset float64, mcuFreq float64) error {
+    if ss == nil || ss.ptr == nil {
+        return fmt.Errorf("steppersync is nil")
+    }
+    C.steppersync_set_time(ss.ptr, C.double(timeOffset), C.double(mcuFreq))
+    return nil
+}
+
+func (ss *StepperSync) AllocSyncEmitter(name string, allocStepcompress bool) (*SyncEmitter, error) {
+    if ss == nil || ss.ptr == nil {
+        return nil, fmt.Errorf("steppersync is nil")
+    }
+    var cname [16]C.char
+    nb := []byte(name)
+    if len(nb) > 15 {
+        nb = nb[:15]
+    }
+    for i := 0; i < len(nb); i++ {
+        cname[i] = C.char(nb[i])
+    }
+    alloc := 0
+    if allocStepcompress {
+        alloc = 1
+    }
+    se := C.steppersync_alloc_syncemitter(ss.ptr, &cname[0], C.int(alloc))
+    if se == nil {
+        return nil, fmt.Errorf("steppersync_alloc_syncemitter failed")
+    }
+    return &SyncEmitter{ptr: se}, nil
+}
+
+func (se *SyncEmitter) GetStepcompress() *Stepcompress {
+    if se == nil || se.ptr == nil {
+        return nil
+    }
+    sc := C.syncemitter_get_stepcompress(se.ptr)
+    if sc == nil {
+        return nil
+    }
+    return &Stepcompress{ptr: sc}
+}
+
+func (se *SyncEmitter) SetStepperKinematics(sk *StepperKinematics) error {
+    if se == nil || se.ptr == nil {
+        return fmt.Errorf("syncemitter is nil")
+    }
+    if sk == nil || sk.ptr == nil {
+        return fmt.Errorf("stepper kinematics is nil")
+    }
+    C.syncemitter_set_stepper_kinematics(se.ptr, sk.ptr)
+    return nil
+}
+
+func (ssm *StepperSyncMgr) GenSteps(flushTime float64, genStepsTime float64, clearHistoryTime float64) error {
+    if ssm == nil || ssm.ptr == nil {
+        return fmt.Errorf("steppersyncmgr is nil")
+    }
+    ret := C.steppersyncmgr_gen_steps(ssm.ptr, C.double(flushTime), C.double(genStepsTime), C.double(clearHistoryTime))
+    if ret != 0 {
+        return fmt.Errorf("steppersyncmgr_gen_steps returned %d", int32(ret))
+    }
+    return nil
+}
+
+func NewTrapQ() (*TrapQ, error) {
+    tq := C.trapq_alloc()
+    if tq == nil {
+        return nil, fmt.Errorf("trapq_alloc failed")
+    }
+    return &TrapQ{ptr: tq}, nil
+}
+
+func (tq *TrapQ) Free() {
+    if tq == nil || tq.ptr == nil {
+        return
+    }
+    C.trapq_free(tq.ptr)
+    tq.ptr = nil
+}
+
+func (tq *TrapQ) Append(
+    printTime float64,
+    accelT float64,
+    cruiseT float64,
+    decelT float64,
+    x float64,
+    y float64,
+    z float64,
+    axisRx float64,
+    axisRy float64,
+    axisRz float64,
+    startV float64,
+    cruiseV float64,
+    accel float64,
+) {
+    C.trapq_append(
+        tq.ptr,
+        C.double(printTime),
+        C.double(accelT),
+        C.double(cruiseT),
+        C.double(decelT),
+        C.double(x),
+        C.double(y),
+        C.double(z),
+        C.double(axisRx),
+        C.double(axisRy),
+        C.double(axisRz),
+        C.double(startV),
+        C.double(cruiseV),
+        C.double(accel),
+    )
+}
+
+func (tq *TrapQ) SetPosition(printTime float64, x float64, y float64, z float64) {
+    C.trapq_set_position(tq.ptr, C.double(printTime), C.double(x), C.double(y), C.double(z))
+}
+
+func (tq *TrapQ) FinalizeMoves(freeTime float64, clearHistoryTime float64) {
+    C.trapq_finalize_moves(tq.ptr, C.double(freeTime), C.double(clearHistoryTime))
+}
+
+func NewCartesianStepperKinematics(axis byte) (*StepperKinematics, error) {
+    sk := C.cartesian_stepper_alloc(C.char(axis))
+    if sk == nil {
+        return nil, fmt.Errorf("cartesian_stepper_alloc failed")
+    }
+    return &StepperKinematics{ptr: sk}, nil
+}
+
+func (sk *StepperKinematics) Free() {
+    if sk == nil || sk.ptr == nil {
+        return
+    }
+    C.free(unsafe.Pointer(sk.ptr))
+    sk.ptr = nil
+}
+
+func (sk *StepperKinematics) SetTrapQ(tq *TrapQ, stepDist float64) {
+    var tp *C.struct_trapq
+    if tq != nil {
+        tp = tq.ptr
+    }
+    C.itersolve_set_trapq(sk.ptr, tp, C.double(stepDist))
+}
+
+func (sk *StepperKinematics) GetTrapQ() *TrapQ {
+    tq := C.itersolve_get_trapq(sk.ptr)
+    if tq == nil {
+        return nil
+    }
+    return &TrapQ{ptr: tq}
+}
+
+func (sk *StepperKinematics) SetPosition(x float64, y float64, z float64) {
+    C.itersolve_set_position(sk.ptr, C.double(x), C.double(y), C.double(z))
+}
+
+func (sk *StepperKinematics) GetCommandedPos() float64 {
+    return float64(C.itersolve_get_commanded_pos(sk.ptr))
+}
+
+func (sk *StepperKinematics) CheckActive(flushTime float64) float64 {
+    return float64(C.itersolve_check_active(sk.ptr, C.double(flushTime)))
+}
+
+func (sc *Stepcompress) Fill(oid uint32, maxError uint32, queueStepTag int32, setDirTag int32) error {
+    if sc == nil || sc.ptr == nil {
+        return fmt.Errorf("stepcompress is nil")
+    }
+    C.stepcompress_fill(sc.ptr, C.uint32_t(oid), C.uint32_t(maxError), C.int32_t(queueStepTag), C.int32_t(setDirTag))
+    return nil
+}
+
+func (sc *Stepcompress) SetInvertSdir(invert bool) error {
+    if sc == nil || sc.ptr == nil {
+        return fmt.Errorf("stepcompress is nil")
+    }
+    v := C.uint32_t(0)
+    if invert {
+        v = 1
+    }
+    C.stepcompress_set_invert_sdir(sc.ptr, v)
+    return nil
+}

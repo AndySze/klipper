@@ -122,7 +122,28 @@ func parseBufferLiteral(raw string) ([]byte, error) {
         body := raw[2 : len(raw)-1]
         return parsePythonBytesBody(body)
     }
-    return nil, fmt.Errorf("unsupported buffer literal %q", raw)
+    // Klipper msgproto uses hex strings for dynamic buffers in command text
+    // (see msgproto.MessageParser._parse_buffer()).
+    if raw == "" {
+        return []byte{}, nil
+    }
+    hexRaw := raw
+    if strings.HasPrefix(hexRaw, "0x") || strings.HasPrefix(hexRaw, "0X") {
+        hexRaw = hexRaw[2:]
+    }
+    if len(hexRaw)%2 != 0 {
+        return nil, fmt.Errorf("odd-length hex buffer")
+    }
+    out := make([]byte, len(hexRaw)/2)
+    for i := 0; i < len(out); i++ {
+        hi, ok1 := fromHex(hexRaw[i*2])
+        lo, ok2 := fromHex(hexRaw[i*2+1])
+        if !ok1 || !ok2 {
+            return nil, fmt.Errorf("invalid hex buffer")
+        }
+        out[i] = byte(hi<<4 | lo)
+    }
+    return out, nil
 }
 
 func parsePythonBytesBody(body string) ([]byte, error) {

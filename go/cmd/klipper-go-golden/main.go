@@ -12,6 +12,9 @@ import (
     "sort"
     "strings"
 
+    "klipper-go-migration/pkg/hosth1"
+    "klipper-go-migration/pkg/hosth2"
+    "klipper-go-migration/pkg/hosth3"
     "klipper-go-migration/pkg/protocol"
 )
 
@@ -93,6 +96,36 @@ func parseExpectedSections(path string) ([]mcuSection, error) {
     return final, nil
 }
 
+func parseExpectedHeader(path string) (string, string, error) {
+    f, err := os.Open(path)
+    if err != nil {
+        return "", "", err
+    }
+    defer f.Close()
+
+    src := ""
+    cfg := ""
+    s := bufio.NewScanner(f)
+    for s.Scan() {
+        ln := strings.TrimSpace(s.Text())
+        if strings.HasPrefix(ln, "## MCU:") {
+            break
+        }
+        if strings.HasPrefix(ln, "# Source:") {
+            src = strings.TrimSpace(strings.TrimPrefix(ln, "# Source:"))
+        } else if strings.HasPrefix(ln, "# Config:") {
+            cfg = strings.TrimSpace(strings.TrimPrefix(ln, "# Config:"))
+        }
+    }
+    if err := s.Err(); err != nil {
+        return "", "", err
+    }
+    if src == "" || cfg == "" {
+        return "", "", fmt.Errorf("missing # Source/# Config in %s", path)
+    }
+    return src, cfg, nil
+}
+
 func writeActual(path string, srcTest string, mode string, sections []mcuSection) error {
     dir := filepath.Dir(path)
     if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -128,7 +161,7 @@ func writeActual(path string, srcTest string, mode string, sections []mcuSection
         switch mode {
         case "stub":
             // Keep the section empty on purpose; it's a placeholder contract.
-        case "roundtrip", "copy-expected", "parsedump", "encode-raw":
+        case "roundtrip", "copy-expected", "parsedump", "encode-raw", "host-h1", "host-h2", "host-h3":
             for _, ln := range sec.lines {
                 ln = strings.TrimSpace(ln)
                 if ln == "" {
@@ -165,7 +198,7 @@ func main() {
         suite   = flag.String("suite", "../test/go_migration/suites/minimal.txt", "suite file")
         outdir  = flag.String("outdir", "../test/go_migration/golden", "golden directory")
         only    = flag.String("only", "", "only generate for a single test (path or stem)")
-        mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw")
+        mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw|host-h1|host-h2|host-h3")
         dictdir = flag.String("dictdir", "../dict", "dictionary directory")
     )
     flag.Parse()
@@ -312,6 +345,154 @@ func main() {
                 lines, err := protocol.DecodeDebugOutput(dict, raw)
                 if err != nil {
                     fmt.Fprintf(os.Stderr, "ERROR: decode raw-go %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+                sections[i].lines = lines
+            }
+            if err := writeActual(actual, testRel, *mode, sections); err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+        case "host-h1":
+            srcTest, cfgRel, err := parseExpectedHeader(expected)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+            sections, err := parseExpectedSections(expected)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+
+            testPath := filepath.Clean(filepath.Join("..", srcTest))
+            cfgPath := filepath.Clean(filepath.Join(filepath.Dir(testPath), cfgRel))
+
+            for i := range sections {
+                dictPath := filepath.Join(*dictdir, sections[i].dict)
+                dict, err := protocol.LoadDictionary(dictPath)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: load dict %s: %v\n", dictPath, err)
+                    os.Exit(2)
+                }
+                var compiled []string
+                switch filepath.Base(cfgPath) {
+                case "example-cartesian.cfg":
+                    compiled, err = hosth1.CompileExampleCartesianConnectPhase(cfgPath, dict)
+                case "linuxtest.cfg":
+                    compiled, err = hosth1.CompileLinuxTestConnectPhase(cfgPath, dict)
+                default:
+                    fmt.Fprintf(os.Stderr, "ERROR: host-h1 only supports example-cartesian.cfg or linuxtest.cfg (got %s)\n", cfgPath)
+                    os.Exit(2)
+                }
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: compile H1: %v\n", err)
+                    os.Exit(2)
+                }
+                raw, err := protocol.EncodeDebugOutputFromText(dict, compiled)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: encode raw: %v\n", err)
+                    os.Exit(2)
+                }
+                rawPath := filepath.Join(caseDir, fmt.Sprintf("raw-host-h1-%s.bin", sections[i].name))
+                if err := os.WriteFile(rawPath, raw, 0o644); err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: write raw %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+                lines, err := protocol.DecodeDebugOutput(dict, raw)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: decode raw %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+                sections[i].lines = lines
+            }
+            if err := writeActual(actual, testRel, *mode, sections); err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+        case "host-h2":
+            srcTest, cfgRel, err := parseExpectedHeader(expected)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+            sections, err := parseExpectedSections(expected)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+
+            testPath := filepath.Clean(filepath.Join("..", srcTest))
+            cfgPath := filepath.Clean(filepath.Join(filepath.Dir(testPath), cfgRel))
+
+            for i := range sections {
+                dictPath := filepath.Join(*dictdir, sections[i].dict)
+                dict, err := protocol.LoadDictionary(dictPath)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: load dict %s: %v\n", dictPath, err)
+                    os.Exit(2)
+                }
+                compiled, err := hosth2.CompileHostH2(cfgPath, testPath, dict)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: compile H2: %v\n", err)
+                    os.Exit(2)
+                }
+                raw, err := protocol.EncodeDebugOutputFromText(dict, compiled)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: encode raw: %v\n", err)
+                    os.Exit(2)
+                }
+                rawPath := filepath.Join(caseDir, fmt.Sprintf("raw-host-h2-%s.bin", sections[i].name))
+                if err := os.WriteFile(rawPath, raw, 0o644); err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: write raw %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+                lines, err := protocol.DecodeDebugOutput(dict, raw)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: decode raw %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+                sections[i].lines = lines
+            }
+            if err := writeActual(actual, testRel, *mode, sections); err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+        case "host-h3":
+            srcTest, cfgRel, err := parseExpectedHeader(expected)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+            sections, err := parseExpectedSections(expected)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+                os.Exit(2)
+            }
+
+            testPath := filepath.Clean(filepath.Join("..", srcTest))
+            cfgPath := filepath.Clean(filepath.Join(filepath.Dir(testPath), cfgRel))
+
+            for i := range sections {
+                dictPath := filepath.Join(*dictdir, sections[i].dict)
+                dict, err := protocol.LoadDictionary(dictPath)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: load dict %s: %v\n", dictPath, err)
+                    os.Exit(2)
+                }
+                raw, err := hosth3.CompileHostH3(cfgPath, testPath, dict)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: compile H3: %v\n", err)
+                    os.Exit(2)
+                }
+                rawPath := filepath.Join(caseDir, fmt.Sprintf("raw-host-h3-%s.bin", sections[i].name))
+                if err := os.WriteFile(rawPath, raw, 0o644); err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: write raw %s: %v\n", rawPath, err)
+                    os.Exit(2)
+                }
+                lines, err := protocol.DecodeDebugOutput(dict, raw)
+                if err != nil {
+                    fmt.Fprintf(os.Stderr, "ERROR: decode raw %s: %v\n", rawPath, err)
                     os.Exit(2)
                 }
                 sections[i].lines = lines

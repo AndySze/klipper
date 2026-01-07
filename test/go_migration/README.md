@@ -97,6 +97,41 @@ mkdir -p out/go-build-cache out/go-path
 ./scripts/go_migration_golden.py compare --mode strict --fail-missing
 ```
 
+## Go Host H1 (connect-phase config compiler)
+
+This mode is the first “real host” step: it reads the Klipper config and
+generates the **connect-phase** MCU command stream (allocate/config/finalize +
+init ADC/PWM scheduling), writes `raw-host-h1-<mcu>.bin`, decodes it, and writes
+`actual.txt`.
+
+Current scope: supports:
+
+- `config/example-cartesian.cfg` (gated by `test/klippy/commands.test`)
+- `test/klippy/linuxtest.cfg` (gated by `test/klippy/linuxtest.test`)
+
+```sh
+mkdir -p out/go-build-cache out/go-path
+(cd go && GOCACHE="$PWD/../out/go-build-cache" GOPATH="$PWD/../out/go-path" \
+  go run ./cmd/klipper-go-golden -mode host-h1 -only commands -dictdir ../dict)
+./scripts/go_migration_golden.py compare --only commands --mode strict --fail-missing
+```
+
+## Go Host H2 (minimal gcode execution)
+
+This mode extends H1 by executing the `.test` file gcode after connect-phase
+compilation. Current scope is intentionally tiny:
+
+- Supports `test/klippy/linuxtest.test` (`G4 P...` and `G4 S...`)
+- Supports `test/klippy/commands.test` (broad command list, currently treated as no-op stubs)
+- Does not yet emit additional runtime MCU messages (time advances + no-op handlers only)
+
+```sh
+mkdir -p out/go-build-cache out/go-path
+(cd go && GOCACHE="$PWD/../out/go-build-cache" GOPATH="$PWD/../out/go-path" \
+  go run ./cmd/klipper-go-golden -mode host-h2 -only linuxtest -dictdir ../dict)
+./scripts/go_migration_golden.py compare --only linuxtest --mode strict --fail-missing
+```
+
 To focus on a single case while iterating:
 
 ```sh

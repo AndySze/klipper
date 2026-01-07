@@ -129,3 +129,35 @@ automated changes by coding agents). It is intentionally separate from:
 - User-visible impact: None (developer tooling).
 - Notable files/areas: `go/pkg/protocol/rawencode.go`, `go/cmd/klipper-go-golden/main.go`, `test/go_migration/README.md`.
 - Validation: `cd go && GOCACHE=../out/go-build-cache GOPATH=../out/go-path go run ./cmd/klipper-go-golden -mode encode-raw`, then `./scripts/go_migration_golden.py compare --mode strict --fail-missing`.
+
+### 2026-01-07 — Add Host migration workplan (entering real Host phase)
+
+- Summary: Added a concrete, milestone-based work plan for starting the real Host migration (cfg parsing → connect-phase config compilation → minimal gcode → motion pipeline → hardware loop).
+- Rationale: Keep the post-protocol work scoped, test-gated, and incremental instead of attempting a “big bang” host rewrite.
+- User-visible impact: None (documentation-only).
+- Notable files/areas: `docs/Go_Host_Migration_Workplan.md`, `docs/Go_Host_Migration_Plan.md`.
+- Validation: N/A (documentation-only change).
+
+### 2026-01-07 — Implement Host H1 connect-phase compiler (example-cartesian)
+
+- Summary: Added a minimal Go “host H1” compiler that reads configs and emits the connect-phase MCU command stream; wired it into `klipper-go-golden -mode host-h1` and validated against `commands.test` and `linuxtest.test`.
+- Rationale: Start migrating real host behavior with a narrow, test-gated milestone (cfg parsing + connect-phase config/init output) before tackling gcode execution and motion planning.
+- User-visible impact: None (developer tooling).
+- Notable files/areas: `go/pkg/hosth1/h1.go`, `go/cmd/klipper-go-golden/main.go`, `go/pkg/protocol/dict.go`, `test/go_migration/README.md`.
+- Validation: `cd go && GOCACHE=../out/go-build-cache GOPATH=../out/go-path go run ./cmd/klipper-go-golden -mode host-h1 -only commands -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only commands --mode strict --fail-missing`; and `cd go && ... go run ./cmd/klipper-go-golden -mode host-h1 -only linuxtest`, then `./scripts/go_migration_golden.py compare --only linuxtest --mode strict --fail-missing`.
+
+### 2026-01-07 — Start Host H2 (minimal gcode execution)
+
+- Summary: Added a minimal H2 gcode runner and a `klipper-go-golden -mode host-h2` path that executes `.test` gcode after connect-phase compilation (supports `G4` dwell and stubs for `commands.test`).
+- Rationale: Establish the smallest possible “execute gcode” loop (parse → dispatch → advance time) before adding motion, heaters, and macro semantics.
+- User-visible impact: None (developer tooling).
+- Notable files/areas: `go/pkg/hosth2/h2.go`, `go/pkg/hosth2/gcode.go`, `go/cmd/klipper-go-golden/main.go`, `docs/Go_Host_Migration_Workplan.md`, `test/go_migration/README.md`.
+- Validation: `cd go && GOCACHE=../out/go-build-cache GOPATH=../out/go-path go run ./cmd/klipper-go-golden -mode host-h2 -only linuxtest -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only linuxtest --mode strict --fail-missing`; and `cd go && ... go run ./cmd/klipper-go-golden -mode host-h2 -only commands`, then `./scripts/go_migration_golden.py compare --only commands --mode strict --fail-missing`.
+
+### 2026-01-07 — Fix Host H3 manual_stepper strict equivalence
+
+- Summary: Brought `host-h3` into strict equivalence for `manual_stepper.test` by matching Klipper semantics for `G28` under `kinematics: none`, making end-of-file behave like fileinput EOF (`request_restart('exit')` → motor-off), and stabilizing motor-off ordering.
+- Rationale: The golden expected output is produced by Klippy fileinput mode; the Go harness must mirror those host-level semantics (homing no-op on `none`, and EOF restart handlers) to keep the MCU command stream identical.
+- User-visible impact: None (developer tooling / migration harness only).
+- Notable files/areas: `go/pkg/hosth3/gcode.go`, `go/pkg/hosth3/h3.go`, `go/pkg/hosth3/runtime.go`.
+- Validation: `cd go && GOCACHE=../out/go-build-cache GOPATH=../out/go-path go run ./cmd/klipper-go-golden -mode host-h3 -only manual_stepper -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only manual_stepper --mode strict --fail-missing`.
