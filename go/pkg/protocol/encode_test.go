@@ -51,6 +51,47 @@ func TestEncodeCommand_Unknown(t *testing.T) {
     }
 }
 
+func TestEncodeCommand_TruncatesUint32(t *testing.T) {
+    d := &Dictionary{
+        Commands: map[string]int{
+            "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c": 1,
+            "finalize_config crc=%u": 2,
+        },
+    }
+    fmts, err := d.BuildCommandFormats()
+    if err != nil {
+        t.Fatalf("BuildCommandFormats: %v", err)
+    }
+
+    // Values can exceed 2^32-1; msgproto truncates to 32 bits when packing.
+    enc, err := EncodeCommand(fmts, "trsync_start oid=1 report_clock=4950762637 report_ticks=1200000 expire_reason=4")
+    if err != nil {
+        t.Fatalf("EncodeCommand: %v", err)
+    }
+    dec, err := DecodeCommand(fmts, enc)
+    if err != nil {
+        t.Fatalf("DecodeCommand: %v", err)
+    }
+    want := "trsync_start oid=1 report_clock=655795341 report_ticks=1200000 expire_reason=4"
+    if dec != want {
+        t.Fatalf("got %q want %q", dec, want)
+    }
+
+    // Negative values on %u fields should also round-trip via 32-bit casting.
+    enc, err = EncodeCommand(fmts, "finalize_config crc=-1")
+    if err != nil {
+        t.Fatalf("EncodeCommand(-1): %v", err)
+    }
+    dec, err = DecodeCommand(fmts, enc)
+    if err != nil {
+        t.Fatalf("DecodeCommand(-1): %v", err)
+    }
+    want = "finalize_config crc=4294967295"
+    if dec != want {
+        t.Fatalf("got %q want %q", dec, want)
+    }
+}
+
 func TestDecodeCommand_UnknownEnumValue(t *testing.T) {
     d := &Dictionary{
         Commands: map[string]int{"set_pin pin=%u": 3},

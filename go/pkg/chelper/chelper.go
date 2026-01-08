@@ -15,6 +15,8 @@ package chelper
 
 // kin_cartesian.c does not provide a public header; declare the symbol.
 struct stepper_kinematics *cartesian_stepper_alloc(char axis);
+struct stepper_kinematics *extruder_stepper_alloc(void);
+void extruder_stepper_free(struct stepper_kinematics *sk);
 */
 import "C"
 
@@ -54,6 +56,7 @@ type TrapQ struct {
 
 type StepperKinematics struct {
     ptr *C.struct_stepper_kinematics
+    isExtruder bool
 }
 
 type SerialStats struct {
@@ -346,14 +349,26 @@ func NewCartesianStepperKinematics(axis byte) (*StepperKinematics, error) {
     if sk == nil {
         return nil, fmt.Errorf("cartesian_stepper_alloc failed")
     }
-    return &StepperKinematics{ptr: sk}, nil
+    return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
+func NewExtruderStepperKinematics() (*StepperKinematics, error) {
+    sk := C.extruder_stepper_alloc()
+    if sk == nil {
+        return nil, fmt.Errorf("extruder_stepper_alloc failed")
+    }
+    return &StepperKinematics{ptr: sk, isExtruder: true}, nil
 }
 
 func (sk *StepperKinematics) Free() {
     if sk == nil || sk.ptr == nil {
         return
     }
-    C.free(unsafe.Pointer(sk.ptr))
+    if sk.isExtruder {
+        C.extruder_stepper_free(sk.ptr)
+    } else {
+        C.free(unsafe.Pointer(sk.ptr))
+    }
     sk.ptr = nil
 }
 

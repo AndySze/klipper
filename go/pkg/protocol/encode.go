@@ -42,7 +42,7 @@ func EncodeCommand(cmdFormats map[string]*MessageFormat, line string) ([]byte, e
             }
             pt.EncodeInt(&out, int32(val))
         case ptInt:
-            v, err := strconv.ParseInt(raw, 0, 32)
+            v, err := strconv.ParseInt(raw, 0, 64)
             if err != nil {
                 return nil, fmt.Errorf("bad int %q for %s: %w", raw, pname, err)
             }
@@ -54,7 +54,10 @@ func EncodeCommand(cmdFormats map[string]*MessageFormat, line string) ([]byte, e
             }
             t.EncodeBytes(&out, b)
         default:
-            v, err := strconv.ParseUint(raw, 0, 32)
+            // Klipper's msgproto encoding ultimately casts to 32-bit integer
+            // types when packing a message. Accept out-of-range values and
+            // truncate to the low 32 bits to match that behavior.
+            v, err := strconv.ParseInt(raw, 0, 64)
             if err != nil {
                 return nil, fmt.Errorf("bad int %q for %s: %w", raw, pname, err)
             }

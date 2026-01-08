@@ -1,0 +1,287 @@
+package hosth4
+
+import (
+    "fmt"
+    "math"
+    "strconv"
+)
+
+const (
+    arcPlaneXY = 0
+    arcPlaneXZ = 1
+    arcPlaneYZ = 2
+)
+
+type gcodeMove struct {
+    toolhead *toolhead
+
+    absoluteCoord   bool
+    absoluteExtrude bool
+
+    basePosition []float64
+    lastPosition []float64
+
+    speed         float64
+    speedFactor   float64
+    extrudeFactor float64
+
+    arcPlane        int
+    mmPerArcSegment float64
+}
+
+func newGCodeMove(th *toolhead, mmPerArcSegment float64) *gcodeMove {
+    gm := &gcodeMove{
+        toolhead:         th,
+        absoluteCoord:    true,
+        absoluteExtrude:  true,
+        speed:            25.0,
+        speedFactor:      1.0 / 60.0,
+        extrudeFactor:    1.0,
+        arcPlane:         arcPlaneXY,
+        mmPerArcSegment:  mmPerArcSegment,
+    }
+    gm.basePosition = make([]float64, len(th.commandedPos))
+    gm.lastPosition = append([]float64{}, th.commandedPos...)
+    return gm
+}
+
+func (gm *gcodeMove) resetFromToolhead() {
+    gm.lastPosition = append([]float64{}, gm.toolhead.commandedPos...)
+    if len(gm.basePosition) != len(gm.lastPosition) {
+        nb := make([]float64, len(gm.lastPosition))
+        copy(nb, gm.basePosition)
+        gm.basePosition = nb
+    }
+}
+
+func (gm *gcodeMove) getGcodePosition() []float64 {
+    out := make([]float64, len(gm.lastPosition))
+    for i := 0; i < len(out) && i < len(gm.basePosition); i++ {
+        out[i] = gm.lastPosition[i] - gm.basePosition[i]
+    }
+    if len(out) > 3 {
+        out[3] /= gm.extrudeFactor
+    }
+    return out
+}
+
+func (gm *gcodeMove) cmdG90() { gm.absoluteCoord = true }
+func (gm *gcodeMove) cmdG91() { gm.absoluteCoord = false }
+
+func (gm *gcodeMove) cmdG17() { gm.arcPlane = arcPlaneXY }
+func (gm *gcodeMove) cmdG18() { gm.arcPlane = arcPlaneXZ }
+func (gm *gcodeMove) cmdG19() { gm.arcPlane = arcPlaneYZ }
+
+func (gm *gcodeMove) cmdG1(args map[string]string) error {
+    axisMap := map[string]int{"X": 0, "Y": 1, "Z": 2, "E": 3}
+    for axis, pos := range axisMap {
+        raw, ok := args[axis]
+        if !ok {
+            continue
+        }
+        v, err := strconv.ParseFloat(raw, 64)
+        if err != nil {
+            return fmt.Errorf("bad %s=%q", axis, raw)
+        }
+        absolute := gm.absoluteCoord
+        if axis == "E" {
+            v *= gm.extrudeFactor
+            if !gm.absoluteExtrude {
+                absolute = false
+            }
+        }
+        if !absolute {
+            gm.lastPosition[pos] += v
+        } else {
+            gm.lastPosition[pos] = v + gm.basePosition[pos]
+        }
+    }
+    if raw, ok := args["F"]; ok {
+        f, err := strconv.ParseFloat(raw, 64)
+        if err != nil {
+            return fmt.Errorf("bad F=%q", raw)
+        }
+        if f <= 0.0 {
+            return fmt.Errorf("invalid speed F=%q", raw)
+        }
+        gm.speed = f * gm.speedFactor
+    }
+    return gm.toolhead.move(gm.lastPosition, gm.speed)
+}
+
+func (gm *gcodeMove) moveGcodePosition(gpos []float64, ePos *float64, feed *float64) error {
+    if len(gpos) < 3 {
+        return fmt.Errorf("gcode pos missing xyz")
+    }
+    if feed != nil {
+        if *feed <= 0.0 {
+            return fmt.Errorf("invalid speed F=%v", *feed)
+        }
+        gm.speed = *feed * gm.speedFactor
+    }
+    target := append([]float64{}, gm.lastPosition...)
+    for i := 0; i < 3; i++ {
+        target[i] = gpos[i] + gm.basePosition[i]
+    }
+    if ePos != nil && len(target) > 3 {
+        v := *ePos * gm.extrudeFactor
+        if gm.absoluteExtrude {
+            target[3] = v + gm.basePosition[3]
+        } else {
+            target[3] = target[3] + v
+        }
+    }
+    gm.lastPosition = target
+    return gm.toolhead.move(target, gm.speed)
+}
+
+func (gm *gcodeMove) cmdG2G3(args map[string]string, clockwise bool) error {
+    if !gm.absoluteCoord {
+        return fmt.Errorf("G2/G3 does not support relative move mode")
+    }
+    current := gm.getGcodePosition()
+    if len(current) < 4 {
+        return fmt.Errorf("missing E axis")
+    }
+
+    target := []float64{
+        floatArgOr(args, "X", current[0]),
+        floatArgOr(args, "Y", current[1]),
+        floatArgOr(args, "Z", current[2]),
+    }
+    if _, ok := args["R"]; ok {
+        return fmt.Errorf("G2/G3 does not support R moves")
+    }
+
+    offsetI := floatArgOr(args, "I", 0.0)
+    offsetJ := floatArgOr(args, "J", 0.0)
+    offsetK := floatArgOr(args, "K", 0.0)
+
+    alpha := 0
+    beta := 1
+    helical := 2
+    planar0 := offsetI
+    planar1 := offsetJ
+    if gm.arcPlane == arcPlaneXZ {
+        alpha = 0
+        beta = 2
+        helical = 1
+        planar0 = offsetI
+        planar1 = offsetK
+    } else if gm.arcPlane == arcPlaneYZ {
+        alpha = 1
+        beta = 2
+        helical = 0
+        planar0 = offsetJ
+        planar1 = offsetK
+    }
+    if planar0 == 0.0 && planar1 == 0.0 {
+        return fmt.Errorf("G2/G3 requires IJ, IK or JK parameters")
+    }
+
+    rP := -planar0
+    rQ := -planar1
+
+    centerP := current[alpha] - rP
+    centerQ := current[beta] - rQ
+    rtAlpha := target[alpha] - centerP
+    rtBeta := target[beta] - centerQ
+    angularTravel := math.Atan2(rP*rtBeta-rQ*rtAlpha, rP*rtAlpha+rQ*rtBeta)
+    if angularTravel < 0.0 {
+        angularTravel += 2.0 * math.Pi
+    }
+    if clockwise {
+        angularTravel -= 2.0 * math.Pi
+    }
+
+    if angularTravel == 0.0 && current[alpha] == target[alpha] && current[beta] == target[beta] {
+        angularTravel = 2.0 * math.Pi
+    }
+
+    linearTravel := target[helical] - current[helical]
+    radius := math.Hypot(rP, rQ)
+    flatMM := radius * angularTravel
+    mmOfTravel := math.Abs(flatMM)
+    if linearTravel != 0.0 {
+        mmOfTravel = math.Hypot(flatMM, linearTravel)
+    }
+    segLen := gm.mmPerArcSegment
+    if segLen <= 0.0 {
+        segLen = 1.0
+    }
+    segments := math.Max(1.0, math.Floor(mmOfTravel/segLen))
+    thetaPerSegment := angularTravel / segments
+    linearPerSegment := linearTravel / segments
+
+    var asE *float64
+    if raw, ok := args["E"]; ok {
+        v, err := strconv.ParseFloat(raw, 64)
+        if err != nil {
+            return fmt.Errorf("bad E=%q", raw)
+        }
+        asE = &v
+    }
+    var asF *float64
+    if raw, ok := args["F"]; ok {
+        v, err := strconv.ParseFloat(raw, 64)
+        if err != nil {
+            return fmt.Errorf("bad F=%q", raw)
+        }
+        asF = &v
+    }
+
+    ePerMove := 0.0
+    eBase := 0.0
+    if asE != nil {
+        if gm.absoluteExtrude {
+            eBase = current[3]
+        }
+        ePerMove = (*asE - eBase) / segments
+    }
+
+    for i := 1; i <= int(segments); i++ {
+        distHelical := float64(i) * linearPerSegment
+        cTheta := float64(i) * thetaPerSegment
+        cosTi := math.Cos(cTheta)
+        sinTi := math.Sin(cTheta)
+        rp := -planar0*cosTi + planar1*sinTi
+        rq := -planar0*sinTi - planar1*cosTi
+
+        seg := []float64{current[0], current[1], current[2]}
+        seg[alpha] = centerP + rp
+        seg[beta] = centerQ + rq
+        seg[helical] = current[helical] + distHelical
+        if float64(i) == segments {
+            seg = target
+        }
+
+        var ePos *float64
+        if ePerMove != 0.0 {
+            v := eBase + ePerMove
+            ePos = &v
+            if gm.absoluteExtrude {
+                eBase += ePerMove
+            }
+        }
+        if err := gm.moveGcodePosition(seg, ePos, asF); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+func floatArgOr(args map[string]string, key string, def float64) float64 {
+    raw, ok := args[key]
+    if !ok {
+        return def
+    }
+    if raw == "" {
+        return def
+    }
+    v, err := strconv.ParseFloat(raw, 64)
+    if err != nil {
+        return def
+    }
+    return v
+}
+

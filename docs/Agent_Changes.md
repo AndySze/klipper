@@ -161,3 +161,22 @@ automated changes by coding agents). It is intentionally separate from:
 - User-visible impact: None (developer tooling / migration harness only).
 - Notable files/areas: `go/pkg/hosth3/gcode.go`, `go/pkg/hosth3/h3.go`, `go/pkg/hosth3/runtime.go`.
 - Validation: `cd go && GOCACHE=../out/go-build-cache GOPATH=../out/go-path go run ./cmd/klipper-go-golden -mode host-h3 -only manual_stepper -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only manual_stepper --mode strict --fail-missing`.
+
+### 2026-01-08 — Implement Host H4 cartesian homing + bounds (out_of_bounds)
+
+- Summary: Added `host-h4` runtime support for `config/example-cartesian.cfg` with cartesian kinematics (`G28` homing with drip flushing + retract + second homing) and bounds checking (errors on out-of-range `G1`).
+- Rationale: Establish a strict-gated Go reproduction of Klippy’s cartesian homing + “out of bounds” failure path before tackling broader motion/extrusion/macros.
+- User-visible impact: None (developer tooling / migration harness only).
+- Notable files/areas: `go/pkg/hosth4/runtime.go`, `go/pkg/hosth4/h4.go`, `go/pkg/hosth4/config.go`, `go/pkg/hosth4/gcode.go`, `go/cmd/klipper-go-golden/main.go`.
+- Validation: `cd go && GOCACHE=../out/go-build-cache GOPATH=../out/go-path CGO_ENABLED=1 go run ./cmd/klipper-go-golden -mode host-h4 -only out_of_bounds -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only out_of_bounds --mode strict --fail-missing`.
+
+### 2026-01-08 — Protocol int truncation + H4 homing output ordering guardrails
+
+- Summary: Updated Go msgproto encoding to accept out-of-range integers and truncate to 32-bit (matching Klipper’s packing semantics), tightened host-h4 homing output ordering by flushing pending steps before stopping endstop sampling, and iterated step flushing to account for callback-queued moves; also made toolhead flush paths stop silently swallowing errors.
+- Rationale: Some Klipper debugoutput values can exceed 32-bit when represented as host-side integers; Go encoding must match Klipper’s “cast/truncate” behavior to keep golden comparisons meaningful. Homing/endstop command ordering is sensitive in strict mode and needs explicit flushing.
+- User-visible impact: None (developer tooling / migration harness only).
+- Notable files/areas: `go/pkg/protocol/encode.go`, `go/pkg/protocol/encode_test.go`, `go/pkg/hosth4/runtime.go`.
+- Validation:
+  - `cd go && GOCACHE=/Users/andy/Documents/projects/3dprinter/klipper/out/go-build-cache GOPATH=/Users/andy/Documents/projects/3dprinter/klipper/out/go-path CGO_ENABLED=1 go test ./...`
+  - `cd go && GOCACHE=/Users/andy/Documents/projects/3dprinter/klipper/out/go-build-cache GOPATH=/Users/andy/Documents/projects/3dprinter/klipper/out/go-path CGO_ENABLED=1 go run ./cmd/klipper-go-golden -mode host-h4 -only out_of_bounds -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only out_of_bounds --mode strict --fail-missing`
+  - `cd go && ... go run ./cmd/klipper-go-golden -mode host-h4 -only gcode_arcs -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only gcode_arcs --mode strict --fail-missing` (currently fails; see diff output)
