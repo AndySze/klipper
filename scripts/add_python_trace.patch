@@ -1,0 +1,84 @@
+--- a/klippy/extras/motion_queuing.py
++++ b/klippy/extras/motion_queuing.py
+@@ -23,6 +23,11 @@ DRIP_SEGMENT_TIME = 0.050
+ DRIP_TIME = 0.100
+
++import os
++TRACE_ENABLED = os.environ.get('KLIPPY_TRACE_MOTION') == '1'
++TRACE_FILE = None
++if TRACE_ENABLED:
++    TRACE_FILE = open('/tmp/klippy_motion_trace.txt', 'w')
++
+ class PrinterMotionQueuing:
+     def __init__(self, config):
+         self.printer = printer = config.getprinter()
+@@ -132,6 +137,14 @@ class PrinterMotionQueuing:
+             want_step_gen_time - STEPCOMPRESS_FLUSH_TIME)
+         step_gen_time = max(want_step_gen_time, self.last_step_gen_time,
+                             flush_time)
++
++        if TRACE_FILE is not None:
++            TRACE_FILE.write(
++                f"MQ advance begin want_flush={want_flush_time:.9f} "
++                f"want_sg={want_step_gen_time:.9f} need_flush={self.need_flush_time:.9f} "
++                f"need_sg={self.need_step_gen_time:.9f} "
++                f"last_flush={self.last_flush_time:.9f} last_sg={self.last_step_gen_time:.9f}\n")
++            TRACE_FILE.flush()
++
+         # Invoke flush callbacks (if any)
+         with self.reactor.assert_no_pause():
+             for cb in self.flush_callbacks:
+@@ -155,6 +168,11 @@ class PrinterMotionQueuing:
+         if ret:
+             raise self.mcu.error("Internal error in stepcompress")
+         self.last_flush_time = flush_time
+         self.last_step_gen_time = step_gen_time
++
++        if TRACE_FILE is not None:
++            TRACE_FILE.write(
++                f"MQ advance end flush={flush_time:.9f} sg={step_gen_time:.9f} "
++                f"clear={clear_history_time:.9f}\n")
++            TRACE_FILE.flush()
++
+         # Move processed trapq entries to history list, and expire old history
+         for trapq in self.trapqs:
+             self.trapq_finalize_moves(trapq, trapq_free_time,
+@@ -243,6 +261,13 @@ class PrinterMotionQueuing:
+             self.need_step_gen_time = max(self.need_step_gen_time, mq_time)
+         self.need_flush_time = max(self.need_flush_time, mq_time)
+         if self.do_kick_flush_timer:
+             self.do_kick_flush_timer = False
+             self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
++
++        if TRACE_FILE is not None:
++            TRACE_FILE.write(
++                f"MQ note mqTime={mq_time:.9f} stepgen={is_step_gen} "
++                f"need_flush={self.need_flush_time:.9f} need_sg={self.need_step_gen_time:.9f} "
++                f"last_flush={self.last_flush_time:.9f} last_sg={self.last_step_gen_time:.9f}\n")
++            TRACE_FILE.flush()
++
+     # "Drip" timing (for homing and probing moves)
+     def drip_update_time(self, start_time, end_time, drip_completion):
+         self.drip_start_times.append(start_time)
+@@ -250,6 +275,12 @@ class PrinterMotionQueuing:
+         self.reactor.update_timer(self.flush_timer, self.reactor.NEVER)
+         self.do_kick_flush_timer = False
+         self._advance_flush_time(start_time - SDS_CHECK_TIME, start_time)
+         # Flush in segments until drip_completion signal
+         flush_time = start_time
+         while flush_time < end_time:
+             if drip_completion.test():
+                 break
+@@ -271,6 +302,14 @@ class PrinterMotionQueuing:
+     def flush_all_steps(self):
+         flush_time = self.need_step_gen_time
+         self._await_flush_time(flush_time)
++
++        if TRACE_FILE is not None:
++            TRACE_FILE.write(
++                f"MQ flushAll need_sg={self.need_step_gen_time:.9f} "
++                f"need_flush={self.need_flush_time:.9f} "
++                f"last_flush={self.last_flush_time:.9f} last_sg={self.last_step_gen_time:.9f}\n")
++            TRACE_FILE.flush()
++
+         self._advance_flush_time(flush_time)

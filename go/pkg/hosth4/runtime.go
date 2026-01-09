@@ -313,6 +313,26 @@ func (mq *motionQueuing) flushHandlerDebugOnce() (bool, error) {
     return false, mq.advanceFlushTime(mq.needFlushTime+bgflushExtraTimeSec, 0.0)
 }
 
+// flushPendingBatch advances step generation in ~0.25s batches during normal motion.
+// This matches Python's _flush_handler_debug behavior for fileoutput mode.
+func (mq *motionQueuing) flushPendingBatch() error {
+    fauxTime := mq.needFlushTime - bgflushFauxTimeOffset
+    batchTime := bgflushSGHighTimeSec - bgflushSGLowTimeSec
+    flushCount := 0
+    for mq.lastStepGenTime < fauxTime {
+        target := mq.lastStepGenTime + batchTime
+        if flushCount > 100 && fauxTime > target {
+            skip := math.Floor((fauxTime - target) / batchTime)
+            target += skip * batchTime
+        }
+        if err := mq.advanceFlushTime(0.0, target); err != nil {
+            return err
+        }
+        flushCount++
+    }
+    return nil
+}
+
 type cartesianKinematics struct {
     rails        [3]stepperCfg
     maxZVelocity float64
@@ -500,7 +520,8 @@ func (th *toolhead) processLookahead(lazy bool) error {
     }
     moves := th.lookahead.flush(lazy)
     if len(moves) == 0 {
-        return nil
+        // Match Python: still note activity even if no moves to process
+        return th.motion.noteMovequeueActivity(th.printTime, true)
     }
     if th.specialState != "" {
         th.specialState = ""
@@ -539,6 +560,8 @@ func (th *toolhead) processLookahead(lazy bool) error {
         }
     }
     th.advanceMoveTime(nextMoveTime)
+    // Note the activity with stepgen=true to match Python's behavior
+    // Python's _process_lookahead calls note_mcu_movequeue_activity with default is_step_gen=True
     return th.motion.noteMovequeueActivity(nextMoveTime, true)
 }
 
@@ -558,6 +581,11 @@ func (th *toolhead) flushLookahead(_ bool) error {
 func (th *toolhead) flushStepGeneration() error {
     if err := th.flushLookahead(false); err != nil {
         return err
+    }
+    // If processLookahead wasn't called (e.g., addMove returned false),
+    // needStepGenTime may not be updated. Ensure it's at least needFlushTime.
+    if th.motion.needStepGenTime < th.motion.needFlushTime {
+        th.motion.needStepGenTime = th.motion.needFlushTime
     }
     return th.motion.flushAllSteps()
 }
@@ -1791,40 +1819,35 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
             return err
         }
         r.gm.resetFromToolhead()
-        return nil
     case "G90":
         r.gm.cmdG90()
-        return nil
     case "G91":
         r.gm.cmdG91()
-        return nil
     case "G17":
         r.gm.cmdG17()
-        return nil
     case "G18":
         r.gm.cmdG18()
-        return nil
     case "G19":
         r.gm.cmdG19()
-        return nil
     case "G2":
         if err := r.gm.cmdG2G3(cmd.Args, true); err != nil {
             return err
         }
-        return nil
     case "G3":
         if err := r.gm.cmdG2G3(cmd.Args, false); err != nil {
             return err
         }
-        return nil
     case "G0", "G1":
         if err := r.gm.cmdG1(cmd.Args); err != nil {
             return err
         }
-        return nil
     default:
         return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
     }
+
+    // After executing each gcode command, trigger batch flushing
+    // This matches Python's _flush_handler_debug behavior
+    return r.toolhead.motion.flushPendingBatch()
 }
 
 func (r *runtime) onEOF() error {
