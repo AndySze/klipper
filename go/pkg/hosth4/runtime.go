@@ -77,6 +77,10 @@ type motionQueuing struct {
 
     kinFlushDelay float64
 
+    enablePins []*stepperEnablePin  // Track enable pins for deferred flushing
+    lastStepClock uint64  // Track the last clock from step generation for enable pin ordering
+    isRealMove bool // Track whether we're in a real move (vs dwell/delay)
+
     trace io.Writer
 }
 
@@ -203,6 +207,19 @@ func (mq *motionQueuing) unregisterFlushCallback(id int) {
     mq.callbacks = out
 }
 
+func (mq *motionQueuing) registerEnablePin(pin *stepperEnablePin) {
+    mq.enablePins = append(mq.enablePins, pin)
+}
+
+func (mq *motionQueuing) flushPendingEnablePins() error {
+    for _, pin := range mq.enablePins {
+        if err := pin.flushPending(mq.lastStepClock); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
 func (mq *motionQueuing) calcStepGenRestart(estPrintTime float64) float64 {
     kinTime := estPrintTime + minKinTimeSec
     if mq.lastStepGenTime > kinTime {
@@ -260,10 +277,12 @@ func (mq *motionQueuing) advanceFlushTime(wantFlushTime float64, wantStepGenTime
         stepGenTime = flushTime
     }
 
+    // Invoke callbacks first (original Python ordering)
     for _, cb := range mq.callbacks {
         cb.fn(flushTime, stepGenTime)
     }
 
+    // Generate steps
     trapqFreeTime := stepGenTime - mq.kinFlushDelay
     clearHistoryTime := 0.0
     if trapqFreeTime-moveHistoryExpireSec > clearHistoryTime {
@@ -278,11 +297,19 @@ func (mq *motionQueuing) advanceFlushTime(wantFlushTime float64, wantStepGenTime
     }
     mq.lastFlushTime = flushTime
     mq.lastStepGenTime = stepGenTime
+
     mq.tracef("MQ advance end flush=%.9f sg=%.9f clear=%.9f\n", flushTime, stepGenTime, clearHistoryTime)
 
+    // Finalize trapqs
     for _, tq := range mq.trapqs {
         tq.FinalizeMoves(trapqFreeTime, clearHistoryTime)
     }
+
+    // Flush pending enable pin changes LAST
+    if err := mq.flushPendingEnablePins(); err != nil {
+        return err
+    }
+
     return nil
 }
 
@@ -1139,10 +1166,12 @@ func (s *stepper) checkActive(_ float64, maxStepGenTime float64) {
     if s.trapq == nil {
         return
     }
+
     pt := s.sk.CheckActive(maxStepGenTime + 1e-9)
     if pt == 0.0 {
         return
     }
+
     s.motion.unregisterFlushCallback(s.activeCBID)
     s.activeCBID = 0
     cbs := s.activeCallbacks
@@ -1190,10 +1219,13 @@ func (d *digitalOut) setDigital(printTime float64, value bool) error {
 type stepperEnablePin struct {
     out         *digitalOut
     enableCount int
+    pendingState *bool  // nil = no pending change, true = enable, false = disable
+    pendingTime  float64
 }
 
 func (p *stepperEnablePin) setEnable(printTime float64) error {
     if p.enableCount == 0 {
+        // Send immediately - this is the default behavior
         if err := p.out.setDigital(printTime, true); err != nil {
             return err
         }
@@ -1202,12 +1234,58 @@ func (p *stepperEnablePin) setEnable(printTime float64) error {
     return nil
 }
 
+// setEnableDeferred queues the enable for later flushing, but with a marker
+// that it should only be sent after steps have been generated
+func (p *stepperEnablePin) setEnableDeferred(printTime float64) {
+    if p.enableCount == 0 {
+        state := true
+        p.pendingState = &state
+        // Use printTime directly - this matches Python Klipper behavior
+        // Python sets the enable pin to the same print_time as the motor_enable callback
+        p.pendingTime = printTime
+    }
+    p.enableCount++
+}
+
 func (p *stepperEnablePin) setDisable(printTime float64) error {
     p.enableCount--
     if p.enableCount == 0 {
-        if err := p.out.setDigital(printTime, false); err != nil {
+        // Queue the disable instead of calling it immediately
+        state := false
+        p.pendingState = &state
+        p.pendingTime = printTime
+    }
+    return nil
+}
+
+// flushPending applies any pending enable/disable changes
+func (p *stepperEnablePin) flushPending(lastStepClock uint64) error {
+    if p.pendingState != nil {
+        // Encode the command
+        clk := uint64(int64(p.pendingTime * p.out.mcuFreq))
+
+        on := 0
+        if *p.pendingState {
+            on = 1
+        }
+        if p.out.invert {
+            on ^= 1
+        }
+        line := fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", p.out.oid, clk, on)
+        b, err := protocol.EncodeCommand(p.out.formats, line)
+        if err != nil {
             return err
         }
+
+        // Use p.out.lastClk to maintain FIFO ordering with other commands on cqMain
+        // Since all commands now use cqMain, the serial queue will order them by
+        // [lastClk, clk] range and send order
+        if err := p.out.sq.Send(p.out.cq, b, p.out.lastClk, clk); err != nil {
+            return err
+        }
+        p.out.lastClk = clk
+
+        p.pendingState = nil
     }
     return nil
 }
@@ -1220,6 +1298,8 @@ type enableTracking struct {
 
 func newEnableTracking(stepper *stepper, pin *stepperEnablePin) *enableTracking {
     et := &enableTracking{stepper: stepper, enablePin: pin}
+    // The stepper starts disabled, so register motor_enable callback
+    // This matches Python Klipper's behavior
     stepper.addActiveCallback(et.motorEnable)
     return et
 }
@@ -1431,7 +1511,6 @@ type runtime struct {
     extraStepperEn  *stepperEnablePin
 
     endstops [3]*endstop
-    cqEnPins []*chelper.CommandQueue
 
     gm *gcodeMove
     motorOffOrder []string
@@ -1634,19 +1713,52 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     // Conditionally create extruder components
     var stE *stepper
     var tqExtruder *chelper.TrapQ
-    var cqEnE *chelper.CommandQueue
     var enE *stepperEnablePin
     var exAxis *extruderAxis
 
+    // Detect filament sensors (buttons)
+    hasButtons := false
+    sensorSections := []string{
+        "filament_switch_sensor runout_switch",
+        "filament_motion_sensor runout_encoder",
+        "filament_switch_sensor runout_switch1",
+        "filament_motion_sensor runout_encoder1",
+    }
+    for _, sectionName := range sensorSections {
+        if _, ok := cfg.sections[sectionName]; ok {
+            hasButtons = true
+            break
+        }
+    }
+    // Also check for numbered variants
+    for i := 2; i < 10; i++ {
+        if _, ok := cfg.sections[fmt.Sprintf("filament_switch_sensor runout_switch%d", i)]; ok {
+            hasButtons = true
+            break
+        }
+        if _, ok := cfg.sections[fmt.Sprintf("filament_motion_sensor runout_encoder%d", i)]; ok {
+            hasButtons = true
+            break
+        }
+    }
+
     // Determine enable pin OIDs based on config type
-    // With extruder: enable_x=12, enable_y=13, enable_z=14, enable_e=17
+    // With extruder + buttons: enable_x=13, enable_y=14, enable_z=15, enable_e=18
+    // With extruder (no buttons): enable_x=12, enable_y=13, enable_z=14, enable_e=17
     // Without extruder: enable_x=9, enable_y=10, enable_z=11
     var oidEnableX, oidEnableY, oidEnableZ, oidEnableE int
     if hasExtruder {
-        oidEnableX = 12
-        oidEnableY = 13
-        oidEnableZ = 14
-        oidEnableE = 17
+        if hasButtons {
+            oidEnableX = 13
+            oidEnableY = 14
+            oidEnableZ = 15
+            oidEnableE = 18
+        } else {
+            oidEnableX = 12
+            oidEnableY = 13
+            oidEnableZ = 14
+            oidEnableE = 17
+        }
     } else {
         oidEnableX = 9
         oidEnableY = 10
@@ -1671,8 +1783,16 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         exAxis = newExtruderAxis("extruder", tqExtruder)
         th.extraAxes = []extraAxis{exAxis}
 
+        // Determine extruder stepper OID based on whether there's an extra_stepper
+        // With extra_stepper: oid=10, without extra_stepper: oid=9
+        _, hasExtraStepper := cfg.section("extruder_stepper my_extra_stepper")
+        oidStepperE := uint32(10)
+        if !hasExtraStepper {
+            oidStepperE = 9
+        }
+
         // Create extruder stepper
-        stE, err = newStepper(motion, sq, "extruder", 'e', 10, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+        stE, err = newStepper(motion, sq, "extruder", 'e', oidStepperE, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
         if err != nil {
             stZ.free()
             stY.free()
@@ -1686,58 +1806,24 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         stE.setTrapQ(tqExtruder)
         stE.setPosition(0.0)
 
-        // Create enable pin command queue
-        cqEnE = chelper.NewCommandQueue()
-        if cqEnE == nil {
-            stE.free()
-            stZ.free()
-            stY.free()
-            stX.free()
-            motion.free()
-            cqMain.Free()
-            sq.Free()
-            f.Close()
-            return nil, fmt.Errorf("alloc enable command queue failed")
-        }
-        enE = &stepperEnablePin{out: newDigitalOut(uint32(oidEnableE), extruderCfg.enablePin.invert, sq, cqEnE, formats, mcuFreq)}
+        // Create extruder enable pin using cqMain for proper ordering
+        enE = &stepperEnablePin{out: newDigitalOut(uint32(oidEnableE), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
     }
 
     // Create enable pins for X/Y/Z
-    cqEnX := chelper.NewCommandQueue()
-    cqEnY := chelper.NewCommandQueue()
-    cqEnZ := chelper.NewCommandQueue()
-    if cqEnX == nil || cqEnY == nil || cqEnZ == nil {
-        if cqEnX != nil {
-            cqEnX.Free()
-        }
-        if cqEnY != nil {
-            cqEnY.Free()
-        }
-        if cqEnZ != nil {
-            cqEnZ.Free()
-        }
-        if cqEnE != nil {
-            cqEnE.Free()
-        }
-        if stE != nil {
-            stE.free()
-        }
-        stZ.free()
-        stY.free()
-        stX.free()
-        motion.free()
-        cqMain.Free()
-        sq.Free()
-        f.Close()
-        return nil, fmt.Errorf("alloc enable command queue failed")
-    }
-    enX := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableX), rails[0].enablePin.invert, sq, cqEnX, formats, mcuFreq)}
-    enY := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableY), rails[1].enablePin.invert, sq, cqEnY, formats, mcuFreq)}
-    enZ := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableZ), rails[2].enablePin.invert, sq, cqEnZ, formats, mcuFreq)}
+    // NOTE: Use cqMain for enable pins to ensure proper ordering with step commands
+    // This matches Python Klipper behavior where enable pins share the same command queue
+    enX := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableX), rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+    enY := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableY), rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+    enZ := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableZ), rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+    motion.registerEnablePin(enX)
+    motion.registerEnablePin(enY)
+    motion.registerEnablePin(enZ)
     se.registerStepper("stepper_x", stX, enX)
     se.registerStepper("stepper_y", stY, enY)
     se.registerStepper("stepper_z", stZ, enZ)
     if hasExtruder {
+        motion.registerEnablePin(enE)
         se.registerStepper("extruder", stE, enE)
     }
 
@@ -1746,14 +1832,13 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     var extraStepperEn *stepperEnablePin
     var extraStepperCfg extruderStepperCfg
     var hasExtraStepper bool
-    var cqEnExtra *chelper.CommandQueue
 
     extraCfg, okExtra, err := readExtruderStepperOptional(cfg, "extruder_stepper my_extra_stepper")
     if okExtra && err == nil {
         hasExtraStepper = true
         extraStepperCfg = extraCfg
 
-        // TEMPORARY: Don't create the extra stepper object to test if this causes the error
+        // TEMPORARY: Don't create the extra stepper object to debug stepcompress error
         // The config command still gets sent to the MCU, but Go doesn't track this stepper
         /*
         // Create the extra stepper (oid=0 for my_extra_stepper)
@@ -1761,10 +1846,6 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         stepDistExtra := extraStepperCfg.rotationDistance / float64(extraStepperCfg.fullSteps*extraStepperCfg.microsteps)
         extraStepper, err = newStepper(motion, sq, "my_extra_stepper", 'e', 0, stepDistExtra, extraStepperCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
         if err != nil {
-            cqEnE.Free()
-            cqEnZ.Free()
-            cqEnY.Free()
-            cqEnX.Free()
             stE.free()
             stZ.free()
             stY.free()
@@ -1779,25 +1860,9 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         // The stepper will only generate steps when connected via SYNC_EXTRUDER_MOTION
         extraStepper.setPosition(0.0)
 
-        // Create enable pin for extra stepper (oid=11)
-        cqEnExtra = chelper.NewCommandQueue()
-        if cqEnExtra == nil {
-            extraStepper.free()
-            cqEnE.Free()
-            cqEnZ.Free()
-            cqEnY.Free()
-            cqEnX.Free()
-            stE.free()
-            stZ.free()
-            stY.free()
-            stX.free()
-            motion.free()
-            cqMain.Free()
-            sq.Free()
-            f.Close()
-            return nil, fmt.Errorf("alloc extra stepper enable command queue failed")
-        }
-        extraStepperEn = &stepperEnablePin{out: newDigitalOut(11, extraStepperCfg.enablePin.invert, sq, cqEnExtra, formats, mcuFreq)}
+        // Create enable pin for extra stepper (oid=11) using cqMain for proper ordering
+        extraStepperEn = &stepperEnablePin{out: newDigitalOut(11, extraStepperCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+        motion.registerEnablePin(extraStepperEn)
         se.registerStepper("my_extra_stepper", extraStepper, extraStepperEn)
 
         // NOTE: We do NOT create an extraAxis for this stepper yet!
@@ -1811,14 +1876,6 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         // Clean up stepperEnablePin digitalOut objects before freeing CommandQueues
         // Note: stepperEnablePin objects don't have explicit Free(), but we must
         // ensure the CommandQueues they reference are still valid when we free them
-        if cqEnExtra != nil {
-            cqEnExtra.Free()
-        }
-        // Free CommandQueues (stepperEnablePin objects will be GC'd)
-        cqEnE.Free()
-        cqEnZ.Free()
-        cqEnY.Free()
-        cqEnX.Free()
         // Steppers are cleaned up by motion.free()
         if extraStepper != nil {
             extraStepper.free()
@@ -1844,10 +1901,9 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     }
 
     // Build cqEnPins and motorOffOrder based on actual axes
-    cqEnPins := []*chelper.CommandQueue{cqEnX, cqEnY, cqEnZ}
+    // NOTE: Enable pins now use cqMain, so no separate cqEnPins needed
     motorOffOrder := []string{"stepper_x", "stepper_y", "stepper_z"}
     if hasExtruder {
-        cqEnPins = append(cqEnPins, cqEnE)
         motorOffOrder = append(motorOffOrder, "extruder")
     }
 
@@ -1872,17 +1928,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         extraStepperCfg: extraStepperCfg,
         extraStepper:    extraStepper,
         extraStepperEn:  extraStepperEn,
-        cqEnPins:      cqEnPins,
         motorOffOrder: motorOffOrder,
         mcu:           mcu,
         rawPath:       rawPath,
         rawFile:       f,
     }
 
-    // Add cqEnExtra to cqEnPins if it exists
-    if cqEnExtra != nil {
-        rt.cqEnPins = append(rt.cqEnPins, cqEnExtra)
-    }
     rt.gm = newGCodeMove(th, mmPerArcSegment)
 
     // Initialize heater manager after runtime is created
@@ -2123,13 +2174,6 @@ func (r *runtime) cleanup(removeFile bool) error {
     }
 
     // Now safe to free commandqueues
-    for _, cq := range r.cqEnPins {
-        if cq != nil {
-            cq.Free()
-        }
-    }
-    r.cqEnPins = nil
-
     if r.cqMain != nil {
         r.cqMain.Free()
         r.cqMain = nil
@@ -2206,13 +2250,6 @@ func (r *runtime) sendLine(line string, cq *chelper.CommandQueue, minClock uint6
             cqName = "main"
         } else if cq == r.cqTrigger {
             cqName = "trigger"
-        } else {
-            for idx, q := range r.cqEnPins {
-                if cq == q {
-                    cqName = fmt.Sprintf("en%d", idx)
-                    break
-                }
-            }
         }
         r.tracef("SEND cq=%s min=%d req=%d line=%s\n", cqName, minClock, reqClock, strings.TrimSpace(line))
     }
@@ -2704,14 +2741,7 @@ func (r *runtime) cmdM190(args map[string]string) error {
 func (r *runtime) cmdSetExtruderRotationDistance(args map[string]string) error {
     // SET_EXTRUDER_ROTATION_DISTANCE [EXTRUDER=<name>] DISTANCE=<distance>
     // This command modifies the extruder's rotation distance at runtime.
-    // In the full Klipper implementation, this would:
-    // 1. Flush step generation
-    // 2. Update the stepper's rotation distance
-    // 3. Optionally invert direction if distance is negative
-    //
-    // For H4 test purposes, we accept the command but don't fully implement
-    // the rotation distance change, as that would require deeper integration
-    // with the C helper library.
+    // Implementation follows Python Klipper's approach in extruder.py
 
     distStr, ok := args["DISTANCE"]
     if !ok || distStr == "" {
@@ -2728,18 +2758,44 @@ func (r *runtime) cmdSetExtruderRotationDistance(args map[string]string) error {
         return fmt.Errorf("rotation distance cannot be zero")
     }
 
+    // Get extruder name (default to "extruder")
+    extruderName := "extruder"
+    if en, ok := args["EXTRUDER"]; ok && en != "" {
+        extruderName = en
+    }
+
+    // Find the target stepper
+    var targetStepper *stepper
+    if r.stepperE != nil && extruderName == "extruder" {
+        targetStepper = r.stepperE
+    } else if r.hasExtraStepper && extruderName == "my_extra_stepper" && r.extraStepper != nil {
+        targetStepper = r.extraStepper
+    } else {
+        return fmt.Errorf("unknown extruder: %s", extruderName)
+    }
+
+    // Handle negative distance (invert direction)
+    invertDir := targetStepper.invertDir
+    if dist < 0.0 {
+        invertDir = !targetStepper.invertDir
+        dist = -dist
+    }
+
     // Flush step generation like Python does
     if err := r.toolhead.flushStepGeneration(); err != nil {
         return err
     }
 
-    r.tracef("SET_EXTRUDER_ROTATION_DISTANCE: DISTANCE=%f\n", dist)
+    // Update stepper's rotation distance
+    targetStepper.stepDist = dist
+    targetStepper.invertDir = invertDir
 
-    // TODO: Fully implement rotation distance change:
-    // - Get extruder stepper by name (EXTRUDER parameter, default "extruder")
-    // - Handle negative distance (invert direction)
-    // - Update stepDist field in stepper struct
-    // For now, this is a no-op that accepts the command
+    // Update the stepper kinematics if it exists
+    if targetStepper.sk != nil && targetStepper.trapq != nil {
+        targetStepper.sk.SetTrapQ(targetStepper.trapq, dist)
+    }
+
+    r.tracef("SET_EXTRUDER_ROTATION_DISTANCE: EXTRUDER=%s DISTANCE=%f\n", extruderName, dist)
 
     return nil
 }

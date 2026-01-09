@@ -459,6 +459,46 @@ func CompileCartesianWithExtruderStepper(cfgPath string, dict *protocol.Dictiona
         return nil, err
     }
 
+    // Parse filament sensor sections
+    type filamentSensor struct {
+        pin    string
+        pullUp int
+    }
+    var filamentSensors []filamentSensor
+
+    // Check for filament_switch_sensor and filament_motion_sensor sections
+    // These follow the pattern: runout_switch, runout_encoder, runout_switch1, runout_encoder1, etc.
+    sensorSections := []string{
+        "filament_switch_sensor runout_switch",
+        "filament_motion_sensor runout_encoder",
+        "filament_switch_sensor runout_switch1",
+        "filament_motion_sensor runout_encoder1",
+    }
+
+    for _, sectionName := range sensorSections {
+        sec, ok := cfg.sections[sectionName]
+        if ok {
+            pin := sec["switch_pin"]
+            pullUp := boolToInt(false) // Default is no pullup
+            filamentSensors = append(filamentSensors, filamentSensor{pin: pin, pullUp: pullUp})
+        }
+    }
+
+    // Also check for numbered variants beyond 1 (e.g., runout_switch2, runout_encoder2, etc.)
+    for i := 2; i < 10; i++ {
+        switchSection := fmt.Sprintf("filament_switch_sensor runout_switch%d", i)
+        if sec, ok := cfg.sections[switchSection]; ok {
+            pin := sec["switch_pin"]
+            filamentSensors = append(filamentSensors, filamentSensor{pin: pin, pullUp: 0})
+        }
+
+        motionSection := fmt.Sprintf("filament_motion_sensor runout_encoder%d", i)
+        if sec, ok := cfg.sections[motionSection]; ok {
+            pin := sec["switch_pin"]
+            filamentSensors = append(filamentSensors, filamentSensor{pin: pin, pullUp: 0})
+        }
+    }
+
     // Allocate OIDs matching Python's order:
     // For configs WITH extra_stepper:
     // 0: extra_stepper
@@ -470,12 +510,13 @@ func CompileCartesianWithExtruderStepper(cfgPath string, dict *protocol.Dictiona
     // 9: stepper_z
     // 10: stepper_e
     // 11: enable_extra
-    // 12: enable_x
-    // 13: enable_y
-    // 14: enable_z
-    // 15: adc_e
-    // 16: pwm_e
-    // 17: enable_e
+    // 12: buttons (if filament sensors present)
+    // 13: enable_x (or 12 if no buttons)
+    // 14: enable_y (or 13 if no buttons)
+    // 15: enable_z (or 14 if no buttons)
+    // 16: adc_e (or 15 if no buttons)
+    // 17: pwm_e (or 16 if no buttons)
+    // 18: enable_e (or 17 if no buttons)
 
     o := struct {
         extraStepper    int
@@ -490,6 +531,7 @@ func CompileCartesianWithExtruderStepper(cfgPath string, dict *protocol.Dictiona
         stepperZ        int
         stepperE        int
         enableExtra     int
+        buttons         int
         enableX         int
         enableY         int
         enableZ         int
@@ -498,6 +540,8 @@ func CompileCartesianWithExtruderStepper(cfgPath string, dict *protocol.Dictiona
         enableE         int
         count           int
     }{}
+
+    hasButtons := len(filamentSensors) > 0
 
     if hasExtraStepper {
         o.extraStepper = 0
@@ -512,13 +556,24 @@ func CompileCartesianWithExtruderStepper(cfgPath string, dict *protocol.Dictiona
         o.stepperZ = 9
         o.stepperE = 10
         o.enableExtra = 11
-        o.enableX = 12
-        o.enableY = 13
-        o.enableZ = 14
-        o.adcE = 15
-        o.pwmE = 16
-        o.enableE = 17
-        o.count = 18
+        if hasButtons {
+            o.buttons = 12
+            o.enableX = 13
+            o.enableY = 14
+            o.enableZ = 15
+            o.adcE = 16
+            o.pwmE = 17
+            o.enableE = 18
+            o.count = 19
+        } else {
+            o.enableX = 12
+            o.enableY = 13
+            o.enableZ = 14
+            o.adcE = 15
+            o.pwmE = 16
+            o.enableE = 17
+            o.count = 18
+        }
     } else {
         o.count = 18
     }
@@ -557,6 +612,13 @@ func CompileCartesianWithExtruderStepper(cfgPath string, dict *protocol.Dictiona
             fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
                 o.enableExtra, extraStepper.Enable.pin, boolToInt(extraStepper.Enable.invert), boolToInt(extraStepper.Enable.invert), 0),
         )
+    }
+
+    // Add buttons configuration if filament sensors are present
+    // Buttons come after extra_stepper enable pin (OID 11)
+    if hasButtons {
+        configCmds = append(configCmds,
+            fmt.Sprintf("config_buttons oid=%d button_count=%d", o.buttons, len(filamentSensors)))
     }
 
     configCmds = append(configCmds,
@@ -598,11 +660,31 @@ func CompileCartesianWithExtruderStepper(cfgPath string, dict *protocol.Dictiona
     crc := crc32.ChecksumIEEE([]byte(crcText))
 
     // Build init commands.
-    initCmds := []string{
+    initCmds := []string{}
+
+    // Add buttons_add and buttons_query if filament sensors are present
+    if hasButtons {
+        // buttons_add commands come first (after finalize_config)
+        for i, sensor := range filamentSensors {
+            initCmds = append(initCmds,
+                fmt.Sprintf("buttons_add oid=%d pos=%d pin=%s pull_up=%d", o.buttons, i, sensor.pin, sensor.pullUp))
+        }
+        // Then buttons_query
+        // QUERY_TIME = 0.002 seconds from buttons.py
+        const queryTime = 0.002
+        const retransmitCount = 50
+        queryClock := querySlotClock(mcuFreq, o.buttons)
+        restTicks := secondsToClock(mcuFreq, queryTime)
+        initCmds = append(initCmds,
+            fmt.Sprintf("buttons_query oid=%d clock=%d rest_ticks=%d retransmit_count=%d invert=%d",
+                o.buttons, queryClock, restTicks, retransmitCount, 0))
+    }
+
+    initCmds = append(initCmds,
         fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
             o.adcE, querySlotClock(mcuFreq, o.adcE), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
         fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmE, pwmInitClock, 0),
-    }
+    )
 
     out := make([]string, 0, 1+len(configCmds)+1+len(initCmds))
     out = append(out, withAllocate...)

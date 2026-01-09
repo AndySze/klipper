@@ -152,9 +152,11 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
                 break
             }
         }
-        if err := rt.onEOF(); err != nil {
-            return nil, err
-        }
+        // Note: Python Klipper does not call motor_off at EOF in normal test execution
+        // Motor-off is only called in specific scenarios (e.g., shutdown, config reload)
+        // if err := rt.onEOF(); err != nil {
+        //     return nil, err
+        // }
     }
 
     rawOut, err := rt.closeAndRead()
