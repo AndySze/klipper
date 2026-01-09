@@ -4,6 +4,7 @@ import (
     "crypto/rand"
     "encoding/hex"
     "fmt"
+    "io"
     "math"
     "os"
     "path/filepath"
@@ -30,6 +31,11 @@ const (
 
     lookaheadFlushSec = 0.150
 
+    bgflushSGLowTimeSec   = 0.450
+    bgflushSGHighTimeSec  = 0.700
+    bgflushExtraTimeSec   = 0.250
+    bgflushFauxTimeOffset = 1.5
+
     homingStartDelaySec    = 0.001
     endstopSampleTimeSec   = 0.000015
     endstopSampleCount     = 4
@@ -40,6 +46,7 @@ const (
 )
 
 type motionQueuing struct {
+    sq      *chelper.SerialQueue
     ssm     *chelper.StepperSyncMgr
     ss      *chelper.StepperSync
     mcuFreq float64
@@ -55,6 +62,8 @@ type motionQueuing struct {
     needStepGenTime float64
 
     kinFlushDelay float64
+
+    trace io.Writer
 }
 
 type flushCB struct {
@@ -83,11 +92,43 @@ func newMotionQueuing(sq *chelper.SerialQueue, mcuFreq float64, reservedMoveSlot
         return nil, err
     }
     return &motionQueuing{
+        sq:           sq,
         ssm:          ssm,
         ss:           ss,
         mcuFreq:      mcuFreq,
         kinFlushDelay: sdsCheckTimeSec,
     }, nil
+}
+
+func (mq *motionQueuing) setTrace(w io.Writer) {
+    mq.trace = w
+}
+
+func (mq *motionQueuing) tracef(format string, args ...any) {
+    if mq == nil || mq.trace == nil {
+        return
+    }
+    fmt.Fprintf(mq.trace, format, args...)
+}
+
+func (mq *motionQueuing) drainSerial(maxWait time.Duration) error {
+    if mq == nil || mq.sq == nil {
+        return nil
+    }
+    deadline := time.Now().Add(maxWait)
+    for {
+        st, err := mq.sq.GetStats()
+        if err != nil {
+            return err
+        }
+        if st.ReadyBytes == 0 && st.UpcomingBytes == 0 {
+            return nil
+        }
+        if time.Now().After(deadline) {
+            return fmt.Errorf("serialqueue did not drain: %s", st.Raw)
+        }
+        time.Sleep(1 * time.Millisecond)
+    }
 }
 
 func (mq *motionQueuing) free() {
@@ -166,26 +207,18 @@ func (mq *motionQueuing) noteMovequeueActivity(mqTime float64, isStepGen bool) e
     if mqTime > mq.needFlushTime {
         mq.needFlushTime = mqTime
     }
+    mq.tracef("MQ note mqTime=%.9f stepgen=%v need_flush=%.9f need_sg=%.9f last_flush=%.9f last_sg=%.9f\n",
+        mqTime, isStepGen, mq.needFlushTime, mq.needStepGenTime, mq.lastFlushTime, mq.lastStepGenTime)
     return nil
 }
 
 func (mq *motionQueuing) flushAllSteps() error {
-    // Callbacks invoked during advanceFlushTime() can queue additional trapq
-    // moves (via lookahead flushing) and extend needStepGenTime. Iterate until
-    // the motion queue is fully caught up.
-    for i := 0; i < 1000; i++ {
-        flushTime := mq.needStepGenTime
-        if err := mq.advanceFlushTime(flushTime, 0.0); err != nil {
-            return err
-        }
-        if mq.needStepGenTime <= mq.lastStepGenTime && mq.needFlushTime <= mq.lastFlushTime {
-            return nil
-        }
-        if mq.needStepGenTime <= flushTime {
-            return fmt.Errorf("flushAllSteps made no progress (need=%f last=%f)", mq.needStepGenTime, mq.lastStepGenTime)
-        }
-    }
-    return fmt.Errorf("flushAllSteps exceeded iteration limit")
+    // Match Klippy: flush_all_steps performs a single advance to the current
+    // need_step_gen_time and does not attempt to iterate to completion.
+    flushTime := mq.needStepGenTime
+    mq.tracef("MQ flushAll need_sg=%.9f need_flush=%.9f last_flush=%.9f last_sg=%.9f\n",
+        mq.needStepGenTime, mq.needFlushTime, mq.lastFlushTime, mq.lastStepGenTime)
+    return mq.advanceFlushTime(flushTime, 0.0)
 }
 
 func (mq *motionQueuing) wipeTrapQ(tq *chelper.TrapQ) {
@@ -196,6 +229,8 @@ func (mq *motionQueuing) wipeTrapQ(tq *chelper.TrapQ) {
 }
 
 func (mq *motionQueuing) advanceFlushTime(wantFlushTime float64, wantStepGenTime float64) error {
+    mq.tracef("MQ advance begin want_flush=%.9f want_sg=%.9f need_flush=%.9f need_sg=%.9f last_flush=%.9f last_sg=%.9f\n",
+        wantFlushTime, wantStepGenTime, mq.needFlushTime, mq.needStepGenTime, mq.lastFlushTime, mq.lastStepGenTime)
     flushTime := wantFlushTime
     if mq.lastFlushTime > flushTime {
         flushTime = mq.lastFlushTime
@@ -229,6 +264,7 @@ func (mq *motionQueuing) advanceFlushTime(wantFlushTime float64, wantStepGenTime
     }
     mq.lastFlushTime = flushTime
     mq.lastStepGenTime = stepGenTime
+    mq.tracef("MQ advance end flush=%.9f sg=%.9f clear=%.9f\n", flushTime, stepGenTime, clearHistoryTime)
 
     for _, tq := range mq.trapqs {
         tq.FinalizeMoves(trapqFreeTime, clearHistoryTime)
@@ -251,6 +287,30 @@ func (mq *motionQueuing) dripUpdateTime(startTime float64, endTime float64) erro
         }
     }
     return mq.advanceFlushTime(flushTime+mq.kinFlushDelay, 0.0)
+}
+
+func (mq *motionQueuing) flushHandlerDebugOnce() (bool, error) {
+    // Port of klippy/extras/motion_queuing.py::_flush_handler_debug used when
+    // in fileoutput mode (can_pause=False). This periodically advances step
+    // generation time in ~0.25s batches to keep output chunking stable.
+    fauxTime := mq.needFlushTime - bgflushFauxTimeOffset
+    batchTime := bgflushSGHighTimeSec - bgflushSGLowTimeSec
+    flushCount := 0
+    for mq.lastStepGenTime < fauxTime {
+        target := mq.lastStepGenTime + batchTime
+        if flushCount > 100 && fauxTime > target {
+            skip := math.Floor((fauxTime - target) / batchTime)
+            target += skip * batchTime
+        }
+        if err := mq.advanceFlushTime(0.0, target); err != nil {
+            return false, err
+        }
+        flushCount++
+    }
+    if flushCount != 0 {
+        return true, nil
+    }
+    return false, mq.advanceFlushTime(mq.needFlushTime+bgflushExtraTimeSec, 0.0)
 }
 
 type cartesianKinematics struct {
@@ -636,6 +696,7 @@ func (th *toolhead) dripMove(newPos []float64, speed float64) error {
     if err := th.motion.dripUpdateTime(startTime, endTime); err != nil {
         return err
     }
+    th.advanceMoveTime(endTime)
     th.motion.wipeTrapQ(th.trapq)
     return nil
 }
@@ -1187,17 +1248,32 @@ type trsync struct {
 }
 
 func (t *trsync) start(printTime float64) error {
-    reportClock := uint64(int64(printTime * t.mcuFreq))
+    // Match Klippy: trsync_start is queued with reqclock=clock (start clock),
+    // and the report_clock field is derived from that clock.
+    clock := uint64(int64(printTime * t.mcuFreq))
+    reportClock := clock
     reportTicks := uint64(int64(t.mcuFreq * (trsyncTimeoutSec * trsyncReportRatio)))
     line := fmt.Sprintf("trsync_start oid=%d report_clock=%d report_ticks=%d expire_reason=%d",
         t.oid, reportClock, reportTicks, trsyncExpireReason)
-    return t.rt.sendLine(line, t.rt.cqMain, 0, 0)
+    cq := t.rt.cqTrigger
+    if cq == nil {
+        cq = t.rt.cqMain
+    }
+    return t.rt.sendLine(line, cq, 0, clock)
 }
 
 func (t *trsync) setTimeout(printTime float64) error {
-    clk := uint64(int64((printTime + trsyncTimeoutSec) * t.mcuFreq))
-    line := fmt.Sprintf("trsync_set_timeout oid=%d clock=%d", t.oid, clk)
-    return t.rt.sendLine(line, t.rt.cqMain, 0, 0)
+    // Match Klippy: expire clock is computed from the start clock, but the
+    // command is queued with reqclock=start clock.
+    clock := uint64(int64(printTime * t.mcuFreq))
+    expireTicks := uint64(int64(trsyncTimeoutSec * t.mcuFreq))
+    expireClock := clock + expireTicks
+    line := fmt.Sprintf("trsync_set_timeout oid=%d clock=%d", t.oid, expireClock)
+    cq := t.rt.cqTrigger
+    if cq == nil {
+        cq = t.rt.cqMain
+    }
+    return t.rt.sendLine(line, cq, 0, clock)
 }
 
 type endstop struct {
@@ -1209,27 +1285,37 @@ type endstop struct {
 }
 
 func (e *endstop) homeStart(printTime float64, restTime float64) error {
+    clock := uint64(int64(printTime * e.mcuFreq))
+    cq := e.rt.cqTrigger
+    if cq == nil {
+        cq = e.rt.cqMain
+    }
     if err := e.tr.start(printTime); err != nil {
         return err
     }
-    if err := e.rt.sendLine(fmt.Sprintf("stepper_stop_on_trigger oid=%d trsync_oid=%d", e.stepperOID, e.tr.oid), e.rt.cqMain, 0, 0); err != nil {
+    // In Klippy, this is sent without an explicit reqclock, but it is queued
+    // immediately after trsync_start and must remain adjacent in fileoutput.
+    if err := e.rt.sendLine(fmt.Sprintf("stepper_stop_on_trigger oid=%d trsync_oid=%d", e.stepperOID, e.tr.oid), cq, 0, clock); err != nil {
         return err
     }
     if err := e.tr.setTimeout(printTime); err != nil {
         return err
     }
-    clk := uint64(int64(printTime * e.mcuFreq))
     sampleTicks := uint64(int64(endstopSampleTimeSec * e.mcuFreq))
     restClk := uint64(int64((printTime + restTime) * e.mcuFreq))
-    restTicks := restClk - clk
+    restTicks := restClk - clock
     line := fmt.Sprintf("endstop_home oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d pin_value=1 trsync_oid=%d trigger_reason=1",
-        e.oid, clk, sampleTicks, endstopSampleCount, restTicks, e.tr.oid)
-    return e.rt.sendLine(line, e.rt.cqMain, 0, 0)
+        e.oid, clock, sampleTicks, endstopSampleCount, restTicks, e.tr.oid)
+    return e.rt.sendLine(line, cq, 0, clock)
 }
 
 func (e *endstop) homeStop() error {
     line := fmt.Sprintf("endstop_home oid=%d clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0", e.oid)
-    return e.rt.sendLine(line, e.rt.cqMain, 0, 0)
+    cq := e.rt.cqTrigger
+    if cq == nil {
+        cq = e.rt.cqMain
+    }
+    return e.rt.sendLine(line, cq, 0, 0)
 }
 
 type runtime struct {
@@ -1241,6 +1327,7 @@ type runtime struct {
 
     sq     *chelper.SerialQueue
     cqMain *chelper.CommandQueue
+    cqTrigger *chelper.CommandQueue
 
     motion       *motionQueuing
     toolhead     *toolhead
@@ -1257,9 +1344,34 @@ type runtime struct {
     gm *gcodeMove
     motorOffOrder []string
 
+    trace io.Writer
+
     rawPath string
     rawFile *os.File
     closed  bool
+}
+
+func (r *runtime) setTrace(w io.Writer) {
+    r.trace = w
+    if r.motion != nil {
+        r.motion.setTrace(w)
+    }
+}
+
+func (r *runtime) tracef(format string, args ...any) {
+    if r == nil || r.trace == nil {
+        return
+    }
+    fmt.Fprintf(r.trace, format, args...)
+}
+
+func (r *runtime) traceMotion(prefix string) {
+    if r == nil || r.trace == nil || r.motion == nil {
+        return
+    }
+    mq := r.motion
+    fmt.Fprintf(r.trace, "%s need_flush=%.9f need_sg=%.9f last_flush=%.9f last_sg=%.9f kin_delay=%.9f\n",
+        prefix, mq.needFlushTime, mq.needStepGenTime, mq.lastFlushTime, mq.lastStepGenTime, mq.kinFlushDelay)
 }
 
 func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtime, error) {
@@ -1338,7 +1450,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         f.Close()
         return nil, err
     }
-    sq.SetClockEst(1e12, 0.0, 0, 0)
+    sq.SetClockEst(1e12, chelper.Monotonic(), 0, 0)
 
     cqMain := chelper.NewCommandQueue()
     if cqMain == nil {
@@ -1470,6 +1582,23 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     se.registerStepper("stepper_z", stZ, enZ)
     se.registerStepper("extruder", stE, enE)
 
+    cqTrigger := chelper.NewCommandQueue()
+    if cqTrigger == nil {
+        cqEnE.Free()
+        cqEnZ.Free()
+        cqEnY.Free()
+        cqEnX.Free()
+        stE.free()
+        stZ.free()
+        stY.free()
+        stX.free()
+        motion.free()
+        cqMain.Free()
+        sq.Free()
+        f.Close()
+        return nil, fmt.Errorf("alloc trigger command queue failed")
+    }
+
     trX := &trsync{oid: 1, rt: nil, mcuFreq: mcuFreq}
     trY := &trsync{oid: 4, rt: nil, mcuFreq: mcuFreq}
     trZ := &trsync{oid: 7, rt: nil, mcuFreq: mcuFreq}
@@ -1481,6 +1610,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         setDirID:      setDirID,
         sq:            sq,
         cqMain:        cqMain,
+        cqTrigger:     cqTrigger,
         motion:        motion,
         toolhead:      th,
         stepperEnable: se,
@@ -1502,6 +1632,33 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     rt.endstops[0] = &endstop{oid: 0, stepperOID: 2, tr: trX, rt: rt, mcuFreq: mcuFreq}
     rt.endstops[1] = &endstop{oid: 3, stepperOID: 5, tr: trY, rt: rt, mcuFreq: mcuFreq}
     rt.endstops[2] = &endstop{oid: 6, stepperOID: 8, tr: trZ, rt: rt, mcuFreq: mcuFreq}
+
+    kinFlushDelay := sdsCheckTimeSec
+    for i := 0; i < 3; i++ {
+        st := steppers[i]
+        if st == nil || st.sk == nil {
+            continue
+        }
+        pre := st.sk.GenStepsPreActive()
+        post := st.sk.GenStepsPostActive()
+        if pre > kinFlushDelay {
+            kinFlushDelay = pre
+        }
+        if post > kinFlushDelay {
+            kinFlushDelay = post
+        }
+    }
+    if stE != nil && stE.sk != nil {
+        pre := stE.sk.GenStepsPreActive()
+        post := stE.sk.GenStepsPostActive()
+        if pre > kinFlushDelay {
+            kinFlushDelay = pre
+        }
+        if post > kinFlushDelay {
+            kinFlushDelay = post
+        }
+    }
+    rt.motion.kinFlushDelay = kinFlushDelay
 
     _ = cfgPath
     return rt, nil
@@ -1534,6 +1691,10 @@ func (r *runtime) cleanup(removeFile bool) error {
     if r.cqMain != nil {
         r.cqMain.Free()
         r.cqMain = nil
+    }
+    if r.cqTrigger != nil {
+        r.cqTrigger.Free()
+        r.cqTrigger = nil
     }
     if r.motion != nil {
         r.motion.free()
@@ -1597,6 +1758,22 @@ func (r *runtime) closeAndRead() ([]byte, error) {
 }
 
 func (r *runtime) sendLine(line string, cq *chelper.CommandQueue, minClock uint64, reqClock uint64) error {
+    if r.trace != nil {
+        cqName := "unknown"
+        if cq == r.cqMain {
+            cqName = "main"
+        } else if cq == r.cqTrigger {
+            cqName = "trigger"
+        } else {
+            for idx, q := range r.cqEnPins {
+                if cq == q {
+                    cqName = fmt.Sprintf("en%d", idx)
+                    break
+                }
+            }
+        }
+        r.tracef("SEND cq=%s min=%d req=%d line=%s\n", cqName, minClock, reqClock, strings.TrimSpace(line))
+    }
     b, err := protocol.EncodeCommand(r.formats, line)
     if err != nil {
         return err
@@ -1631,11 +1808,20 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
         r.gm.cmdG19()
         return nil
     case "G2":
-        return r.gm.cmdG2G3(cmd.Args, true)
+        if err := r.gm.cmdG2G3(cmd.Args, true); err != nil {
+            return err
+        }
+        return nil
     case "G3":
-        return r.gm.cmdG2G3(cmd.Args, false)
+        if err := r.gm.cmdG2G3(cmd.Args, false); err != nil {
+            return err
+        }
+        return nil
     case "G0", "G1":
-        return r.gm.cmdG1(cmd.Args)
+        if err := r.gm.cmdG1(cmd.Args); err != nil {
+            return err
+        }
+        return nil
     default:
         return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
     }
@@ -1645,6 +1831,7 @@ func (r *runtime) onEOF() error {
     if r.stepperEnable == nil {
         return nil
     }
+    r.traceMotion("EOF: before motorOff")
     if len(r.motorOffOrder) == 0 {
         return r.stepperEnable.motorOff()
     }
@@ -1652,12 +1839,44 @@ func (r *runtime) onEOF() error {
 }
 
 func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
+    r.tracef("HOMING axis=%d begin speed=%.6f movepos=%v\n", axis, speed, movepos)
+    r.traceMotion("HOMING: pre flushStepGeneration")
     if err := r.toolhead.flushStepGeneration(); err != nil {
         return err
     }
+    r.traceMotion("HOMING: post flushStepGeneration")
     pt, err := r.toolhead.getLastMoveTime()
     if err != nil {
         return err
+    }
+    r.tracef("HOMING axis=%d start_pt=%.9f\n", axis, pt)
+    if r.trace != nil {
+        st := r.steppers[axis]
+        if st != nil && st.stepqueue != nil {
+            center := uint64(int64(pt * r.mcuFreq))
+            half := uint64(int64(0.5 * r.mcuFreq))
+            start := uint64(0)
+            if center > half {
+                start = center - half
+            }
+            end := center + half
+            hs, err := st.stepqueue.ExtractOld(start, end, 64)
+            if err != nil {
+                r.tracef("HOMING axis=%d stepcompress_extract_old err=%v\n", axis, err)
+            } else {
+                r.tracef("HOMING axis=%d stepcompress_history window=[%d,%d] entries=%d\n", axis, start, end, len(hs))
+                for i := 0; i < len(hs) && i < 10; i++ {
+                    p := hs[i]
+                    r.tracef("HOMING axis=%d hist[%d] first=%d last=%d count=%d interval=%d add=%d\n",
+                        axis, i, p.FirstClock, p.LastClock, p.StepCount, p.Interval, p.Add)
+                }
+                if len(hs) > 0 {
+                    p := hs[len(hs)-1]
+                    r.tracef("HOMING axis=%d hist_last first=%d last=%d count=%d interval=%d add=%d\n",
+                        axis, p.FirstClock, p.LastClock, p.StepCount, p.Interval, p.Add)
+                }
+            }
+        }
     }
     if axis < 0 || axis >= 3 {
         return fmt.Errorf("bad axis %d", axis)
@@ -1675,9 +1894,11 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
     }
     moveT := moveD / speed
     restTime := moveT / maxSteps
+    r.tracef("HOMING axis=%d restTime=%.9f moveT=%.9f maxSteps=%.3f\n", axis, restTime, moveT, maxSteps)
     if err := r.endstops[axis].homeStart(pt, restTime); err != nil {
         return err
     }
+    r.traceMotion("HOMING: after homeStart")
     if err := r.toolhead.dwell(homingStartDelaySec); err != nil {
         return err
     }
@@ -1688,6 +1909,32 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
     // endstop sampling, to match Klippy's ordering in debugoutput.
     if err := r.motion.flushAllSteps(); err != nil {
         return err
+    }
+    r.traceMotion("HOMING: before homeStop")
+    if r.trace != nil {
+        st := r.steppers[axis]
+        if st != nil && st.stepqueue != nil {
+            // Re-dump a narrow history window after emitting homing steps to
+            // help debug ordering diffs around trsync_start.
+            center := uint64(int64(pt * r.mcuFreq))
+            span := uint64(int64(0.05 * r.mcuFreq))
+            start := uint64(0)
+            if center > span {
+                start = center - span
+            }
+            end := center + span
+            hs, err := st.stepqueue.ExtractOld(start, end, 64)
+            if err != nil {
+                r.tracef("HOMING axis=%d post-move stepcompress_extract_old err=%v\n", axis, err)
+            } else {
+                r.tracef("HOMING axis=%d post-move history window=[%d,%d] entries=%d\n", axis, start, end, len(hs))
+                for i := 0; i < len(hs) && i < 10; i++ {
+                    p := hs[i]
+                    r.tracef("HOMING axis=%d post[%d] first=%d last=%d count=%d interval=%d add=%d\n",
+                        axis, i, p.FirstClock, p.LastClock, p.StepCount, p.Interval, p.Add)
+                }
+            }
+        }
     }
     return r.endstops[axis].homeStop()
 }

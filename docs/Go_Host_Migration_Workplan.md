@@ -94,6 +94,13 @@
 - `test/klippy/extruders.test`
 - `test/klippy/pressure_advance.test`
 
+**当前已知差距（严格对齐未通过）**
+- `test/klippy/gcode_arcs.test`：`host-h4` 仍有小范围 diff
+  - `queue_step` 在 `interval=8000` 的分块边界处存在 1-step 级别的分配/交错差异（典型表现：`count=499/500/501` 的出现位置不同，末尾 `305/306` 互换）。
+  - EOF motor-off：`queue_digital_out oid=12/13/14/17 clock` 比期望值晚（当前差 `362614` ticks @ 16MHz ≈ `22.66ms`）。
+  - 推测：与 fileoutput 下 `flush_handler_debug` 批量推进（约 `0.25s`）的边界对齐/flush 触发点有关；需要进一步定位 “step generation 推进时间序列” 与 Python 参考的差异来源。
+  - 下一步建议：增加可选诊断（不影响 golden）用于记录每次 `advanceFlushTime()` 的 `(flushTime, stepGenTime, needFlushTime, needStepGenTime)` 序列，并对比 Python 同场景的推进轨迹。
+
 ---
 
 ## 里程碑 H4：硬件闭环（clocksync / 重连 / underrun 保护）

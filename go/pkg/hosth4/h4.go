@@ -3,6 +3,7 @@ package hosth4
 import (
     "bufio"
     "fmt"
+    "io"
     "os"
     "path/filepath"
     "strings"
@@ -11,12 +12,16 @@ import (
     "klipper-go-migration/pkg/protocol"
 )
 
+type CompileOptions struct {
+    Trace io.Writer
+}
+
 // CompileHostH4 executes the H4 host runtime and returns the raw debugoutput
 // msg stream. H4 focuses on cartesian kinematics (G28 homing + bounds checks).
 //
 // On "expected failure" tests, callers may need to accept a non-nil error while
 // still using any produced output (not implemented yet).
-func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary) ([]byte, error) {
+func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, opts *CompileOptions) ([]byte, error) {
     base := filepath.Base(cfgPath)
     if base != "example-cartesian.cfg" && base != "gcode_arcs.cfg" {
         return nil, fmt.Errorf("host-h4 only supports example-cartesian.cfg or gcode_arcs.cfg (got %s)", base)
@@ -39,6 +44,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary) (
         return nil, err
     }
     defer rt.free()
+    if opts != nil && opts.Trace != nil {
+        rt.setTrace(opts.Trace)
+    }
 
     // Connect-phase + init commands (already strict-validated by host-h1).
     initLines, err := hosth1.CompileExampleCartesianConnectPhase(cfgPath, dict)
@@ -98,6 +106,15 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary) (
             return nil, fmt.Errorf("expected failure but test completed successfully")
         }
     } else {
+        for i := 0; i < 10000; i++ {
+            didWork, err := rt.motion.flushHandlerDebugOnce()
+            if err != nil {
+                return nil, err
+            }
+            if !didWork {
+                break
+            }
+        }
         if err := rt.onEOF(); err != nil {
             return nil, err
         }

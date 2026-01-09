@@ -180,3 +180,39 @@ automated changes by coding agents). It is intentionally separate from:
   - `cd go && GOCACHE=/Users/andy/Documents/projects/3dprinter/klipper/out/go-build-cache GOPATH=/Users/andy/Documents/projects/3dprinter/klipper/out/go-path CGO_ENABLED=1 go test ./...`
   - `cd go && GOCACHE=/Users/andy/Documents/projects/3dprinter/klipper/out/go-build-cache GOPATH=/Users/andy/Documents/projects/3dprinter/klipper/out/go-path CGO_ENABLED=1 go run ./cmd/klipper-go-golden -mode host-h4 -only out_of_bounds -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only out_of_bounds --mode strict --fail-missing`
   - `cd go && ... go run ./cmd/klipper-go-golden -mode host-h4 -only gcode_arcs -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only gcode_arcs --mode strict --fail-missing` (currently fails; see diff output)
+
+### 2026-01-08 — Host H4: align fileoutput clock-est + command queues; reduce eager flushing
+
+- Summary: Adjusted `host-h4` to be less “eager” about step generation and closer to Klippy debuginput behavior by (1) removing per-GCode `flush_handler_debug` emulation from `G0/G1/G2/G3`, (2) switching `serialqueue_set_clock_est()` to use a real monotonic `conv_time`, (3) splitting trsync/endstop traffic onto a dedicated command queue, and (4) aligning `flushAllSteps()` with Klippy’s single-pass `flush_all_steps` semantics.
+- Rationale: Klippy debuginput tends to queue lots of motion before flushing; over-eager Go-side flushing introduced systematic timing shifts and altered step compression. Matching Klippy’s clock-est initialization and command-queue topology reduces ordering/scheduling skew.
+- User-visible impact: None (developer tooling / migration harness only).
+- Notable files/areas: `go/pkg/hosth4/runtime.go`, `go/pkg/chelper/chelper.go`.
+- Validation:
+  - `cd go && GOCACHE=/Users/andy/Documents/projects/3dprinter/klipper/out/go-build-cache GOPATH=/Users/andy/Documents/projects/3dprinter/klipper/out/go-path CGO_ENABLED=1 go run ./cmd/klipper-go-golden -mode host-h4 -only out_of_bounds -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only out_of_bounds --mode strict --fail-missing` ✅
+  - `cd go && GOCACHE=/Users/andy/Documents/projects/3dprinter/klipper/out/go-build-cache GOPATH=/Users/andy/Documents/projects/3dprinter/klipper/out/go-path CGO_ENABLED=1 go run ./cmd/klipper-go-golden -mode host-h4 -only gcode_arcs -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only gcode_arcs --mode strict --fail-missing` ❌ (still failing; remaining diffs include step splitting/ordering around homing)
+
+### 2026-01-08 — Host H4: advance toolhead print_time in drip_move
+
+- Summary: Updated `toolhead.dripMove()` to advance `toolhead.printTime` to the computed drip segment `endTime` after `motion.dripUpdateTime()`.
+- Rationale: Klippy’s `toolhead.drip_move()` advances print time as it queues the move. Not advancing `printTime` in Go caused subsequent ordering/timing to drift (and made some homing-related command ordering harder to match).
+- User-visible impact: None (developer tooling / migration harness only).
+- Notable files/areas: `go/pkg/hosth4/runtime.go`.
+- Validation:
+  - `cd go && GOCACHE=/Users/andy/Documents/projects/3dprinter/klipper/out/go-build-cache GOPATH=/Users/andy/Documents/projects/3dprinter/klipper/out/go-path CGO_ENABLED=1 go run ./cmd/klipper-go-golden -mode host-h4 -only out_of_bounds -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only out_of_bounds --mode strict --fail-missing` ✅
+  - `cd go && ... go run ./cmd/klipper-go-golden -mode host-h4 -only gcode_arcs -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only gcode_arcs --mode strict --fail-missing` ❌ (still failing; but removed one early homing stop ordering mismatch)
+
+### 2026-01-09 — Document remaining Host H4 gcode_arcs diffs
+
+- Summary: Added a short “known gaps” note for `host-h4` strict alignment on `gcode_arcs.test` (step splitting near `interval=8000` boundaries and EOF motor-off clock offset).
+- Rationale: Make the current blocker explicit and give a concrete next-debugging direction (flush time sequence tracing) before expanding to more motion/extrusion cases.
+- User-visible impact: None (documentation-only change).
+- Notable files/areas: `docs/Go_Host_Migration_Workplan.md`.
+- Validation: `./scripts/go_migration_golden.py compare --only out_of_bounds --mode strict --fail-missing` ✅; `./scripts/go_migration_golden.py compare --only gcode_arcs --mode strict --fail-missing` ❌.
+
+### 2026-01-09 — Host H4: add optional motion flush trace (diagnostics)
+
+- Summary: Extended `host-h4` `-trace` output to include motion queuing “flush timeline” markers (`noteMovequeueActivity`, `flushAllSteps`, `advanceFlushTime`) so we can debug `gcode_arcs.test` batch boundary diffs without changing golden output.
+- Rationale: The remaining `gcode_arcs.test` diffs look like 0.25s batch boundary misalignment (500 steps @ 8k interval); we need visibility into the Go-side flush/stepGen time sequence to pinpoint divergence.
+- User-visible impact: None (only affects `-trace` diagnostics).
+- Notable files/areas: `go/pkg/hosth4/runtime.go`.
+- Validation: `cd go && GOCACHE=/Users/andy/Documents/projects/3dprinter/klipper/out/go-build-cache GOPATH=/Users/andy/Documents/projects/3dprinter/klipper/out/go-path CGO_ENABLED=1 go test ./...` ✅.

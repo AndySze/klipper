@@ -201,6 +201,7 @@ func main() {
         only    = flag.String("only", "", "only generate for a single test (path or stem)")
         mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw|host-h1|host-h2|host-h3|host-h4")
         dictdir = flag.String("dictdir", "../dict", "dictionary directory")
+        trace   = flag.Bool("trace", false, "write host trace logs (host-h4 only)")
     )
     flag.Parse()
 
@@ -524,7 +525,22 @@ func main() {
                     fmt.Fprintf(os.Stderr, "ERROR: load dict %s: %v\n", dictPath, err)
                     os.Exit(2)
                 }
-                raw, runErr := hosth4.CompileHostH4(cfgPath, testPath, dict)
+                var opts *hosth4.CompileOptions
+                var traceFile *os.File
+                if *trace {
+                    tracePath := filepath.Join(caseDir, fmt.Sprintf("trace-host-h4-%s.log", sections[i].name))
+                    f, err := os.Create(tracePath)
+                    if err != nil {
+                        fmt.Fprintf(os.Stderr, "ERROR: create trace %s: %v\n", tracePath, err)
+                        os.Exit(2)
+                    }
+                    traceFile = f
+                    opts = &hosth4.CompileOptions{Trace: traceFile}
+                }
+                raw, runErr := hosth4.CompileHostH4(cfgPath, testPath, dict, opts)
+                if traceFile != nil {
+                    _ = traceFile.Close()
+                }
                 if runErr != nil {
                     fmt.Fprintf(os.Stderr, "ERROR: compile H4: %v\n", runErr)
                     os.Exit(2)

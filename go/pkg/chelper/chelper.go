@@ -12,6 +12,7 @@ package chelper
 #include "steppersync.h"
 #include "stepcompress.h"
 #include "trapq.h"
+#include "pyhelper.h"
 
 // kin_cartesian.c does not provide a public header; declare the symbol.
 struct stepper_kinematics *cartesian_stepper_alloc(char axis);
@@ -48,6 +49,15 @@ type SyncEmitter struct {
 
 type Stepcompress struct {
     ptr *C.struct_stepcompress
+}
+
+type HistorySteps struct {
+    FirstClock    uint64
+    LastClock     uint64
+    StartPosition int64
+    StepCount     int
+    Interval      int
+    Add           int
 }
 
 type TrapQ struct {
@@ -88,6 +98,10 @@ func NewSerialQueue(fd int, fdType byte, clientID int, name string) (*SerialQueu
 
 func (sq *SerialQueue) SetClockEst(estFreq float64, convTime float64, convClock uint64, lastClock uint64) {
     C.serialqueue_set_clock_est(sq.ptr, C.double(estFreq), C.double(convTime), C.uint64_t(convClock), C.uint64_t(lastClock))
+}
+
+func Monotonic() float64 {
+    return float64(C.get_monotonic())
 }
 
 func (sq *SerialQueue) GetStats() (SerialStats, error) {
@@ -400,6 +414,20 @@ func (sk *StepperKinematics) CheckActive(flushTime float64) float64 {
     return float64(C.itersolve_check_active(sk.ptr, C.double(flushTime)))
 }
 
+func (sk *StepperKinematics) GenStepsPreActive() float64 {
+    if sk == nil || sk.ptr == nil {
+        return 0.0
+    }
+    return float64(C.itersolve_get_gen_steps_pre_active(sk.ptr))
+}
+
+func (sk *StepperKinematics) GenStepsPostActive() float64 {
+    if sk == nil || sk.ptr == nil {
+        return 0.0
+    }
+    return float64(C.itersolve_get_gen_steps_post_active(sk.ptr))
+}
+
 func (sc *Stepcompress) Fill(oid uint32, maxError uint32, queueStepTag int32, setDirTag int32) error {
     if sc == nil || sc.ptr == nil {
         return fmt.Errorf("stepcompress is nil")
@@ -418,4 +446,37 @@ func (sc *Stepcompress) SetInvertSdir(invert bool) error {
     }
     C.stepcompress_set_invert_sdir(sc.ptr, v)
     return nil
+}
+
+func (sc *Stepcompress) ExtractOld(startClock uint64, endClock uint64, max int) ([]HistorySteps, error) {
+    if sc == nil || sc.ptr == nil {
+        return nil, fmt.Errorf("stepcompress is nil")
+    }
+    if max <= 0 {
+        return nil, nil
+    }
+    buf := make([]C.struct_pull_history_steps, max)
+    n := C.stepcompress_extract_old(
+        sc.ptr,
+        &buf[0],
+        C.int(max),
+        C.uint64_t(startClock),
+        C.uint64_t(endClock),
+    )
+    if n < 0 {
+        return nil, fmt.Errorf("stepcompress_extract_old failed: %d", int(n))
+    }
+    out := make([]HistorySteps, 0, int(n))
+    for i := 0; i < int(n); i++ {
+        p := buf[i]
+        out = append(out, HistorySteps{
+            FirstClock:    uint64(p.first_clock),
+            LastClock:     uint64(p.last_clock),
+            StartPosition: int64(p.start_position),
+            StepCount:     int(p.step_count),
+            Interval:      int(p.interval),
+            Add:           int(p.add),
+        })
+    }
+    return out, nil
 }
