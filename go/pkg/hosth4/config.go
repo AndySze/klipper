@@ -360,6 +360,48 @@ func readExtruderStepper(cfg *config) (extruderStepperCfg, error) {
     }, nil
 }
 
+// readExtruderStepperOptional reads an extruder_stepper section if it exists
+func readExtruderStepperOptional(cfg *config, secName string) (extruderStepperCfg, bool, error) {
+    sec, ok := cfg.section(secName)
+    if !ok {
+        return extruderStepperCfg{}, false, nil
+    }
+    stepPin, err := parsePin(sec, "step_pin", true, false)
+    if err != nil {
+        return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+    }
+    dirPin, err := parsePin(sec, "dir_pin", true, false)
+    if err != nil {
+        return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+    }
+    enablePin, err := parsePin(sec, "enable_pin", true, false)
+    if err != nil {
+        return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+    }
+    microsteps, err := parseInt(sec, "microsteps", nil)
+    if err != nil {
+        return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+    }
+    defFull := 200
+    fullSteps, err := parseInt(sec, "full_steps_per_rotation", &defFull)
+    if err != nil {
+        return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+    }
+    rotationDistance, err := parseFloat(sec, "rotation_distance", nil)
+    if err != nil {
+        return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+    }
+    return extruderStepperCfg{
+        name:             secName,
+        stepPin:          stepPin,
+        dirPin:           dirPin,
+        enablePin:        enablePin,
+        microsteps:       microsteps,
+        fullSteps:        fullSteps,
+        rotationDistance: rotationDistance,
+    }, true, nil
+}
+
 func readGcodeArcsResolution(cfg *config) (float64, error) {
     sec, ok := cfg.section("gcode_arcs")
     if !ok {

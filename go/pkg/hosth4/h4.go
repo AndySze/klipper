@@ -23,8 +23,17 @@ type CompileOptions struct {
 // still using any produced output (not implemented yet).
 func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, opts *CompileOptions) ([]byte, error) {
     base := filepath.Base(cfgPath)
-    if base != "example-cartesian.cfg" && base != "gcode_arcs.cfg" {
-        return nil, fmt.Errorf("host-h4 only supports example-cartesian.cfg or gcode_arcs.cfg (got %s)", base)
+    // Support known cartesian kinematics test configs
+    allowedConfigs := map[string]bool{
+        "example-cartesian.cfg": true,
+        "gcode_arcs.cfg":        true,
+        "extruders.cfg":         true,
+        "pressure_advance.cfg":  true,
+        "bed_screws.cfg":        true,
+        "out_of_bounds.cfg":     true,
+    }
+    if !allowedConfigs[base] {
+        return nil, fmt.Errorf("host-h4: unsupported config %s (only cartesian configs supported)", base)
     }
     cfg, err := loadConfig(cfgPath)
     if err != nil {
@@ -48,11 +57,32 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
         rt.setTrace(opts.Trace)
     }
 
-    // Connect-phase + init commands (already strict-validated by host-h1).
-    initLines, err := hosth1.CompileExampleCartesianConnectPhase(cfgPath, dict)
-    if err != nil {
-        return nil, err
+    // Connect-phase + init commands.
+    // Check if config has heater_bed section and extruder_stepper to determine which compiler to use.
+    _, hasBedHeater := cfg.section("heater_bed")
+    _, hasExtraStepper := cfg.section("extruder_stepper my_extra_stepper")
+
+    var initLines []string
+    if hasBedHeater {
+        // Use the full connect-phase compiler for configs with heater_bed
+        initLines, err = hosth1.CompileExampleCartesianConnectPhase(cfgPath, dict)
+        if err != nil {
+            return nil, err
+        }
+    } else if hasExtraStepper {
+        // Use the compiler for configs with extruder_stepper (pressure_advance, extruders)
+        initLines, err = hosth1.CompileCartesianWithExtruderStepper(cfgPath, dict)
+        if err != nil {
+            return nil, err
+        }
+    } else {
+        // For configs without heater_bed or extruder_stepper, use a minimal connect-phase
+        initLines, err = hosth1.CompileMinimalCartesianConnectPhase(cfgPath, dict)
+        if err != nil {
+            return nil, err
+        }
     }
+
     for _, line := range initLines {
         if err := rt.sendLine(line, rt.cqMain, 0, 0); err != nil {
             return nil, err

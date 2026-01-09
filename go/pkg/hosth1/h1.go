@@ -213,6 +213,324 @@ func CompileLinuxTestConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]
     return out, nil
 }
 
+// CompileMinimalCartesianConnectPhase compiles the connect-phase MCU command
+// stream for cartesian configs without heater_bed (e.g., extruders.cfg, pressure_advance.cfg).
+func CompileMinimalCartesianConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+    cfg, err := loadConfig(cfgPath)
+    if err != nil {
+        return nil, err
+    }
+    clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+    if err != nil {
+        return nil, err
+    }
+    adcMax, err := dictConfigFloat(dict, "ADC_MAX")
+    if err != nil {
+        return nil, err
+    }
+    mcuFreq := clockFreq
+
+    // Extract required pins.
+    stepperX, err := readStepper(cfg, "stepper_x")
+    if err != nil {
+        return nil, err
+    }
+    stepperY, err := readStepper(cfg, "stepper_y")
+    if err != nil {
+        return nil, err
+    }
+    stepperZ, err := readStepper(cfg, "stepper_z")
+    if err != nil {
+        return nil, err
+    }
+    extruder, err := readExtruder(cfg, "extruder")
+    if err != nil {
+        return nil, err
+    }
+
+    // Allocate OIDs for cartesian config without heater_bed.
+    o := oids{
+        endstopX: 0, trsyncX: 1, stepperX: 2,
+        endstopY: 3, trsyncY: 4, stepperY: 5,
+        endstopZ: 6, trsyncZ: 7, stepperZ: 8,
+        stepperE: 9,
+        adcBed: 10, pwmBed: 11, // Unused but keep for OID stability
+        enableX: 12, enableY: 13, enableZ: 14,
+        adcE: 15, pwmE: 16, enableE: 17,
+        count: 18,
+    }
+
+    // Derived constants (match klippy defaults).
+    const (
+        pwmCycleTime     = 0.100
+        heaterMaxHeatSec = 3.0
+        stepPulseSec     = 0.000002
+        adcSampleTime    = 0.001
+        adcSampleCount   = 8
+        adcReportTime    = 0.300
+        adcRangeChecks   = 4
+        pwmInitDelaySec  = 0.200
+    )
+    cycleTicks := secondsToClock(mcuFreq, pwmCycleTime)
+    mdurTicks := secondsToClock(mcuFreq, heaterMaxHeatSec)
+    stepPulseTicks := secondsToClock(mcuFreq, stepPulseSec)
+    sampleTicks := secondsToClock(mcuFreq, adcSampleTime)
+    reportTicks := secondsToClock(mcuFreq, adcReportTime)
+    pwmInitClock := secondsToClock(mcuFreq, pwmInitDelaySec)
+
+    // ADC min/max for extruder thermistor.
+    extMin, extMax, err := thermistorMinMaxTicks(extruder.Heater, adcMax, adcSampleCount)
+    if err != nil {
+        return nil, err
+    }
+
+    // Build config commands for steppers and extruder (no heater_bed).
+    configCmds := []string{
+        fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopX, stepperX.Endstop.pin, stepperX.Endstop.pullup),
+        fmt.Sprintf("config_trsync oid=%d", o.trsyncX),
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperX, stepperX.Step.pin, stepperX.Dir.pin, boolToInt(stepperX.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableX, stepperX.Enable.pin, boolToInt(stepperX.Enable.invert), boolToInt(stepperX.Enable.invert), 0),
+
+        fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopY, stepperY.Endstop.pin, stepperY.Endstop.pullup),
+        fmt.Sprintf("config_trsync oid=%d", o.trsyncY),
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperY, stepperY.Step.pin, stepperY.Dir.pin, boolToInt(stepperY.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableY, stepperY.Enable.pin, boolToInt(stepperY.Enable.invert), boolToInt(stepperY.Enable.invert), 0),
+
+        fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopZ, stepperZ.Endstop.pin, stepperZ.Endstop.pullup),
+        fmt.Sprintf("config_trsync oid=%d", o.trsyncZ),
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperZ, stepperZ.Step.pin, stepperZ.Dir.pin, boolToInt(stepperZ.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableZ, stepperZ.Enable.pin, boolToInt(stepperZ.Enable.invert), boolToInt(stepperZ.Enable.invert), 0),
+
+        fmt.Sprintf("config_analog_in oid=%d pin=%s", o.adcE, extruder.Heater.SensorPin.pin),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.pwmE, extruder.Heater.HeaterPin.pin, 0, 0, mdurTicks),
+        fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmE, cycleTicks),
+
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperE, extruder.Step.pin, extruder.Dir.pin, boolToInt(extruder.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableE, extruder.Enable.pin, boolToInt(extruder.Enable.invert), boolToInt(extruder.Enable.invert), 0),
+    }
+
+    // Prepend allocate_oids and compute finalize_config CRC over config_cmds.
+    withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", o.count)}, configCmds...)
+    crcText := strings.Join(withAllocate, "\n")
+    crc := crc32.ChecksumIEEE([]byte(crcText))
+
+    // Build init commands (extruder only, no heater_bed).
+    initCmds := []string{
+        fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+            o.adcE, querySlotClock(mcuFreq, o.adcE), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
+        fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmE, pwmInitClock, 0),
+    }
+
+    out := make([]string, 0, 1+len(configCmds)+1+len(initCmds))
+    out = append(out, withAllocate...)
+    out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+    out = append(out, initCmds...)
+    return out, nil
+}
+
+// CompileCartesianWithExtruderStepper compiles the connect-phase for cartesian
+// configs with an additional extruder_stepper (e.g., extruders.cfg, pressure_advance.cfg).
+func CompileCartesianWithExtruderStepper(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+    cfg, err := loadConfig(cfgPath)
+    if err != nil {
+        return nil, err
+    }
+    clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+    if err != nil {
+        return nil, err
+    }
+    adcMax, err := dictConfigFloat(dict, "ADC_MAX")
+    if err != nil {
+        return nil, err
+    }
+    mcuFreq := clockFreq
+
+    // Extract required pins.
+    stepperX, err := readStepper(cfg, "stepper_x")
+    if err != nil {
+        return nil, err
+    }
+    stepperY, err := readStepper(cfg, "stepper_y")
+    if err != nil {
+        return nil, err
+    }
+    stepperZ, err := readStepper(cfg, "stepper_z")
+    if err != nil {
+        return nil, err
+    }
+    extruder, err := readExtruder(cfg, "extruder")
+    if err != nil {
+        return nil, err
+    }
+
+    // Check for extruder_stepper my_extra_stepper
+    extraStepper, hasExtraStepper, err := readExtruderStepper(cfg, "extruder_stepper my_extra_stepper")
+    if err != nil {
+        return nil, err
+    }
+
+    // Allocate OIDs matching Python's order:
+    // 0: extra_stepper (if present)
+    // 1-2: endstop_x + trsync_x
+    // 3: stepper_x
+    // 11: enable for extra_stepper (if present)
+    // 13: enable_x
+    // 4-5: endstop_y + trsync_y
+    // 6: stepper_y (or 5 if no extra_stepper)
+    // 14: enable_y (or 13 if no extra_stepper)
+    // 7-8: endstop_z + trsync_z
+    // 9: stepper_z (or 8 if no extra_stepper)
+    // 15: enable_z (or 14 if no extra_stepper)
+    // 16: adc_e (or 15 if no extra_stepper)
+    // 17: pwm_e (or 16 if no extra_stepper)
+    // 10: stepper_e (or 9 if no extra_stepper)
+    // 18: enable_e (or 17 if no extra_stepper)
+
+    o := struct {
+        extraStepper    int
+        endstopX        int
+        trsyncX         int
+        stepperX        int
+        enableExtra     int
+        buttons         int
+        enableX         int
+        endstopY        int
+        trsyncY         int
+        stepperY        int
+        enableY         int
+        endstopZ        int
+        trsyncZ         int
+        stepperZ        int
+        enableZ         int
+        adcE            int
+        pwmE            int
+        stepperE        int
+        enableE         int
+        count           int
+    }{
+        endstopX: 1, trsyncX: 2, stepperX: 3, enableX: 13,
+        endstopY: 4, trsyncY: 5, stepperY: 6, enableY: 14,
+        endstopZ: 7, trsyncZ: 8, stepperZ: 9, enableZ: 15,
+        adcE: 16, pwmE: 17, stepperE: 10, enableE: 18,
+    }
+
+    if hasExtraStepper {
+        o.extraStepper = 0
+        o.enableExtra = 11
+        o.buttons = 12
+        // Adjust subsequent OIDs
+        o.stepperX = 3
+        o.enableX = 13
+        o.stepperY = 6
+        o.enableY = 14
+        o.stepperZ = 9
+        o.enableZ = 15
+        o.adcE = 16
+        o.pwmE = 17
+        o.stepperE = 10
+        o.enableE = 18
+        o.count = 19
+    } else {
+        o.count = 18
+    }
+
+    // Derived constants (match klippy defaults).
+    const (
+        pwmCycleTime     = 0.100
+        heaterMaxHeatSec = 3.0
+        stepPulseSec     = 0.000002
+        adcSampleTime    = 0.001
+        adcSampleCount   = 8
+        adcReportTime    = 0.300
+        adcRangeChecks   = 4
+        pwmInitDelaySec  = 0.200
+    )
+    cycleTicks := secondsToClock(mcuFreq, pwmCycleTime)
+    mdurTicks := secondsToClock(mcuFreq, heaterMaxHeatSec)
+    stepPulseTicks := secondsToClock(mcuFreq, stepPulseSec)
+    sampleTicks := secondsToClock(mcuFreq, adcSampleTime)
+    reportTicks := secondsToClock(mcuFreq, adcReportTime)
+    pwmInitClock := secondsToClock(mcuFreq, pwmInitDelaySec)
+
+    // ADC min/max for extruder thermistor.
+    extMin, extMax, err := thermistorMinMaxTicks(extruder.Heater, adcMax, adcSampleCount)
+    if err != nil {
+        return nil, err
+    }
+
+    // Build config commands.
+    configCmds := []string{}
+
+    if hasExtraStepper {
+        configCmds = append(configCmds,
+            fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+                o.extraStepper, extraStepper.Step.pin, extraStepper.Dir.pin, boolToInt(extraStepper.Step.invert), stepPulseTicks),
+            fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+                o.enableExtra, extraStepper.Enable.pin, boolToInt(extraStepper.Enable.invert), boolToInt(extraStepper.Enable.invert), 0),
+        )
+    }
+
+    configCmds = append(configCmds,
+        fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopX, stepperX.Endstop.pin, stepperX.Endstop.pullup),
+        fmt.Sprintf("config_trsync oid=%d", o.trsyncX),
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperX, stepperX.Step.pin, stepperX.Dir.pin, boolToInt(stepperX.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableX, stepperX.Enable.pin, boolToInt(stepperX.Enable.invert), boolToInt(stepperX.Enable.invert), 0),
+
+        fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopY, stepperY.Endstop.pin, stepperY.Endstop.pullup),
+        fmt.Sprintf("config_trsync oid=%d", o.trsyncY),
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperY, stepperY.Step.pin, stepperY.Dir.pin, boolToInt(stepperY.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableY, stepperY.Enable.pin, boolToInt(stepperY.Enable.invert), boolToInt(stepperY.Enable.invert), 0),
+
+        fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopZ, stepperZ.Endstop.pin, stepperZ.Endstop.pullup),
+        fmt.Sprintf("config_trsync oid=%d", o.trsyncZ),
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperZ, stepperZ.Step.pin, stepperZ.Dir.pin, boolToInt(stepperZ.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableZ, stepperZ.Enable.pin, boolToInt(stepperZ.Enable.invert), boolToInt(stepperZ.Enable.invert), 0),
+
+        fmt.Sprintf("config_analog_in oid=%d pin=%s", o.adcE, extruder.Heater.SensorPin.pin),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.pwmE, extruder.Heater.HeaterPin.pin, 0, 0, mdurTicks),
+        fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmE, cycleTicks),
+
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperE, extruder.Step.pin, extruder.Dir.pin, boolToInt(extruder.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableE, extruder.Enable.pin, boolToInt(extruder.Enable.invert), boolToInt(extruder.Enable.invert), 0),
+    )
+
+    // Prepend allocate_oids and compute finalize_config CRC over config_cmds.
+    withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", o.count)}, configCmds...)
+    crcText := strings.Join(withAllocate, "\n")
+    crc := crc32.ChecksumIEEE([]byte(crcText))
+
+    // Build init commands.
+    initCmds := []string{
+        fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+            o.adcE, querySlotClock(mcuFreq, o.adcE), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
+        fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmE, pwmInitClock, 0),
+    }
+
+    out := make([]string, 0, 1+len(configCmds)+1+len(initCmds))
+    out = append(out, withAllocate...)
+    out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+    out = append(out, initCmds...)
+    return out, nil
+}
+
 type oids struct {
     endstopX int
     trsyncX  int
@@ -367,12 +685,53 @@ func readExtruder(cfg *config, name string) (extruder, error) {
     return extruder{Step: stepPin, Dir: dirPin, Enable: enPin, Heater: h}, nil
 }
 
+// extruderStepper represents an auxiliary extruder stepper (without heater/endstop)
+type extruderStepper struct {
+    Step   pin
+    Dir    pin
+    Enable pin
+}
+
+// readExtruderStepper reads an extruder_stepper section (optional, returns has=false if not found)
+func readExtruderStepper(cfg *config, name string) (extruderStepper, bool, error) {
+    sec, ok := cfg.sections[name]
+    if !ok {
+        return extruderStepper{}, false, nil
+    }
+    stepPin, err := parsePin(sec, "step_pin", true, false)
+    if err != nil {
+        return extruderStepper{}, false, err
+    }
+    dirPin, err := parsePin(sec, "dir_pin", true, false)
+    if err != nil {
+        return extruderStepper{}, false, err
+    }
+    enPin, err := parsePin(sec, "enable_pin", true, false)
+    if err != nil {
+        return extruderStepper{}, false, err
+    }
+    return extruderStepper{Step: stepPin, Dir: dirPin, Enable: enPin}, true, nil
+}
+
 func readHeater(cfg *config, name string) (heater, error) {
     sec, ok := cfg.sections[name]
     if !ok {
         return heater{}, fmt.Errorf("missing [%s] section", name)
     }
     return readHeaterFromSection(sec)
+}
+
+// readHeaterOptional reads a heater section if it exists, returns nil if not found
+func readHeaterOptional(cfg *config, name string) (*heater, error) {
+    sec, ok := cfg.sections[name]
+    if !ok {
+        return nil, nil
+    }
+    h, err := readHeaterFromSection(sec)
+    if err != nil {
+        return nil, err
+    }
+    return &h, nil
 }
 
 func readHeaterFromSection(sec map[string]string) (heater, error) {

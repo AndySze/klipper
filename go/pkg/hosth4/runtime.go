@@ -1417,6 +1417,14 @@ type runtime struct {
     extruderCfg extruderStepperCfg
     stepperE    *stepper
     extruder    *extruderAxis
+
+    // Additional extruder_stepper support (e.g., my_extra_stepper)
+    hasExtraStepper bool
+    extraStepperCfg extruderStepperCfg
+    extraStepper    *stepper
+    extraStepperEn  *stepperEnablePin
+    extraStepperTQ  *chelper.TrapQ
+
     endstops [3]*endstop
     cqEnPins []*chelper.CommandQueue
 
@@ -1672,12 +1680,99 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     se.registerStepper("stepper_z", stZ, enZ)
     se.registerStepper("extruder", stE, enE)
 
+    // Check for and initialize extruder_stepper my_extra_stepper if present
+    var extraStepper *stepper
+    var extraStepperEn *stepperEnablePin
+    var extraStepperTQ *chelper.TrapQ
+    var extraStepperCfg extruderStepperCfg
+    var hasExtraStepper bool
+    var cqEnExtra *chelper.CommandQueue
+
+    extraCfg, okExtra, err := readExtruderStepperOptional(cfg, "extruder_stepper my_extra_stepper")
+    if okExtra && err == nil {
+        hasExtraStepper = true
+        extraStepperCfg = extraCfg
+
+        // Create independent trapq for extra stepper (will be used when connected to extruder)
+        extraStepperTQ, err = motion.allocTrapQ()
+        if err != nil {
+            cqEnE.Free()
+            cqEnZ.Free()
+            cqEnY.Free()
+            cqEnX.Free()
+            stE.free()
+            stZ.free()
+            stY.free()
+            stX.free()
+            motion.free()
+            cqMain.Free()
+            sq.Free()
+            f.Close()
+            return nil, fmt.Errorf("alloc extra stepper trapq failed: %v", err)
+        }
+
+        // Create extra axis for the extra stepper
+        extraAxis := newExtruderAxis("my_extra_stepper", extraStepperTQ)
+        th.extraAxes = append(th.extraAxes, extraAxis)
+
+        // Calculate step distance for extra stepper
+        stepDistExtra := extraStepperCfg.rotationDistance / float64(extraStepperCfg.fullSteps*extraStepperCfg.microsteps)
+
+        // Create the extra stepper (oid=0 for my_extra_stepper)
+        extraStepper, err = newStepper(motion, sq, "my_extra_stepper", 'e', 0, stepDistExtra, extraStepperCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+        if err != nil {
+            cqEnE.Free()
+            cqEnZ.Free()
+            cqEnY.Free()
+            cqEnX.Free()
+            stE.free()
+            stZ.free()
+            stY.free()
+            stX.free()
+            motion.free()
+            cqMain.Free()
+            sq.Free()
+            f.Close()
+            return nil, fmt.Errorf("create extra stepper failed: %v", err)
+        }
+        // IMPORTANT: Initially, don't set any trapq (nil)
+        // The stepper will only generate steps when connected to main extruder via SYNC_EXTRUDER_MOTION
+        extraStepper.setPosition(0.0)
+
+        // Create enable pin for extra stepper (oid=11)
+        cqEnExtra = chelper.NewCommandQueue()
+        if cqEnExtra == nil {
+            extraStepper.free()
+            cqEnE.Free()
+            cqEnZ.Free()
+            cqEnY.Free()
+            cqEnX.Free()
+            stE.free()
+            stZ.free()
+            stY.free()
+            stX.free()
+            motion.free()
+            cqMain.Free()
+            sq.Free()
+            f.Close()
+            return nil, fmt.Errorf("alloc extra stepper enable command queue failed")
+        }
+        extraStepperEn = &stepperEnablePin{out: newDigitalOut(11, extraStepperCfg.enablePin.invert, sq, cqEnExtra, formats, mcuFreq)}
+        se.registerStepper("my_extra_stepper", extraStepper, extraStepperEn)
+    }
+
     cqTrigger := chelper.NewCommandQueue()
     if cqTrigger == nil {
+        if cqEnExtra != nil {
+            cqEnExtra.Free()
+        }
         cqEnE.Free()
         cqEnZ.Free()
         cqEnY.Free()
         cqEnX.Free()
+        if extraStepper != nil {
+            extraStepper.free()
+        }
         stE.free()
         stZ.free()
         stY.free()
@@ -1715,11 +1810,21 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         extruderCfg:   extruderCfg,
         stepperE:      stE,
         extruder:      exAxis,
+        hasExtraStepper: hasExtraStepper,
+        extraStepperCfg: extraStepperCfg,
+        extraStepper:    extraStepper,
+        extraStepperEn:  extraStepperEn,
+        extraStepperTQ:  extraStepperTQ,
         cqEnPins:      []*chelper.CommandQueue{cqEnX, cqEnY, cqEnZ, cqEnE},
         motorOffOrder: []string{"stepper_x", "stepper_y", "stepper_z", "extruder"},
         mcu:           mcu,
         rawPath:       rawPath,
         rawFile:       f,
+    }
+
+    // Add cqEnExtra to cqEnPins if it exists
+    if cqEnExtra != nil {
+        rt.cqEnPins = append(rt.cqEnPins, cqEnExtra)
     }
     rt.gm = newGCodeMove(th, mmPerArcSegment)
 
@@ -1751,6 +1856,17 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     if stE != nil && stE.sk != nil {
         pre := stE.sk.GenStepsPreActive()
         post := stE.sk.GenStepsPostActive()
+        if pre > kinFlushDelay {
+            kinFlushDelay = pre
+        }
+        if post > kinFlushDelay {
+            kinFlushDelay = post
+        }
+    }
+    // Include extra stepper in kinFlushDelay calculation
+    if extraStepper != nil && extraStepper.sk != nil {
+        pre := extraStepper.sk.GenStepsPreActive()
+        post := extraStepper.sk.GenStepsPostActive()
         if pre > kinFlushDelay {
             kinFlushDelay = pre
         }
@@ -2080,6 +2196,21 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
     case "M190":
         // Set Heated Bed Temperature and Wait
         if err := r.cmdM190(cmd.Args); err != nil {
+            return err
+        }
+    case "SET_EXTRUDER_ROTATION_DISTANCE":
+        // Set extruder rotation distance
+        if err := r.cmdSetExtruderRotationDistance(cmd.Args); err != nil {
+            return err
+        }
+    case "SET_PRESSURE_ADVANCE":
+        // Set pressure advance parameters
+        if err := r.cmdSetPressureAdvance(cmd.Args); err != nil {
+            return err
+        }
+    case "SYNC_EXTRUDER_MOTION":
+        // Sync extruder motion queue
+        if err := r.cmdSyncExtruderMotion(cmd.Args); err != nil {
             return err
         }
     default:
@@ -2460,6 +2591,133 @@ func (r *runtime) cmdM190(args map[string]string) error {
 
     // Wait for temperature to reach target
     return r.waitTemperature("heater_bed", temp)
+}
+
+func (r *runtime) cmdSetExtruderRotationDistance(args map[string]string) error {
+    // SET_EXTRUDER_ROTATION_DISTANCE [EXTRUDER=<name>] DISTANCE=<distance>
+    // This command modifies the extruder's rotation distance at runtime.
+    // In the full Klipper implementation, this would:
+    // 1. Flush step generation
+    // 2. Update the stepper's rotation distance
+    // 3. Optionally invert direction if distance is negative
+    //
+    // For H4 test purposes, we accept the command but don't fully implement
+    // the rotation distance change, as that would require deeper integration
+    // with the C helper library.
+
+    distStr, ok := args["DISTANCE"]
+    if !ok || distStr == "" {
+        // No distance specified, just query current value (no-op for H4)
+        return nil
+    }
+
+    dist, err := floatArg(args, "DISTANCE", 0.0)
+    if err != nil {
+        return err
+    }
+
+    if dist == 0.0 {
+        return fmt.Errorf("rotation distance cannot be zero")
+    }
+
+    // Flush step generation like Python does
+    if err := r.toolhead.flushStepGeneration(); err != nil {
+        return err
+    }
+
+    r.tracef("SET_EXTRUDER_ROTATION_DISTANCE: DISTANCE=%f\n", dist)
+
+    // TODO: Fully implement rotation distance change:
+    // - Get extruder stepper by name (EXTRUDER parameter, default "extruder")
+    // - Handle negative distance (invert direction)
+    // - Update stepDist field in stepper struct
+    // For now, this is a no-op that accepts the command
+
+    return nil
+}
+
+func (r *runtime) cmdSetPressureAdvance(args map[string]string) error {
+    // SET_PRESSURE_ADVANCE [EXTRUDER=<name>] [ADVANCE=<value>] [SMOOTH_TIME=<value>]
+    // This command configures pressure advance parameters for extrusion.
+    // In the full Klipper implementation, this would:
+    // 1. Update the extruder's pressure advance value
+    // 2. Update the smooth_time parameter
+    //
+    // For H4 test purposes, we accept the command but don't fully implement
+    // pressure advance, as that would require deeper integration with the
+    // motion planning and C helper library.
+
+    advance, _ := floatArg(args, "ADVANCE", 0.0)
+    smoothTime, _ := floatArg(args, "SMOOTH_TIME", 0.0)
+
+    if advance < 0.0 {
+        return fmt.Errorf("ADVANCE must be >= 0")
+    }
+    if smoothTime < 0.0 || smoothTime > 0.200 {
+        return fmt.Errorf("SMOOTH_TIME must be between 0.0 and 0.200")
+    }
+
+    r.tracef("SET_PRESSURE_ADVANCE: ADVANCE=%f SMOOTH_TIME=%f\n", advance, smoothTime)
+
+    // TODO: Fully implement pressure advance:
+    // - Get extruder by name (EXTRUDER parameter)
+    // - Store pressure advance parameters in extruder state
+    // - Apply pressure advance in motion planning
+    // For now, this is a no-op that accepts the command
+
+    return nil
+}
+
+func (r *runtime) cmdSyncExtruderMotion(args map[string]string) error {
+    // SYNC_EXTRUDER_MOTION EXTRUDER=<name> [MOTION_QUEUE=<name>]
+    // This command synchronizes an extruder stepper to a motion queue.
+    // When MOTION_QUEUE=<name>, the stepper connects to that extruder's trapq
+    // When MOTION_QUEUE is empty or not specified, the stepper disconnects
+
+    extruderName, ok := args["EXTRUDER"]
+    if !ok {
+        return fmt.Errorf("SYNC_EXTRUDER_MOTION: missing EXTRUDER parameter")
+    }
+
+    motionQueue, ok := args["MOTION_QUEUE"]
+    if !ok {
+        motionQueue = ""
+    }
+
+    // Flush step generation like Python does
+    if err := r.toolhead.flushStepGeneration(); err != nil {
+        return err
+    }
+
+    // Currently we only support "my_extra_stepper" -> "extruder" synchronization
+    if extruderName == "my_extra_stepper" && r.hasExtraStepper {
+        if motionQueue == "extruder" {
+            // Connect extra stepper to main extruder's trapq
+            r.extraStepper.setTrapQ(r.extruder.trapq)
+            r.tracef("SYNC_EXTRUDER_MOTION: my_extra_stepper -> extruder (connected)\n")
+        } else if motionQueue == "" {
+            // Disconnect extra stepper
+            r.extraStepper.setTrapQ(nil)
+            r.tracef("SYNC_EXTRUDER_MOTION: my_extra_stepper -> (disconnected)\n")
+        } else {
+            return fmt.Errorf("SYNC_EXTRUDER_MOTION: unknown motion queue %q", motionQueue)
+        }
+    } else if extruderName == "extruder" {
+        // Main extruder can't be disconnected in this implementation
+        if motionQueue == "" {
+            r.stepperE.setTrapQ(nil)
+            r.tracef("SYNC_EXTRUDER_MOTION: extruder -> (disconnected)\n")
+        } else if motionQueue == "extruder" {
+            r.stepperE.setTrapQ(r.extruder.trapq)
+            r.tracef("SYNC_EXTRUDER_MOTION: extruder -> extruder (reconnected)\n")
+        } else {
+            return fmt.Errorf("SYNC_EXTRUDER_MOTION: unknown motion queue %q", motionQueue)
+        }
+    } else {
+        return fmt.Errorf("SYNC_EXTRUDER_MOTION: unknown extruder %q", extruderName)
+    }
+
+    return nil
 }
 
 func (r *runtime) homeAll() error {

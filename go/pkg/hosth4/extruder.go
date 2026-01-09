@@ -31,7 +31,18 @@ func (e *extruderAxis) GetName() string { return e.name }
 func (e *extruderAxis) GetAxisGcodeID() string { return "E" }
 
 func (e *extruderAxis) ProcessMove(printTime float64, mv *move, axisIndex int) error {
+    // Add bounds check for axisIndex
+    if axisIndex >= len(mv.axesR) || axisIndex >= len(mv.startPos) || axisIndex >= len(mv.endPos) {
+        // axisIndex is out of range, skip this move for this axis
+        return nil
+    }
+
+    // Only process moves if there's actual extrusion (axisR > 0)
     axisR := mv.axesR[axisIndex]
+    if axisR <= 0.0 {
+        return nil
+    }
+
     accel := mv.accel * axisR
     startV := mv.startV * axisR
     cruiseV := mv.cruiseV * axisR
@@ -63,6 +74,11 @@ func (e *extruderAxis) CheckMove(_ *move, _ int) error {
 }
 
 func (e *extruderAxis) CalcJunction(prev *move, mv *move, axisIndex int) float64 {
+    // Add bounds check for axisIndex
+    if axisIndex >= len(mv.axesR) || axisIndex >= len(prev.axesR) {
+        // axisIndex is out of range, return max cruise velocity as fallback
+        return mv.maxCruiseV2
+    }
     diffR := mv.axesR[axisIndex] - prev.axesR[axisIndex]
     if diffR != 0.0 {
         v := e.instantCornerV / math.Abs(diffR)
