@@ -608,6 +608,7 @@ func (th *toolhead) getLastMoveTime() (float64, error) {
     if th.err != nil {
         return 0.0, th.err
     }
+    th.motion.tracef("getLastMoveTime begin special_state=%q pt=%.9f\n", th.specialState, th.printTime)
     if th.specialState != "" {
         if err := th.flushLookahead(false); err != nil {
             return 0.0, err
@@ -618,6 +619,7 @@ func (th *toolhead) getLastMoveTime() (float64, error) {
             return 0.0, err
         }
     }
+    th.motion.tracef("getLastMoveTime end pt=%.9f\n", th.printTime)
     return th.printTime, nil
 }
 
@@ -628,14 +630,18 @@ func (th *toolhead) dwell(delay float64) error {
     if delay < 0.0 {
         delay = 0.0
     }
+    th.motion.tracef("DWELL begin delay=%.9f pt=%.9f\n", delay, th.printTime)
     if err := th.flushLookahead(false); err != nil {
         return err
     }
+    th.motion.tracef("DWELL after flushLookahead pt=%.9f\n", th.printTime)
     pt, err := th.getLastMoveTime()
     if err != nil {
         return err
     }
+    th.motion.tracef("DWELL getLastMoveTime pt=%.9f target=%.9f\n", pt, pt+delay)
     th.advanceMoveTime(pt + delay)
+    th.motion.tracef("DWELL after advanceMoveTime pt=%.9f\n", th.printTime)
     return nil
 }
 
@@ -1243,27 +1249,58 @@ func (se *stepperEnable) registerStepper(name string, stepper *stepper, pin *ste
 }
 
 func (se *stepperEnable) motorOffOrdered(names []string) error {
-    if err := se.toolhead.flushStepGeneration(); err != nil {
+    th := se.toolhead
+    th.motion.tracef("MOTOR_OFF begin flushStepGeneration pt=%.9f\n", th.printTime)
+    if err := th.flushStepGeneration(); err != nil {
         return err
     }
-    if err := se.toolhead.dwell(disableStallTimeSec); err != nil {
+    th.motion.tracef("MOTOR_OFF after flushStepGeneration pt=%.9f\n", th.printTime)
+
+    // Clear special state to prevent calcPrintTime from advancing
+    // print_time unexpectedly based on last_step_gen_time.
+    if th.specialState != "" {
+        th.motion.tracef("MOTOR_OFF clearing special_state=%q\n", th.specialState)
+        th.specialState = ""
+    }
+
+    // Process lookahead to handle any pending moves
+    if err := th.processLookahead(false); err != nil {
         return err
     }
-    pt, err := se.toolhead.getLastMoveTime()
+    th.motion.tracef("MOTOR_OFF after processLookahead pt=%.9f\n", th.printTime)
+
+    // Match Python's motor_off behavior:
+    // - dwell(DISABLE_STALL_TIME) advances print_time
+    // - motor_disable uses the advanced print_time
+    // - dwell again after disabling
+    // But we avoid using the dwell() function here because it may
+    // trigger flushLookahead which sets special_state=NeedPrime and
+    // causes getLastMoveTime to call calcPrintTime, advancing time based
+    // on last_step_gen_time instead of current print_time.
+    pt := th.printTime
+    th.advanceMoveTime(pt + disableStallTimeSec)
+    th.motion.tracef("MOTOR_OFF after first dwell pt=%.9f\n", th.printTime)
+
+    // Get the print_time after dwell (now without NeedPrime state)
+    pt, err := th.getLastMoveTime()
     if err != nil {
         return err
     }
+    th.motion.tracef("MOTOR_OFF getLastMoveTime pt=%.9f\n", pt)
     for _, name := range names {
         et := se.lines[name]
         if et != nil && et.isEnabled {
+            th.motion.tracef("MOTOR_OFF disable %s at pt=%.9f\n", name, pt)
             et.motorDisable(pt)
         }
     }
-    if err := se.toolhead.dwell(disableStallTimeSec); err != nil {
-        return err
-    }
-    if se.toolhead.kin != nil {
-        se.toolhead.kin.clearHomingState("xyz")
+
+    // Second dwell after disabling motors
+    th.advanceMoveTime(pt + disableStallTimeSec)
+    th.motion.tracef("MOTOR_OFF after second dwell pt=%.9f\n", th.printTime)
+
+    if th.kin != nil {
+        th.kin.clearHomingState("xyz")
     }
     return nil
 }
@@ -2049,9 +2086,10 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
         return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
     }
 
-    // After executing each gcode command, trigger batch flushing
-    // This matches Python's _flush_handler_debug behavior
-    return r.toolhead.motion.flushPendingBatch()
+    // NOTE: Removed flushPendingBatch() call here. Python uses asynchronous
+    // timer-based flushing (_flush_handler_debug), not synchronous flushing
+    // after each command. Flushing is handled at EOF by flushHandlerDebugOnce().
+    return nil
 }
 
 func (r *runtime) onEOF() error {
