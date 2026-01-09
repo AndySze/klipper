@@ -368,3 +368,46 @@ func readGcodeArcsResolution(cfg *config) (float64, error) {
     def := 1.0
     return parseFloat(sec, "resolution", &def)
 }
+
+// readHeaterConfigs reads all heater configurations from the config file
+func readHeaterConfigs(cfg *config) ([]*heaterConfig, error) {
+    var heaters []*heaterConfig
+
+    // Check for [extruder] section
+    if sec, ok := cfg.section("extruder"); ok {
+        // Only create heater if heater_pin is present
+        if _, hasHeater := sec["heater_pin"]; hasHeater {
+            hc, err := parseHeaterConfig("extruder", sec)
+            if err != nil {
+                return nil, fmt.Errorf("[extruder] %v", err)
+            }
+            heaters = append(heaters, hc)
+        }
+    }
+
+    // Check for [heater_bed] section
+    if sec, ok := cfg.section("heater_bed"); ok {
+        hc, err := parseHeaterConfig("heater_bed", sec)
+        if err != nil {
+            return nil, fmt.Errorf("[heater_bed] %v", err)
+        }
+        heaters = append(heaters, hc)
+    }
+
+    // Check for [heater_generic] sections
+    for secName := range cfg.sections {
+        if strings.HasPrefix(secName, "heater_generic ") {
+            sec, ok := cfg.section(secName)
+            if !ok {
+                continue
+            }
+            hc, err := parseHeaterConfig(secName, sec)
+            if err != nil {
+                return nil, fmt.Errorf("[%s] %v", secName, err)
+            }
+            heaters = append(heaters, hc)
+        }
+    }
+
+    return heaters, nil
+}
