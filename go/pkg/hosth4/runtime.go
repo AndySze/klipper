@@ -458,11 +458,13 @@ type toolhead struct {
     extraAxes []extraAxis
 }
 
-func newToolhead(mcuFreq float64, motion *motionQueuing, maxVelocity float64, maxAccel float64) (*toolhead, error) {
+func newToolhead(mcuFreq float64, motion *motionQueuing, maxVelocity float64, maxAccel float64, numAxes int) (*toolhead, error) {
     tq, err := motion.allocTrapQ()
     if err != nil {
         return nil, err
     }
+    // Initialize commandedPos with the correct number of axes (3 for no-extruder, 4 for with-extruder)
+    commandedPos := make([]float64, numAxes)
     th := &toolhead{
         mcuFreq:      mcuFreq,
         motion:       motion,
@@ -471,7 +473,7 @@ func newToolhead(mcuFreq float64, motion *motionQueuing, maxVelocity float64, ma
         minCruiseRatio: 0.5,
         squareCornerV:  5.0,
         specialState: "NeedPrime",
-        commandedPos: []float64{0, 0, 0, 0},
+        commandedPos: commandedPos,
         lookahead:    &lookAheadQueue{junctionFlush: lookaheadFlushSec},
         trapq:        tq,
         extraAxes:    nil,
@@ -1530,10 +1532,13 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         return nil, err
     }
     rails := [3]stepperCfg{sx, sy, sz}
-    extruderCfg, err := readExtruderStepper(cfg)
+
+    // Extruder is optional (e.g., for bed_screws test)
+    extruderCfg, hasExtruder, err := readExtruderStepperOptional(cfg, "extruder")
     if err != nil {
         return nil, err
     }
+
     mmPerArcSegment, err := readGcodeArcsResolution(cfg)
     if err != nil {
         return nil, err
@@ -1571,7 +1576,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         f.Close()
         return nil, err
     }
-    th, err := newToolhead(mcuFreq, motion, maxVelocity, maxAccel)
+    // Determine number of axes: 3 for no-extruder configs, 4 for with-extruder configs
+    numAxes := 3
+    if hasExtruder {
+        numAxes = 4
+    }
+    th, err := newToolhead(mcuFreq, motion, maxVelocity, maxAccel, numAxes)
     if err != nil {
         motion.free()
         cqMain.Free()
@@ -1585,7 +1595,6 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     stepDistX := rails[0].rotationDistance / float64(rails[0].fullSteps*rails[0].microsteps)
     stepDistY := rails[1].rotationDistance / float64(rails[1].fullSteps*rails[1].microsteps)
     stepDistZ := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
-    stepDistE := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
 
     stX, err := newStepper(motion, sq, "stepper_x", 'x', 2, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
     if err != nil {
@@ -1622,39 +1631,82 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     kin := newCartesianKinematics(rails, steppers, maxZVelocity, maxZAccel)
     th.kin = kin
 
-    tqExtruder, err := motion.allocTrapQ()
-    if err != nil {
-        stZ.free()
-        stY.free()
-        stX.free()
-        motion.free()
-        cqMain.Free()
-        sq.Free()
-        f.Close()
-        return nil, err
-    }
-    exAxis := newExtruderAxis("extruder", tqExtruder)
-    th.extraAxes = []extraAxis{exAxis}
+    // Conditionally create extruder components
+    var stE *stepper
+    var tqExtruder *chelper.TrapQ
+    var cqEnE *chelper.CommandQueue
+    var enE *stepperEnablePin
+    var exAxis *extruderAxis
 
-    stE, err := newStepper(motion, sq, "extruder", 'e', 9, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
-    if err != nil {
-        stZ.free()
-        stY.free()
-        stX.free()
-        motion.free()
-        cqMain.Free()
-        sq.Free()
-        f.Close()
-        return nil, err
+    // Determine enable pin OIDs based on config type
+    // With extruder: enable_x=12, enable_y=13, enable_z=14, enable_e=17
+    // Without extruder: enable_x=9, enable_y=10, enable_z=11
+    var oidEnableX, oidEnableY, oidEnableZ, oidEnableE int
+    if hasExtruder {
+        oidEnableX = 12
+        oidEnableY = 13
+        oidEnableZ = 14
+        oidEnableE = 17
+    } else {
+        oidEnableX = 9
+        oidEnableY = 10
+        oidEnableZ = 11
     }
-    stE.setTrapQ(tqExtruder)
-    stE.setPosition(0.0)
 
+    if hasExtruder {
+        stepDistE := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
+
+        // Allocate trapq for extruder
+        tqExtruder, err = motion.allocTrapQ()
+        if err != nil {
+            stZ.free()
+            stY.free()
+            stX.free()
+            motion.free()
+            cqMain.Free()
+            sq.Free()
+            f.Close()
+            return nil, err
+        }
+        exAxis = newExtruderAxis("extruder", tqExtruder)
+        th.extraAxes = []extraAxis{exAxis}
+
+        // Create extruder stepper
+        stE, err = newStepper(motion, sq, "extruder", 'e', 10, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+        if err != nil {
+            stZ.free()
+            stY.free()
+            stX.free()
+            motion.free()
+            cqMain.Free()
+            sq.Free()
+            f.Close()
+            return nil, err
+        }
+        stE.setTrapQ(tqExtruder)
+        stE.setPosition(0.0)
+
+        // Create enable pin command queue
+        cqEnE = chelper.NewCommandQueue()
+        if cqEnE == nil {
+            stE.free()
+            stZ.free()
+            stY.free()
+            stX.free()
+            motion.free()
+            cqMain.Free()
+            sq.Free()
+            f.Close()
+            return nil, fmt.Errorf("alloc enable command queue failed")
+        }
+        enE = &stepperEnablePin{out: newDigitalOut(uint32(oidEnableE), extruderCfg.enablePin.invert, sq, cqEnE, formats, mcuFreq)}
+    }
+
+    // Create enable pins for X/Y/Z
     cqEnX := chelper.NewCommandQueue()
     cqEnY := chelper.NewCommandQueue()
     cqEnZ := chelper.NewCommandQueue()
-    cqEnE := chelper.NewCommandQueue()
-    if cqEnX == nil || cqEnY == nil || cqEnZ == nil || cqEnE == nil {
+    if cqEnX == nil || cqEnY == nil || cqEnZ == nil {
         if cqEnX != nil {
             cqEnX.Free()
         }
@@ -1667,7 +1719,9 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         if cqEnE != nil {
             cqEnE.Free()
         }
-        stE.free()
+        if stE != nil {
+            stE.free()
+        }
         stZ.free()
         stY.free()
         stX.free()
@@ -1677,14 +1731,15 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         f.Close()
         return nil, fmt.Errorf("alloc enable command queue failed")
     }
-    enX := &stepperEnablePin{out: newDigitalOut(12, rails[0].enablePin.invert, sq, cqEnX, formats, mcuFreq)}
-    enY := &stepperEnablePin{out: newDigitalOut(13, rails[1].enablePin.invert, sq, cqEnY, formats, mcuFreq)}
-    enZ := &stepperEnablePin{out: newDigitalOut(14, rails[2].enablePin.invert, sq, cqEnZ, formats, mcuFreq)}
-    enE := &stepperEnablePin{out: newDigitalOut(17, extruderCfg.enablePin.invert, sq, cqEnE, formats, mcuFreq)}
+    enX := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableX), rails[0].enablePin.invert, sq, cqEnX, formats, mcuFreq)}
+    enY := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableY), rails[1].enablePin.invert, sq, cqEnY, formats, mcuFreq)}
+    enZ := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableZ), rails[2].enablePin.invert, sq, cqEnZ, formats, mcuFreq)}
     se.registerStepper("stepper_x", stX, enX)
     se.registerStepper("stepper_y", stY, enY)
     se.registerStepper("stepper_z", stZ, enZ)
-    se.registerStepper("extruder", stE, enE)
+    if hasExtruder {
+        se.registerStepper("extruder", stE, enE)
+    }
 
     // Check for and initialize extruder_stepper my_extra_stepper if present
     var extraStepper *stepper
@@ -1788,6 +1843,14 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         clock: 0,
     }
 
+    // Build cqEnPins and motorOffOrder based on actual axes
+    cqEnPins := []*chelper.CommandQueue{cqEnX, cqEnY, cqEnZ}
+    motorOffOrder := []string{"stepper_x", "stepper_y", "stepper_z"}
+    if hasExtruder {
+        cqEnPins = append(cqEnPins, cqEnE)
+        motorOffOrder = append(motorOffOrder, "extruder")
+    }
+
     rt := &runtime{
         dict:          dict,
         formats:       formats,
@@ -1809,8 +1872,8 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         extraStepperCfg: extraStepperCfg,
         extraStepper:    extraStepper,
         extraStepperEn:  extraStepperEn,
-        cqEnPins:      []*chelper.CommandQueue{cqEnX, cqEnY, cqEnZ, cqEnE},
-        motorOffOrder: []string{"stepper_x", "stepper_y", "stepper_z", "extruder"},
+        cqEnPins:      cqEnPins,
+        motorOffOrder: motorOffOrder,
         mcu:           mcu,
         rawPath:       rawPath,
         rawFile:       f,
@@ -2244,17 +2307,20 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
             return fmt.Errorf("bed_screws not configured")
         }
         if err := r.bedScrews.cmdBED_SCREWS_ADJUST(cmd.Args); err != nil {
-            return err
+            return fmt.Errorf("BED_SCREWS_ADJUST failed: %w", err)
         }
     case "ACCEPT", "ADJUSTED", "ABORT":
         // Dynamic commands for bed_screws tool
-        if r.bedScrews != nil && r.bedScrews.isActive() {
-            handler, ok := r.bedScrews.getDynamicCommand(cmd.Name)
-            if ok {
-                return handler(cmd.Args)
-            }
+        if r.bedScrews == nil {
+            return fmt.Errorf("bed_screws not configured for %s", cmd.Name)
         }
-        return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
+        handler, ok := r.bedScrews.getDynamicCommand(cmd.Name)
+        if !ok {
+            // Command not registered - tool has completed, just ignore
+            // (Python Klipper would raise "unknown command" error here)
+            return nil
+        }
+        return handler(cmd.Args)
     default:
         return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
     }

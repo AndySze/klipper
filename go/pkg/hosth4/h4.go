@@ -58,8 +58,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
     }
 
     // Connect-phase + init commands.
-    // Check if config has heater_bed section and extruder_stepper to determine which compiler to use.
+    // Check if config has heater_bed section, extruder, and extruder_stepper to determine which compiler to use.
     _, hasBedHeater := cfg.section("heater_bed")
+    _, hasExtruder := cfg.section("extruder")
     _, hasExtraStepper := cfg.section("extruder_stepper my_extra_stepper")
 
     var initLines []string
@@ -75,9 +76,15 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
         if err != nil {
             return nil, err
         }
-    } else {
-        // For configs without heater_bed or extruder_stepper, use a minimal connect-phase
+    } else if hasExtruder {
+        // For configs with extruder but no heater_bed, use minimal connect-phase
         initLines, err = hosth1.CompileMinimalCartesianConnectPhase(cfgPath, dict)
+        if err != nil {
+            return nil, err
+        }
+    } else {
+        // For configs without heater_bed and without extruder (e.g., bed_screws)
+        initLines, err = hosth1.CompileCartesianNoExtruder(cfgPath, dict)
         if err != nil {
             return nil, err
         }

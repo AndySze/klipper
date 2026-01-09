@@ -213,8 +213,89 @@ func CompileLinuxTestConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]
     return out, nil
 }
 
+// CompileCartesianNoExtruder compiles the connect-phase for cartesian configs
+// without heater_bed AND without extruder (e.g., bed_screws.cfg).
+// OID layout: X/Y/Z steppers only, no E axis.
+func CompileCartesianNoExtruder(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+    cfg, err := loadConfig(cfgPath)
+    if err != nil {
+        return nil, err
+    }
+    clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+    if err != nil {
+        return nil, err
+    }
+    mcuFreq := clockFreq
+
+    // Extract required pins.
+    stepperX, err := readStepper(cfg, "stepper_x")
+    if err != nil {
+        return nil, err
+    }
+    stepperY, err := readStepper(cfg, "stepper_y")
+    if err != nil {
+        return nil, err
+    }
+    stepperZ, err := readStepper(cfg, "stepper_z")
+    if err != nil {
+        return nil, err
+    }
+
+    // Allocate OIDs for cartesian config without heater_bed and without extruder.
+    // OIDs 0-8: X/Y/Z endstops, trsyncs, steppers
+    // OIDs 9-11: enable pins for X/Y/Z
+    o := oids{
+        endstopX: 0, trsyncX: 1, stepperX: 2,
+        endstopY: 3, trsyncY: 4, stepperY: 5,
+        endstopZ: 6, trsyncZ: 7, stepperZ: 8,
+        enableX: 9, enableY: 10, enableZ: 11,
+        count:    12,
+    }
+
+    // Derived constants (match klippy defaults).
+    const (
+        stepPulseSec = 0.000002
+    )
+    stepPulseTicks := secondsToClock(mcuFreq, stepPulseSec)
+
+    // Build config commands for steppers only (no extruder, no heaters).
+    configCmds := []string{
+        fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopX, stepperX.Endstop.pin, stepperX.Endstop.pullup),
+        fmt.Sprintf("config_trsync oid=%d", o.trsyncX),
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperX, stepperX.Step.pin, stepperX.Dir.pin, boolToInt(stepperX.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableX, stepperX.Enable.pin, boolToInt(stepperX.Enable.invert), boolToInt(stepperX.Enable.invert), 0),
+
+        fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopY, stepperY.Endstop.pin, stepperY.Endstop.pullup),
+        fmt.Sprintf("config_trsync oid=%d", o.trsyncY),
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperY, stepperY.Step.pin, stepperY.Dir.pin, boolToInt(stepperY.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableY, stepperY.Enable.pin, boolToInt(stepperY.Enable.invert), boolToInt(stepperY.Enable.invert), 0),
+
+        fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopZ, stepperZ.Endstop.pin, stepperZ.Endstop.pullup),
+        fmt.Sprintf("config_trsync oid=%d", o.trsyncZ),
+        fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+            o.stepperZ, stepperZ.Step.pin, stepperZ.Dir.pin, boolToInt(stepperZ.Step.invert), stepPulseTicks),
+        fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+            o.enableZ, stepperZ.Enable.pin, boolToInt(stepperZ.Enable.invert), boolToInt(stepperZ.Enable.invert), 0),
+    }
+
+    // Prepend allocate_oids and compute finalize_config CRC over config_cmds.
+    withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", o.count)}, configCmds...)
+    crcText := strings.Join(withAllocate, "\n")
+    crc := crc32.ChecksumIEEE([]byte(crcText))
+
+    out := make([]string, 0, 1+len(configCmds)+1)
+    out = append(out, withAllocate...)
+    out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+    return out, nil
+}
+
 // CompileMinimalCartesianConnectPhase compiles the connect-phase MCU command
 // stream for cartesian configs without heater_bed (e.g., extruders.cfg, pressure_advance.cfg).
+// Note: This requires an [extruder] section. Use CompileCartesianNoExtruder for configs without extruder.
 func CompileMinimalCartesianConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
     cfg, err := loadConfig(cfgPath)
     if err != nil {
