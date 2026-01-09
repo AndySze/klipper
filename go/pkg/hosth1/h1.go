@@ -379,66 +379,65 @@ func CompileCartesianWithExtruderStepper(cfgPath string, dict *protocol.Dictiona
     }
 
     // Allocate OIDs matching Python's order:
-    // 0: extra_stepper (if present)
+    // For configs WITH extra_stepper:
+    // 0: extra_stepper
     // 1-2: endstop_x + trsync_x
     // 3: stepper_x
-    // 11: enable for extra_stepper (if present)
-    // 13: enable_x
     // 4-5: endstop_y + trsync_y
-    // 6: stepper_y (or 5 if no extra_stepper)
-    // 14: enable_y (or 13 if no extra_stepper)
+    // 6: stepper_y
     // 7-8: endstop_z + trsync_z
-    // 9: stepper_z (or 8 if no extra_stepper)
-    // 15: enable_z (or 14 if no extra_stepper)
-    // 16: adc_e (or 15 if no extra_stepper)
-    // 17: pwm_e (or 16 if no extra_stepper)
-    // 10: stepper_e (or 9 if no extra_stepper)
-    // 18: enable_e (or 17 if no extra_stepper)
+    // 9: stepper_z
+    // 10: stepper_e
+    // 11: enable_extra
+    // 12: enable_x
+    // 13: enable_y
+    // 14: enable_z
+    // 15: adc_e
+    // 16: pwm_e
+    // 17: enable_e
 
     o := struct {
         extraStepper    int
         endstopX        int
         trsyncX         int
         stepperX        int
-        enableExtra     int
-        buttons         int
-        enableX         int
         endstopY        int
         trsyncY         int
         stepperY        int
-        enableY         int
         endstopZ        int
         trsyncZ         int
         stepperZ        int
+        stepperE        int
+        enableExtra     int
+        enableX         int
+        enableY         int
         enableZ         int
         adcE            int
         pwmE            int
-        stepperE        int
         enableE         int
         count           int
-    }{
-        endstopX: 1, trsyncX: 2, stepperX: 3, enableX: 13,
-        endstopY: 4, trsyncY: 5, stepperY: 6, enableY: 14,
-        endstopZ: 7, trsyncZ: 8, stepperZ: 9, enableZ: 15,
-        adcE: 16, pwmE: 17, stepperE: 10, enableE: 18,
-    }
+    }{}
 
     if hasExtraStepper {
         o.extraStepper = 0
-        o.enableExtra = 11
-        o.buttons = 12
-        // Adjust subsequent OIDs
+        o.endstopX = 1
+        o.trsyncX = 2
         o.stepperX = 3
-        o.enableX = 13
+        o.endstopY = 4
+        o.trsyncY = 5
         o.stepperY = 6
-        o.enableY = 14
+        o.endstopZ = 7
+        o.trsyncZ = 8
         o.stepperZ = 9
-        o.enableZ = 15
-        o.adcE = 16
-        o.pwmE = 17
         o.stepperE = 10
-        o.enableE = 18
-        o.count = 19
+        o.enableExtra = 11
+        o.enableX = 12
+        o.enableY = 13
+        o.enableZ = 14
+        o.adcE = 15
+        o.pwmE = 16
+        o.enableE = 17
+        o.count = 18
     } else {
         o.count = 18
     }

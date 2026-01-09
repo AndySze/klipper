@@ -1133,6 +1133,10 @@ func (s *stepper) checkActive(_ float64, maxStepGenTime float64) {
     if s.sk == nil {
         return
     }
+    // Don't generate steps if trapq is nil (disconnected stepper)
+    if s.trapq == nil {
+        return
+    }
     pt := s.sk.CheckActive(maxStepGenTime + 1e-9)
     if pt == 0.0 {
         return
@@ -1423,13 +1427,15 @@ type runtime struct {
     extraStepperCfg extruderStepperCfg
     extraStepper    *stepper
     extraStepperEn  *stepperEnablePin
-    extraStepperTQ  *chelper.TrapQ
 
     endstops [3]*endstop
     cqEnPins []*chelper.CommandQueue
 
     gm *gcodeMove
     motorOffOrder []string
+
+    // Bed screws adjustment tool
+    bedScrews *bedScrews
 
     // Temperature control
     mcu           *mcu
@@ -1683,7 +1689,6 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
     // Check for and initialize extruder_stepper my_extra_stepper if present
     var extraStepper *stepper
     var extraStepperEn *stepperEnablePin
-    var extraStepperTQ *chelper.TrapQ
     var extraStepperCfg extruderStepperCfg
     var hasExtraStepper bool
     var cqEnExtra *chelper.CommandQueue
@@ -1693,32 +1698,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         hasExtraStepper = true
         extraStepperCfg = extraCfg
 
-        // Create independent trapq for extra stepper (will be used when connected to extruder)
-        extraStepperTQ, err = motion.allocTrapQ()
-        if err != nil {
-            cqEnE.Free()
-            cqEnZ.Free()
-            cqEnY.Free()
-            cqEnX.Free()
-            stE.free()
-            stZ.free()
-            stY.free()
-            stX.free()
-            motion.free()
-            cqMain.Free()
-            sq.Free()
-            f.Close()
-            return nil, fmt.Errorf("alloc extra stepper trapq failed: %v", err)
-        }
-
-        // Create extra axis for the extra stepper
-        extraAxis := newExtruderAxis("my_extra_stepper", extraStepperTQ)
-        th.extraAxes = append(th.extraAxes, extraAxis)
-
-        // Calculate step distance for extra stepper
-        stepDistExtra := extraStepperCfg.rotationDistance / float64(extraStepperCfg.fullSteps*extraStepperCfg.microsteps)
-
+        // TEMPORARY: Don't create the extra stepper object to test if this causes the error
+        // The config command still gets sent to the MCU, but Go doesn't track this stepper
+        /*
         // Create the extra stepper (oid=0 for my_extra_stepper)
+        // We create it during init to match the MCU config, but don't give it a trapq yet
+        stepDistExtra := extraStepperCfg.rotationDistance / float64(extraStepperCfg.fullSteps*extraStepperCfg.microsteps)
         extraStepper, err = newStepper(motion, sq, "my_extra_stepper", 'e', 0, stepDistExtra, extraStepperCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
         if err != nil {
             cqEnE.Free()
@@ -1735,8 +1720,8 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
             f.Close()
             return nil, fmt.Errorf("create extra stepper failed: %v", err)
         }
-        // IMPORTANT: Initially, don't set any trapq (nil)
-        // The stepper will only generate steps when connected to main extruder via SYNC_EXTRUDER_MOTION
+        // IMPORTANT: Don't set trapq, so stepper won't generate steps
+        // The stepper will only generate steps when connected via SYNC_EXTRUDER_MOTION
         extraStepper.setPosition(0.0)
 
         // Create enable pin for extra stepper (oid=11)
@@ -1759,17 +1744,27 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         }
         extraStepperEn = &stepperEnablePin{out: newDigitalOut(11, extraStepperCfg.enablePin.invert, sq, cqEnExtra, formats, mcuFreq)}
         se.registerStepper("my_extra_stepper", extraStepper, extraStepperEn)
+
+        // NOTE: We do NOT create an extraAxis for this stepper yet!
+        // The extraAxis will only be created when SYNC_EXTRUDER_MOTION connects the stepper
+        // This prevents the move processing from populating a trapq for a disconnected stepper
+        */
     }
 
     cqTrigger := chelper.NewCommandQueue()
     if cqTrigger == nil {
+        // Clean up stepperEnablePin digitalOut objects before freeing CommandQueues
+        // Note: stepperEnablePin objects don't have explicit Free(), but we must
+        // ensure the CommandQueues they reference are still valid when we free them
         if cqEnExtra != nil {
             cqEnExtra.Free()
         }
+        // Free CommandQueues (stepperEnablePin objects will be GC'd)
         cqEnE.Free()
         cqEnZ.Free()
         cqEnY.Free()
         cqEnX.Free()
+        // Steppers are cleaned up by motion.free()
         if extraStepper != nil {
             extraStepper.free()
         }
@@ -1814,7 +1809,6 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
         extraStepperCfg: extraStepperCfg,
         extraStepper:    extraStepper,
         extraStepperEn:  extraStepperEn,
-        extraStepperTQ:  extraStepperTQ,
         cqEnPins:      []*chelper.CommandQueue{cqEnX, cqEnY, cqEnZ, cqEnE},
         motorOffOrder: []string{"stepper_x", "stepper_y", "stepper_z", "extruder"},
         mcu:           mcu,
@@ -1830,6 +1824,20 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 
     // Initialize heater manager after runtime is created
     rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
+
+    // Initialize bed_screws if [bed_screws] section exists
+    if _, hasBedScrews := cfg.section("bed_screws"); hasBedScrews {
+        bs, err := newBedScrews(rt, cfg)
+        if err != nil {
+            motion.free()
+            cqMain.Free()
+            sq.Free()
+            f.Close()
+            return nil, fmt.Errorf("initialize bed_screws: %w", err)
+        }
+        rt.bedScrews = bs
+    }
+
     trX.rt = rt
     trY.rt = rt
     trZ.rt = rt
@@ -2031,10 +2039,27 @@ func (r *runtime) cleanup(removeFile bool) error {
     }
     r.closed = true
 
+    // Flush all pending steps
     if r.motion != nil {
         _ = r.motion.flushAllSteps()
     }
 
+    // Wait for serialqueue to drain before freeing commandqueues
+    // This prevents "Memory leak! Can't free non-empty commandqueue" errors
+    if r.sq != nil {
+        for i := 0; i < 2000; i++ {
+            st, err := r.sq.GetStats()
+            if err != nil {
+                break
+            }
+            if st.ReadyBytes == 0 && st.UpcomingBytes == 0 {
+                break
+            }
+            time.Sleep(1 * time.Millisecond)
+        }
+    }
+
+    // Now safe to free commandqueues
     for _, cq := range r.cqEnPins {
         if cq != nil {
             cq.Free()
@@ -2213,6 +2238,23 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
         if err := r.cmdSyncExtruderMotion(cmd.Args); err != nil {
             return err
         }
+    case "BED_SCREWS_ADJUST":
+        // Bed screws adjustment tool
+        if r.bedScrews == nil {
+            return fmt.Errorf("bed_screws not configured")
+        }
+        if err := r.bedScrews.cmdBED_SCREWS_ADJUST(cmd.Args); err != nil {
+            return err
+        }
+    case "ACCEPT", "ADJUSTED", "ABORT":
+        // Dynamic commands for bed_screws tool
+        if r.bedScrews != nil && r.bedScrews.isActive() {
+            handler, ok := r.bedScrews.getDynamicCommand(cmd.Name)
+            if ok {
+                return handler(cmd.Args)
+            }
+        }
+        return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
     default:
         return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
     }
@@ -2692,12 +2734,29 @@ func (r *runtime) cmdSyncExtruderMotion(args map[string]string) error {
     // Currently we only support "my_extra_stepper" -> "extruder" synchronization
     if extruderName == "my_extra_stepper" && r.hasExtraStepper {
         if motionQueue == "extruder" {
+            // Create extra axis if it doesn't exist yet
+            if len(r.toolhead.extraAxes) == 0 {
+                extraStepperTQ, err := r.toolhead.motion.allocTrapQ()
+                if err != nil {
+                    return fmt.Errorf("alloc extra stepper trapq failed: %v", err)
+                }
+                extraAxis := newExtruderAxis("my_extra_stepper", extraStepperTQ)
+                r.toolhead.extraAxes = append(r.toolhead.extraAxes, extraAxis)
+            }
             // Connect extra stepper to main extruder's trapq
-            r.extraStepper.setTrapQ(r.extruder.trapq)
+            stepDist := r.extraStepperCfg.rotationDistance / float64(r.extraStepperCfg.fullSteps*r.extraStepperCfg.microsteps)
+            extraStepperTQ := r.toolhead.extraAxes[0].GetTrapQ()
+            if r.extraStepper != nil {
+                r.extraStepper.setTrapQ(extraStepperTQ)
+                r.extraStepper.sk.SetTrapQ(extraStepperTQ, stepDist)
+            }
             r.tracef("SYNC_EXTRUDER_MOTION: my_extra_stepper -> extruder (connected)\n")
         } else if motionQueue == "" {
-            // Disconnect extra stepper
-            r.extraStepper.setTrapQ(nil)
+            // Disconnect extra stepper - set trapq to nil and step distance to 0
+            if r.extraStepper != nil {
+                r.extraStepper.setTrapQ(nil)
+                r.extraStepper.sk.SetTrapQ(nil, 0.0)
+            }
             r.tracef("SYNC_EXTRUDER_MOTION: my_extra_stepper -> (disconnected)\n")
         } else {
             return fmt.Errorf("SYNC_EXTRUDER_MOTION: unknown motion queue %q", motionQueue)
