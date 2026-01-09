@@ -7,9 +7,8 @@ package temperature_test
 
 import (
 	"fmt"
-	"math"
 
-	"github.com/klipper-go/temperature"
+	"klipper-go-migration/pkg/temperature"
 )
 
 // MockPrinter implements PrinterInterface for testing

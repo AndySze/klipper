@@ -1411,6 +1411,13 @@ func (r *runtime) tracef(format string, args ...any) {
     fmt.Fprintf(r.trace, format, args...)
 }
 
+// gcodeRespond sends a response message to the G-code handler
+func (r *runtime) gcodeRespond(msg string) {
+    // In golden test mode, we write to trace
+    // In real implementation, this would use the G-code output
+    r.tracef("%s\n", msg)
+}
+
 func (r *runtime) traceMotion(prefix string) {
     if r == nil || r.trace == nil || r.motion == nil {
         return
@@ -1742,22 +1749,74 @@ func (r *runtime) setupHeater(hc *heaterConfig) error {
     if err != nil {
         return fmt.Errorf("failed to create ADC adapter: %w", err)
     }
+    adc.setRuntime(r) // Set runtime reference for sending commands
 
-    // Create MCU sensor with temperature conversion
-    sensorConfig := &temperature.MCUConfig{
-        SensorMCU: "mcu",
+    // Create temperature sensor based on sensor_type
+    var sensor temperature.Sensor
+
+    switch hc.sensorType {
+    case "AD595":
+        // AD595 thermocouple amplifier
+        ad595Config := &temperature.AD595Config{
+            VoltageSupply: 5.0,  // Default 5.0V supply
+            VoltageOffset: 0.0,  // Default 0V offset at 0°C
+        }
+        sensor, err = temperature.NewAD595Sensor(hc.name+"_sensor", hc.sensorPin, adc, ad595Config)
+        if err != nil {
+            return fmt.Errorf("failed to create AD595 sensor: %w", err)
+        }
+        r.tracef("  Created AD595 sensor (supply=%.1fV, offset=%.1fV)\n",
+                  ad595Config.VoltageSupply, ad595Config.VoltageOffset)
+
+    case "PT100 INA826":
+        // PT100 RTD with INA826 amplifier
+        pt100Config := &temperature.PT100Config{
+            ReferenceResistor: 4300.0,  // Default 4.3K reference resistor
+            R0:                100.0,   // PT100 resistance at 0°C
+        }
+        sensor, err = temperature.NewPT100Sensor(hc.name+"_sensor", hc.sensorPin, adc, pt100Config)
+        if err != nil {
+            return fmt.Errorf("failed to create PT100 sensor: %w", err)
+        }
+        r.tracef("  Created PT100 sensor (R_ref=%.1f ohms, R0=%.1f ohms)\n",
+                  pt100Config.ReferenceResistor, pt100Config.R0)
+
+    case "Thermistor":
+        // Generic thermistor using Beta parameter equation
+        thermistorConfig := &temperature.ThermistorConfig{
+            Beta:           3950.0,  // Common Beta value for EPCOS 100K
+            R0:             100000.0, // 100K ohms at T0
+            T0:             25.0,      // Reference temperature
+            PullupResistor: 4700.0,   // Common 4.7K pullup
+        }
+        sensor, err = temperature.NewThermistorSensor(hc.name+"_sensor", hc.sensorPin, adc, thermistorConfig)
+        if err != nil {
+            return fmt.Errorf("failed to create Thermistor sensor: %w", err)
+        }
+        r.tracef("  Created Thermistor sensor (Beta=%.0f, R0=%.0f ohms, T0=%.1f°C)\n",
+                  thermistorConfig.Beta, thermistorConfig.R0, thermistorConfig.T0)
+
+    default:
+        // Fallback to generic MCU sensor with linear calibration
+        // This handles unknown sensor types and allows custom calibration
+        sensorConfig := &temperature.MCUConfig{
+            SensorMCU: "mcu",
+        }
+        mcuSensor := temperature.NewMCUSensor(hc.name+"_sensor", sensorConfig, adc)
+
+        // Use simple linear calibration for unknown sensor types
+        // This allows the system to function even with unsupported sensors
+        mcuSensor.SetCalibration(25.0, 100.0) // 25°C at 0.5V, 125°C at 1.5V
+        sensor = mcuSensor
+        r.tracef("  Created generic MCU sensor with linear calibration (sensor_type=%s)\n", hc.sensorType)
     }
-    sensor := temperature.NewMCUSensor(hc.name+"_sensor", sensorConfig, adc)
-
-    // For now, use simple linear calibration
-    // TODO: Implement proper sensor type calibration (AD595, PT100, etc.)
-    sensor.SetCalibration(25.0, 100.0) // 25°C at 0.5V, 125°C at 1.5V
 
     // Create PWM adapter
     pwm, err := newMcuPWMAdapter(r.mcu, hc.heaterPin, hc.maxPower, hc.pwmCycleTime)
     if err != nil {
         return fmt.Errorf("failed to create PWM adapter: %w", err)
     }
+    pwm.setRuntime(r) // Set runtime reference for sending commands
 
     // Create heater config
     heaterCfg := &temperature.HeaterConfig{
@@ -1921,6 +1980,12 @@ func (r *runtime) sendLine(line string, cq *chelper.CommandQueue, minClock uint6
         return err
     }
     return r.sq.Send(cq, b, minClock, reqClock)
+}
+
+// sendConfigLine sends a configuration command during initialization
+func (r *runtime) sendConfigLine(line string) error {
+    // For config commands, we send them immediately on the main queue
+    return r.sendLine(line, r.cqMain, 0, 0)
 }
 
 func (r *runtime) exec(cmd *gcodeCommand) error {
@@ -2229,6 +2294,72 @@ func (r *runtime) cmdM105(args map[string]string) error {
     return nil
 }
 
+// waitTemperature waits for a heater to reach target temperature
+func (r *runtime) waitTemperature(heaterName string, targetTemp float64) error {
+    // Don't wait if temperature is 0 (heater off)
+    if targetTemp == 0 {
+        return nil
+    }
+
+    r.tracef("Waiting for %s to reach %.1f°C...\n", heaterName, targetTemp)
+
+    // Get the heater
+    heater, err := r.heaterManager.GetHeater(heaterName)
+    if err != nil {
+        return fmt.Errorf("heater %s not found: %w", heaterName, err)
+    }
+
+    // Wait parameters
+    const (
+        checkInterval = 1.0        // Check temperature every 1 second
+        maxWaitTime   = 600.0      // Maximum wait time: 10 minutes
+        tolerance     = 1.0        // Temperature tolerance: ±1°C
+    )
+
+    startTime := float64(time.Now().UnixNano()) / 1e9
+    lastReportTime := 0.0
+
+    // Wait loop
+    for {
+        currentTime := float64(time.Now().UnixNano()) / 1e9
+        elapsed := currentTime - startTime
+
+        // Check for timeout
+        if elapsed > maxWaitTime {
+            r.tracef("Timeout waiting for %s to reach %.1f°C (waited %.1f seconds)\n",
+                      heaterName, targetTemp, elapsed)
+            return fmt.Errorf("timeout waiting for heater %s", heaterName)
+        }
+
+        // Get current temperature
+        eventtime := currentTime
+        currentTemp, _ := heater.GetTemp(eventtime)
+
+        // Report temperature every second
+        if elapsed-lastReportTime >= checkInterval {
+            r.gcodeRespond(fmt.Sprintf("%s: %.1f / %.1f", heaterName, currentTemp, targetTemp))
+            lastReportTime = elapsed
+        }
+
+        // Check if temperature has reached target (within tolerance)
+        tempDiff := currentTemp - targetTemp
+        if tempDiff < tolerance && tempDiff > -tolerance {
+            r.tracef("%s reached target temperature: %.1f°C\n", heaterName, currentTemp)
+            r.gcodeRespond(fmt.Sprintf("%s: %.1f / %.1f (reached)", heaterName, currentTemp, targetTemp))
+            return nil
+        }
+
+        // Check if heater is still busy (heating or cooling)
+        if !heater.CheckBusy(eventtime) {
+            r.tracef("%s is no longer busy, current temp: %.1f°C\n", heaterName, currentTemp)
+            return nil
+        }
+
+        // Sleep a bit before next check
+        time.Sleep(100 * time.Millisecond)
+    }
+}
+
 func (r *runtime) cmdM109(args map[string]string) error {
     // M109 - Set Extruder Temperature and Wait
     // Usage: M109 [S<temp>] [T<index>]
@@ -2256,13 +2387,15 @@ func (r *runtime) cmdM109(args map[string]string) error {
 
     r.tracef("M109: heater=%s temp=%.1f (waiting)\n", heaterName, temp)
 
-    // Set temperature and wait
-    if err := r.heaterManager.SetTemperature(heaterName, temp, true); err != nil {
+    // Set temperature
+    if err := r.heaterManager.SetTemperature(heaterName, temp, false); err != nil {
         // Heater might not exist in config, that's ok for some tests
         r.tracef("M109: Note - %v\n", err)
+        return nil
     }
 
-    return nil
+    // Wait for temperature to reach target
+    return r.waitTemperature(heaterName, temp)
 }
 
 func (r *runtime) cmdM190(args map[string]string) error {
@@ -2280,13 +2413,15 @@ func (r *runtime) cmdM190(args map[string]string) error {
 
     r.tracef("M190: heater_bed temp=%.1f (waiting)\n", temp)
 
-    // Set temperature and wait
-    if err := r.heaterManager.SetTemperature("heater_bed", temp, true); err != nil {
+    // Set temperature
+    if err := r.heaterManager.SetTemperature("heater_bed", temp, false); err != nil {
         // Heater might not exist in config, that's ok for some tests
         r.tracef("M190: Note - %v\n", err)
+        return nil
     }
 
-    return nil
+    // Wait for temperature to reach target
+    return r.waitTemperature("heater_bed", temp)
 }
 
 func (r *runtime) homeAll() error {

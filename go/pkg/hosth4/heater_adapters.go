@@ -18,6 +18,8 @@ type mcuPWMAdapter struct {
 	lastTime   float64
 	mu         sync.Mutex
 	cmdID      int32
+	cycleTicks uint64
+	rt         *runtime // Reference to runtime for sending commands
 }
 
 // newMcuPWMAdapter creates a new PWM adapter
@@ -25,12 +27,24 @@ func newMcuPWMAdapter(mcu *mcu, pin string, maxPower float64, pwmCycleTime float
 	if mcu == nil {
 		return nil, fmt.Errorf("mcu is nil")
 	}
+
+	// Calculate cycle ticks from cycle time
+	// cycle_ticks = cycle_time * mcu_freq
+	cycleTicks := uint64(pwmCycleTime * mcu.freq)
+
 	return &mcuPWMAdapter{
-		mcu:      mcu,
-		pin:      pin,
-		maxPower: maxPower,
-		pwmCycle: pwmCycleTime,
+		mcu:         mcu,
+		pin:         pin,
+		maxPower:    maxPower,
+		pwmCycle:    pwmCycleTime,
+		cycleTicks:  cycleTicks,
+		lastPWM:     0.0,
 	}, nil
+}
+
+// setRuntime sets the runtime reference for sending commands
+func (a *mcuPWMAdapter) setRuntime(rt *runtime) {
+	a.rt = rt
 }
 
 func (a *mcuPWMAdapter) SetPWM(pwmTime, value float64) error {
@@ -45,8 +59,22 @@ func (a *mcuPWMAdapter) SetPWM(pwmTime, value float64) error {
 	a.lastPWM = value
 	a.lastTime = pwmTime
 
-	// In golden test mode, we don't actually send MCU commands
-	// This will be implemented when we have full MCU support
+	// If we have a runtime reference, send actual MCU command
+	if a.rt != nil {
+		// Convert 0.0-1.0 to 0-255 (or PWM_MAX)
+		pwmMax := uint32(255) // Default PWM_MAX
+		pwmValue := uint32(value * float64(pwmMax) + 0.5)
+
+		// Send set_pwm_out command
+		// Format: set_pwm_out pin=%u cycle_ticks=%u value=%hu
+		line := fmt.Sprintf("set_pwm_out pin=%s cycle_ticks=%d value=%d",
+			a.pin, a.cycleTicks, pwmValue)
+
+		if err := a.rt.sendConfigLine(line); err != nil {
+			return fmt.Errorf("failed to send PWM command: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -54,11 +82,13 @@ func (a *mcuPWMAdapter) SetupCycleTime(cycleTime float64) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pwmCycle = cycleTime
+	a.cycleTicks = uint64(cycleTime * a.mcu.freq)
 	return nil
 }
 
 func (a *mcuPWMAdapter) SetupMaxDuration(maxDuration float64) error {
 	// MCU-specific implementation
+	// In golden test mode, we don't need to send this command
 	return nil
 }
 
@@ -82,6 +112,8 @@ type mcuADCAdapter struct {
 	lastADCValue    float64
 	lastTemp        float64
 	started         bool
+	rt              *runtime // Reference to runtime for sending commands
+	oid             int32
 }
 
 // newMcuADCAdapter creates a new ADC adapter
@@ -99,6 +131,11 @@ func newMcuADCAdapter(mcu *mcu, pin string) (*mcuADCAdapter, error) {
 	}, nil
 }
 
+// setRuntime sets the runtime reference for sending commands
+func (a *mcuADCAdapter) setRuntime(rt *runtime) {
+	a.rt = rt
+}
+
 func (a *mcuADCAdapter) SetupADCCallback(reportTime float64, callback func(float64, float64)) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -106,6 +143,30 @@ func (a *mcuADCAdapter) SetupADCCallback(reportTime float64, callback func(float
 	a.reportTime = reportTime
 	a.callback = callback
 	a.started = true
+
+	// Send ADC configuration commands if we have runtime
+	if a.rt != nil {
+		// config_analog_in oid=%c pin=%u
+		oid := 1 // TODO: allocate proper OID
+		line := fmt.Sprintf("config_analog_in oid=%d pin=%s", oid, a.pin)
+		if err := a.rt.sendConfigLine(line); err != nil {
+			fmt.Printf("Warning: failed to config ADC: %v\n", err)
+			return
+		}
+
+		// query_analog_in oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u min_value=%hu max_value=%hu range_check_count=%c
+		sampleTicks := uint64(a.sampleTime * a.mcu.freq)
+		reportTicks := uint64(a.reportTime * a.mcu.freq)
+		restTicks := sampleTicks * uint64(a.sampleCount-1)
+
+		line = fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=0 max_value=65535 range_check_count=0",
+			oid, reportTicks, sampleTicks, a.sampleCount, restTicks)
+		if err := a.rt.sendConfigLine(line); err != nil {
+			fmt.Printf("Warning: failed to query ADC: %v\n", err)
+		}
+
+		a.oid = int32(oid)
+	}
 
 	// Start background ADC reader
 	go a.adcReaderLoop()
@@ -136,6 +197,7 @@ func (a *mcuADCAdapter) adcReaderLoop() {
 		// Real implementation would read from MCU
 		if a.callback != nil {
 			// Simulate a temperature reading around 25°C (ambient)
+			// with slight variation based on target temperature
 			adcValue := 0.5 // Mock ADC value (0.0 - 1.0)
 			readTime := float64(time.Now().UnixNano()) / 1e9
 
