@@ -7,3 +7,7 @@ klippy/.version
 dict
 _test_output*
 _test_.log
+_test_.log.*
+go/.cache/
+go/.gopath/
+go/pkg/hosth4/runtime.go.bak*

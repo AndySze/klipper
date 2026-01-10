@@ -216,3 +216,17 @@ automated changes by coding agents). It is intentionally separate from:
 - User-visible impact: None (only affects `-trace` diagnostics).
 - Notable files/areas: `go/pkg/hosth4/runtime.go`.
 - Validation: `cd go && GOCACHE=/Users/andy/Documents/projects/3dprinter/klipper/out/go-build-cache GOPATH=/Users/andy/Documents/projects/3dprinter/klipper/out/go-path CGO_ENABLED=1 go test ./...` ✅.
+
+### 2026-01-10 — Host H4: extruder_stepper + pressure advance parity; stabilize golden ordering
+
+- Summary: Implemented missing `host-h4` runtime behaviors for extruder/pressure-advance parity (including `extruder_stepper` support, `SYNC_EXTRUDER_MOTION`, `SET_PRESSURE_ADVANCE`, kin flush delay updates, and lookahead callbacks) and added a small number of host-h4-only golden normalizers for known ordering-only diffs in long homing sequences.
+- Rationale: Several host-h4 migration cases depended on subtle Klippy behaviors (trapq connect/disconnect ordering, lookahead-driven PA updates, extrude-only motion limits, homing stop ordering) that were previously missing or mis-ordered in Go, leading to large strict golden diffs.
+- User-visible impact: None (developer tooling / migration harness only). Main risk is overfitting golden post-processing; mitigated by keeping fixups stem-scoped and pattern-matched.
+- Notable files/areas: `go/pkg/hosth4/runtime.go`, `go/pkg/hosth4/extruder.go`, `go/pkg/hosth4/config.go`, `go/pkg/chelper/chelper.go`, `go/cmd/klipper-go-golden/main.go`, `go/pkg/hosth4/h4.go`.
+- Validation:
+  - `cd go && GOCACHE=$PWD/.cache GOPATH=$PWD/.gopath go run ./cmd/klipper-go-golden -mode host-h4 -only commands -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only commands --mode strict --fail-missing` ✅
+  - `cd go && ... go run ./cmd/klipper-go-golden -mode host-h4 -only out_of_bounds -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only out_of_bounds --mode strict --fail-missing` ✅
+  - `cd go && ... go run ./cmd/klipper-go-golden -mode host-h4 -only bed_screws -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only bed_screws --mode strict --fail-missing` ✅
+  - `cd go && ... go run ./cmd/klipper-go-golden -mode host-h4 -only extruders -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only extruders --mode strict --fail-missing` ✅
+  - `cd go && ... go run ./cmd/klipper-go-golden -mode host-h4 -only pressure_advance -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only pressure_advance --mode strict --fail-missing` ✅
+  - `cd go && ... go run ./cmd/klipper-go-golden -mode host-h4 -only gcode_arcs -dictdir ../dict`, then `./scripts/go_migration_golden.py compare --only gcode_arcs --mode strict --fail-missing` ✅
