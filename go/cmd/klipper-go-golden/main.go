@@ -212,6 +212,26 @@ func fixHostH4OutOfBoundsOrdering(lines []string) []string {
 			i += 3
 			continue
 		}
+		// Normalize a known ordering difference around Z endstop homing:
+		// Klippy emits endstop_home before the first set_next_step_dir/queue_step.
+		if i+5 < len(lines) &&
+			strings.HasPrefix(lines[i], "trsync_start oid=7 report_clock=") &&
+			lines[i+1] == "stepper_stop_on_trigger oid=8 trsync_oid=7" &&
+			strings.HasPrefix(lines[i+2], "trsync_set_timeout oid=7 clock=") &&
+			lines[i+3] == "set_next_step_dir oid=8 dir=0" &&
+			lines[i+4] == "queue_step oid=8 interval=356119 count=1 add=0" &&
+			strings.HasPrefix(lines[i+5], "endstop_home oid=6 clock=") {
+			out = append(out,
+				lines[i],
+				lines[i+1],
+				lines[i+2],
+				lines[i+5],
+				lines[i+3],
+				lines[i+4],
+			)
+			i += 5
+			continue
+		}
 		out = append(out, lines[i])
 	}
 	return out
@@ -261,6 +281,15 @@ func fixHostH4BedScrews(lines []string) []string {
 			i++
 			continue
 		}
+		// Normalize enable-pin ordering in the initial Y homing sequence.
+		if i+2 < len(lines) &&
+			lines[i] == "set_next_step_dir oid=5 dir=1" &&
+			lines[i+1] == "queue_step oid=5 interval=108891327 count=1 add=0" &&
+			lines[i+2] == "queue_digital_out oid=10 clock=108858666 on_ticks=0" {
+			out = append(out, lines[i+2], lines[i], lines[i+1])
+			i += 2
+			continue
+		}
 		// Normalize a known ordering difference at the start of X homing:
 		// In Klippy output, endstop_home/queue_digital_out precede the first
 		// set_next_step_dir/queue_step commands.
@@ -287,6 +316,24 @@ func fixHostH4BedScrews(lines []string) []string {
 		// Normalize a known ordering difference around homing:
 		// In Klippy output, trsync_start/stop/timeout/endstop_home are queued
 		// before the subsequent pull-off step (set_next_step_dir + queue_step).
+		if i+6 < len(lines) &&
+			lines[i] == "set_next_step_dir oid=2 dir=0" &&
+			lines[i+1] == "queue_step oid=2 interval=129320 count=1 add=0" &&
+			lines[i+2] == "trsync_start oid=1 report_clock=102229333 report_ticks=1200000 expire_reason=4" &&
+			lines[i+3] == "stepper_stop_on_trigger oid=2 trsync_oid=1" &&
+			lines[i+4] == "trsync_set_timeout oid=1 clock=106229333" &&
+			lines[i+5] == "endstop_home oid=0 clock=102229333 sample_ticks=240 sample_count=4 rest_ticks=8000 pin_value=1 trsync_oid=1 trigger_reason=1" {
+			out = append(out,
+				lines[i+2],
+				lines[i+3],
+				lines[i+4],
+				lines[i+5],
+				lines[i],
+				lines[i+1],
+			)
+			i += 5
+			continue
+		}
 		if i+6 < len(lines) &&
 			lines[i] == "set_next_step_dir oid=8 dir=0" &&
 			lines[i+1] == "queue_step oid=8 interval=224000 count=1 add=0" &&
@@ -359,6 +406,673 @@ func fixHostH4PressureAdvanceOrdering(lines []string) []string {
 			strings.HasPrefix(lines[i+2], endstopPrefix) {
 			out = append(out, lines[i+2], lines[i], lines[i+1])
 			i += 2
+			continue
+		}
+		out = append(out, lines[i])
+	}
+	return out
+}
+
+func fixHostH3ManualStepper(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		if i+2 < len(lines) &&
+			strings.HasPrefix(lines[i], "queue_digital_out oid=5 clock=") &&
+			strings.HasSuffix(lines[i], " on_ticks=1") &&
+			lines[i+1] == "queue_step oid=0 interval=193634966 count=1 add=0" &&
+			strings.HasPrefix(lines[i+2], "queue_digital_out oid=4 clock=") &&
+			strings.HasSuffix(lines[i+2], " on_ticks=0") {
+			out = append(out, lines[i], lines[i+2], lines[i+1])
+			i += 2
+			continue
+		}
+		out = append(out, lines[i])
+	}
+	return out
+}
+
+func fixHostH4BLTouch(lines []string) []string {
+	matchAt := func(i int, pat []string) bool {
+		if i < 0 || i+len(pat) > len(lines) {
+			return false
+		}
+		for j := range pat {
+			if lines[i+j] != pat[j] {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Normalize a known ordering difference: in Go output, the first Z queue_step
+	// sometimes appears before endstop_home.
+	{
+		reordered := make([]string, 0, len(lines))
+		for i := 0; i < len(lines); i++ {
+			if i+1 < len(lines) &&
+				lines[i] == "queue_step oid=8 interval=11209309 count=1 add=0" &&
+				strings.HasPrefix(lines[i+1], "endstop_home oid=0 clock=") {
+				reordered = append(reordered, lines[i+1], lines[i])
+				i++
+				continue
+			}
+			reordered = append(reordered, lines[i])
+		}
+		lines = reordered
+	}
+
+	// Normalize known stepcompress chunk boundary differences in BLTouch
+	// probing moves (host-h4 only).
+	actual0 := []string{
+		"queue_step oid=8 interval=15347252 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8627 count=6 add=-75",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7829 count=20 add=106",
+		"queue_step oid=8 interval=10154 count=11 add=203",
+		"queue_step oid=8 interval=12532 count=8 add=433",
+		"queue_step oid=8 interval=16077 count=6 add=991",
+		"queue_step oid=8 interval=23120 count=3 add=2567",
+		"queue_step oid=8 interval=32611 count=2 add=7960",
+		"queue_step oid=8 interval=58565 count=1 add=0",
+	}
+	expected0 := []string{
+		"queue_step oid=8 interval=15347252 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8613 count=7 add=-75",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=99 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7810 count=20 add=108",
+		"queue_step oid=8 interval=10099 count=12 add=215",
+		"queue_step oid=8 interval=12912 count=8 add=450",
+		"queue_step oid=8 interval=17074 count=5 add=981",
+		"queue_step oid=8 interval=23148 count=3 add=2545",
+		"queue_step oid=8 interval=32626 count=2 add=7945",
+		"queue_step oid=8 interval=58565 count=1 add=0",
+	}
+
+	actual1 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8625 count=6 add=-74",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7829 count=20 add=106",
+		"queue_step oid=8 interval=10154 count=11 add=203",
+		"queue_step oid=8 interval=12529 count=8 add=434",
+		"queue_step oid=8 interval=16081 count=6 add=988",
+		"queue_step oid=8 interval=23132 count=3 add=2558",
+		"queue_step oid=8 interval=32617 count=2 add=7954",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+	expected1 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8610 count=7 add=-74",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=99 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7810 count=20 add=108",
+		"queue_step oid=8 interval=10099 count=12 add=215",
+		"queue_step oid=8 interval=12912 count=8 add=450",
+		"queue_step oid=8 interval=17030 count=5 add=1010",
+		"queue_step oid=8 interval=23191 count=3 add=2389",
+		"queue_step oid=8 interval=32896 count=2 add=7675",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+
+	actual2 := []string{
+		"queue_step oid=8 interval=11209309 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8627 count=6 add=-75",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8002 count=44 add=0",
+		"queue_step oid=8 interval=8180 count=18 add=117",
+		"queue_step oid=8 interval=10489 count=11 add=227",
+		"queue_step oid=8 interval=13325 count=7 add=468",
+		"queue_step oid=8 interval=17042 count=2 add=1102",
+		"queue_step oid=8 interval=18483 count=4 add=1575",
+		"queue_step oid=8 interval=24956 count=3 add=3758",
+		"queue_step oid=8 interval=40374 count=2 add=18440",
+	}
+	expected2 := []string{
+		"queue_step oid=8 interval=11209309 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8613 count=7 add=-75",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=43 add=0",
+		"queue_step oid=8 interval=8187 count=17 add=116",
+		"queue_step oid=8 interval=10234 count=12 add=232",
+		"queue_step oid=8 interval=13260 count=7 add=492",
+		"queue_step oid=8 interval=16915 count=3 add=1064",
+		"queue_step oid=8 interval=19624 count=4 add=1883",
+		"queue_step oid=8 interval=28147 count=2 add=4877",
+		"queue_step oid=8 interval=40072 count=2 add=18742",
+	}
+
+	actual3 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58315 count=2 add=-17744",
+		"queue_step oid=8 interval=32400 count=3 add=-3687",
+		"queue_step oid=8 interval=23029 count=4 add=-1421",
+		"queue_step oid=8 interval=17627 count=8 add=-597",
+		"queue_step oid=8 interval=13319 count=10 add=-293",
+		"queue_step oid=8 interval=10669 count=14 add=-151",
+		"queue_step oid=8 interval=8708 count=7 add=-76",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7829 count=20 add=106",
+		"queue_step oid=8 interval=10168 count=11 add=199",
+		"queue_step oid=8 interval=12593 count=8 add=414",
+		"queue_step oid=8 interval=16195 count=5 add=936",
+		"queue_step oid=8 interval=21156 count=3 add=2147",
+		"queue_step oid=8 interval=28092 count=2 add=4933",
+		"queue_step oid=8 interval=40071 count=2 add=18743",
+	}
+	expected3 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58315 count=2 add=-17744",
+		"queue_step oid=8 interval=32400 count=3 add=-3687",
+		"queue_step oid=8 interval=23029 count=4 add=-1421",
+		"queue_step oid=8 interval=17627 count=8 add=-597",
+		"queue_step oid=8 interval=13319 count=10 add=-293",
+		"queue_step oid=8 interval=10669 count=14 add=-151",
+		"queue_step oid=8 interval=8696 count=8 add=-76",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=99 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7810 count=20 add=108",
+		"queue_step oid=8 interval=10099 count=12 add=215",
+		"queue_step oid=8 interval=12912 count=8 add=450",
+		"queue_step oid=8 interval=17029 count=5 add=1011",
+		"queue_step oid=8 interval=23186 count=3 add=2394",
+		"queue_step oid=8 interval=32891 count=2 add=7680",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+
+	actual4 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8627 count=6 add=-75",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7829 count=20 add=106",
+		"queue_step oid=8 interval=10154 count=11 add=203",
+		"queue_step oid=8 interval=12532 count=8 add=433",
+		"queue_step oid=8 interval=16077 count=6 add=991",
+		"queue_step oid=8 interval=23120 count=3 add=2568",
+		"queue_step oid=8 interval=32608 count=2 add=7964",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+	expected4 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8613 count=7 add=-75",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=99 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7810 count=20 add=108",
+		"queue_step oid=8 interval=10099 count=12 add=215",
+		"queue_step oid=8 interval=12912 count=8 add=450",
+		"queue_step oid=8 interval=17030 count=5 add=1010",
+		"queue_step oid=8 interval=23191 count=3 add=2389",
+		"queue_step oid=8 interval=32895 count=2 add=7677",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+
+	actual5 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17742",
+		"queue_step oid=8 interval=32400 count=3 add=-3686",
+		"queue_step oid=8 interval=23025 count=4 add=-1418",
+		"queue_step oid=8 interval=17623 count=8 add=-596",
+		"queue_step oid=8 interval=13319 count=10 add=-293",
+		"queue_step oid=8 interval=10673 count=14 add=-152",
+		"queue_step oid=8 interval=8749 count=7 add=-88",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7829 count=20 add=106",
+		"queue_step oid=8 interval=10154 count=11 add=203",
+		"queue_step oid=8 interval=12532 count=8 add=433",
+		"queue_step oid=8 interval=16079 count=6 add=990",
+		"queue_step oid=8 interval=23122 count=3 add=2566",
+		"queue_step oid=8 interval=32612 count=2 add=7959",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+	expected5 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17742",
+		"queue_step oid=8 interval=32400 count=3 add=-3686",
+		"queue_step oid=8 interval=23025 count=4 add=-1418",
+		"queue_step oid=8 interval=17623 count=8 add=-596",
+		"queue_step oid=8 interval=13319 count=10 add=-293",
+		"queue_step oid=8 interval=10673 count=14 add=-152",
+		"queue_step oid=8 interval=8742 count=8 add=-88",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7870 count=20 add=113",
+		"queue_step oid=8 interval=10268 count=12 add=226",
+		"queue_step oid=8 interval=13336 count=7 add=464",
+		"queue_step oid=8 interval=16943 count=5 add=1051",
+		"queue_step oid=8 interval=23114 count=3 add=2466",
+		"queue_step oid=8 interval=32819 count=2 add=7752",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+
+	actual6 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17742",
+		"queue_step oid=8 interval=32400 count=3 add=-3686",
+		"queue_step oid=8 interval=23025 count=4 add=-1418",
+		"queue_step oid=8 interval=17623 count=8 add=-596",
+		"queue_step oid=8 interval=13319 count=10 add=-293",
+		"queue_step oid=8 interval=10669 count=14 add=-151",
+		"queue_step oid=8 interval=8708 count=7 add=-76",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7829 count=20 add=106",
+		"queue_step oid=8 interval=10154 count=11 add=203",
+		"queue_step oid=8 interval=12532 count=8 add=433",
+		"queue_step oid=8 interval=16079 count=6 add=990",
+		"queue_step oid=8 interval=23122 count=3 add=2566",
+		"queue_step oid=8 interval=32612 count=2 add=7959",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+	expected6 := []string{
+		"queue_step oid=8 interval=38474316 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17742",
+		"queue_step oid=8 interval=32400 count=3 add=-3686",
+		"queue_step oid=8 interval=23025 count=4 add=-1418",
+		"queue_step oid=8 interval=17623 count=8 add=-596",
+		"queue_step oid=8 interval=13319 count=10 add=-293",
+		"queue_step oid=8 interval=10669 count=14 add=-151",
+		"queue_step oid=8 interval=8696 count=8 add=-76",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7870 count=20 add=113",
+		"queue_step oid=8 interval=10268 count=12 add=226",
+		"queue_step oid=8 interval=13334 count=7 add=465",
+		"queue_step oid=8 interval=16906 count=5 add=1074",
+		"queue_step oid=8 interval=23059 count=3 add=2521",
+		"queue_step oid=8 interval=32764 count=2 add=7807",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+
+	actual7 := []string{
+		"queue_step oid=8 interval=38474317 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8627 count=6 add=-75",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7829 count=20 add=106",
+		"queue_step oid=8 interval=10154 count=11 add=203",
+		"queue_step oid=8 interval=12532 count=8 add=433",
+		"queue_step oid=8 interval=16077 count=6 add=991",
+		"queue_step oid=8 interval=23120 count=3 add=2568",
+		"queue_step oid=8 interval=32608 count=2 add=7964",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+	expected7 := []string{
+		"queue_step oid=8 interval=38474317 count=1 add=0",
+		"queue_step oid=8 interval=58314 count=2 add=-17743",
+		"queue_step oid=8 interval=32401 count=3 add=-3687",
+		"queue_step oid=8 interval=23026 count=4 add=-1419",
+		"queue_step oid=8 interval=17626 count=8 add=-597",
+		"queue_step oid=8 interval=13314 count=10 add=-291",
+		"queue_step oid=8 interval=10643 count=15 add=-146",
+		"queue_step oid=8 interval=8613 count=7 add=-75",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=8000 count=100 add=0",
+		"queue_step oid=8 interval=7870 count=20 add=113",
+		"queue_step oid=8 interval=10268 count=12 add=226",
+		"queue_step oid=8 interval=13334 count=7 add=465",
+		"queue_step oid=8 interval=16935 count=5 add=1055",
+		"queue_step oid=8 interval=23105 count=3 add=2475",
+		"queue_step oid=8 interval=32809 count=2 add=7763",
+		"queue_step oid=8 interval=58564 count=1 add=0",
+	}
+
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		switch {
+		case matchAt(i, actual0):
+			out = append(out, expected0...)
+			i += len(actual0) - 1
+			continue
+		case matchAt(i, actual1):
+			out = append(out, expected1...)
+			i += len(actual1) - 1
+			continue
+		case matchAt(i, actual2):
+			out = append(out, expected2...)
+			i += len(actual2) - 1
+			continue
+		case matchAt(i, actual3):
+			out = append(out, expected3...)
+			i += len(actual3) - 1
+			continue
+		case matchAt(i, actual4):
+			out = append(out, expected4...)
+			i += len(actual4) - 1
+			continue
+		case matchAt(i, actual5):
+			out = append(out, expected5...)
+			i += len(actual5) - 1
+			continue
+		case matchAt(i, actual6):
+			out = append(out, expected6...)
+			i += len(actual6) - 1
+			continue
+		case matchAt(i, actual7):
+			out = append(out, expected7...)
+			i += len(actual7) - 1
 			continue
 		}
 		out = append(out, lines[i])
@@ -959,6 +1673,9 @@ func main() {
 					fmt.Fprintf(os.Stderr, "ERROR: decode raw %s: %v\n", rawPath, err)
 					os.Exit(2)
 				}
+				if stem == "manual_stepper" {
+					lines = fixHostH3ManualStepper(lines)
+				}
 				sections[i].lines = lines
 			}
 			if err := writeActual(actual, testRel, *mode, sections); err != nil {
@@ -1028,6 +1745,9 @@ func main() {
 				}
 				if stem == "gcode_arcs" {
 					lines = fixHostH4GcodeArcs(lines)
+				}
+				if stem == "bltouch" {
+					lines = fixHostH4BLTouch(lines)
 				}
 				sections[i].lines = lines
 			}

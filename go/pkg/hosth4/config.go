@@ -143,18 +143,30 @@ func parsePinDesc(desc string, canInvert bool, canPullup bool) (pin, error) {
 		p.invert = true
 		d = strings.TrimSpace(d[1:])
 	}
+	chip := "mcu"
 	if strings.Contains(d, ":") {
 		parts := strings.SplitN(d, ":", 2)
-		chip := strings.TrimSpace(parts[0])
-		if chip != "mcu" {
+		chip = strings.TrimSpace(parts[0])
+		if chip != "mcu" && chip != "probe" {
 			return pin{}, fmt.Errorf("unsupported pin chip %q in %q", chip, desc)
 		}
 		d = strings.TrimSpace(parts[1])
 	}
-	if strings.ContainsAny(d, "^~!:") || strings.Join(strings.Fields(d), "") != d {
+	if strings.Join(strings.Fields(d), "") != d {
 		return pin{}, fmt.Errorf("invalid pin %q", desc)
 	}
-	p.pin = d
+	if chip == "mcu" {
+		if strings.ContainsAny(d, "^~!:") {
+			return pin{}, fmt.Errorf("invalid pin %q", desc)
+		}
+		p.pin = d
+	} else {
+		// Virtual / non-MCU pin.
+		if d == "" {
+			return pin{}, fmt.Errorf("invalid pin %q", desc)
+		}
+		p.pin = chip + ":" + d
+	}
 	return p, nil
 }
 
@@ -251,9 +263,21 @@ func readStepper(cfg *config, axis byte) (stepperCfg, error) {
 	if err != nil {
 		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
 	}
-	positionEndstop, err := parseFloat(sec, "position_endstop", nil)
-	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+	var positionEndstop float64
+	rawEndstop := strings.TrimSpace(sec["position_endstop"])
+	if rawEndstop == "" {
+		// Some configs (e.g., probe-based Z endstop) do not specify position_endstop
+		// on the stepper. Klippy derives it from the probe object (z_offset).
+		if strings.HasPrefix(strings.ToLower(endstopPin.pin), "probe:") {
+			positionEndstop = defPosMin
+		} else {
+			return stepperCfg{}, fmt.Errorf("[%s] missing position_endstop", secName)
+		}
+	} else {
+		positionEndstop, err = parseFloat(sec, "position_endstop", nil)
+		if err != nil {
+			return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		}
 	}
 
 	defHomingSpeed := 5.0

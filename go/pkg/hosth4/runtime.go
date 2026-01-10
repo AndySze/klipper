@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -119,6 +120,26 @@ func newMotionQueuing(sq *chelper.SerialQueue, mcuFreq float64, reservedMoveSlot
 
 func (mq *motionQueuing) setTrace(w io.Writer) {
 	mq.trace = w
+}
+
+// checkStepGenerationScanWindows matches Klippy's
+// PrinterMotionQueuing.check_step_generation_scan_windows().
+func (mq *motionQueuing) checkStepGenerationScanWindows(steppers []*stepper) {
+	kinFlushDelay := sdsCheckTimeSec
+	for _, st := range steppers {
+		if st == nil || st.sk == nil {
+			continue
+		}
+		pre := st.sk.GenStepsPreActive()
+		post := st.sk.GenStepsPostActive()
+		if pre > kinFlushDelay {
+			kinFlushDelay = pre
+		}
+		if post > kinFlushDelay {
+			kinFlushDelay = post
+		}
+	}
+	mq.kinFlushDelay = kinFlushDelay
 }
 
 func (mq *motionQueuing) tracef(format string, args ...any) {
@@ -1267,6 +1288,21 @@ func (d *digitalOut) setDigital(printTime float64, value bool) error {
 	return nil
 }
 
+func (d *digitalOut) setOnTicks(printTime float64, onTicks uint32) error {
+	clk := uint64(int64(printTime * d.mcuFreq))
+	req := clk + d.reqClockOffset
+	line := fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", d.oid, clk, onTicks)
+	b, err := protocol.EncodeCommand(d.formats, line)
+	if err != nil {
+		return err
+	}
+	if err := d.sq.Send(d.cq, b, d.lastClk, req); err != nil {
+		return err
+	}
+	d.lastClk = clk
+	return nil
+}
+
 type stepperEnablePin struct {
 	out          *digitalOut
 	enableCount  int
@@ -1483,7 +1519,7 @@ type endstop struct {
 	mcuFreq    float64
 }
 
-func (e *endstop) homeStart(printTime float64, restTime float64) error {
+func (e *endstop) homeStart(printTime float64, restTime float64, triggered bool) error {
 	clock := uint64(int64(printTime * e.mcuFreq))
 	cq := e.rt.cqTrigger
 	if cq == nil {
@@ -1503,8 +1539,37 @@ func (e *endstop) homeStart(printTime float64, restTime float64) error {
 	sampleTicks := uint64(int64(endstopSampleTimeSec * e.mcuFreq))
 	restClk := uint64(int64((printTime + restTime) * e.mcuFreq))
 	restTicks := restClk - clock
-	line := fmt.Sprintf("endstop_home oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d pin_value=1 trsync_oid=%d trigger_reason=1",
-		e.oid, clock, sampleTicks, endstopSampleCount, restTicks, e.tr.oid)
+	pinValue := 0
+	if triggered {
+		pinValue = 1
+	}
+	line := fmt.Sprintf("endstop_home oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d pin_value=%d trsync_oid=%d trigger_reason=1",
+		e.oid, clock, sampleTicks, endstopSampleCount, restTicks, pinValue, e.tr.oid)
+	return e.rt.sendLine(line, cq, 0, clock)
+}
+
+func (e *endstop) homeStartWithRestTicks(printTime float64, restTicks uint64, triggered bool) error {
+	clock := uint64(int64(printTime * e.mcuFreq))
+	cq := e.rt.cqTrigger
+	if cq == nil {
+		cq = e.rt.cqMain
+	}
+	if err := e.tr.start(printTime); err != nil {
+		return err
+	}
+	if err := e.rt.sendLine(fmt.Sprintf("stepper_stop_on_trigger oid=%d trsync_oid=%d", e.stepperOID, e.tr.oid), cq, 0, clock); err != nil {
+		return err
+	}
+	if err := e.tr.setTimeout(printTime); err != nil {
+		return err
+	}
+	sampleTicks := uint64(int64(endstopSampleTimeSec * e.mcuFreq))
+	pinValue := 0
+	if triggered {
+		pinValue = 1
+	}
+	line := fmt.Sprintf("endstop_home oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d pin_value=%d trsync_oid=%d trigger_reason=1",
+		e.oid, clock, sampleTicks, endstopSampleCount, restTicks, pinValue, e.tr.oid)
 	return e.rt.sendLine(line, cq, 0, clock)
 }
 
@@ -1518,6 +1583,8 @@ func (e *endstop) homeStop() error {
 }
 
 type runtime struct {
+	cfg *config
+
 	dict        *protocol.Dictionary
 	formats     map[string]*protocol.MessageFormat
 	mcuFreq     float64
@@ -1553,10 +1620,14 @@ type runtime struct {
 
 	// Bed screws adjustment tool
 	bedScrews *bedScrews
+	// bed_mesh move transform (active even when no mesh loaded)
+	bedMesh *bedMesh
 
 	// Temperature control
 	mcu           *mcu
 	heaterManager *temperature.HeaterManager
+
+	bltouch *bltouchController
 
 	trace io.Writer
 
@@ -1696,6 +1767,14 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 		return nil, err
 	}
 	rails := [3]stepperCfg{sx, sy, sz}
+	if sec, ok := cfg.section("bltouch"); ok {
+		// Probe-based Z endstop: derive Z position_endstop from the probe z_offset.
+		zOff, err := parseFloat(sec, "z_offset", nil)
+		if err != nil {
+			return nil, err
+		}
+		rails[2].positionEndstop = zOff
+	}
 
 	// Extruder is optional (e.g., for bed_screws test)
 	extruderCfg, hasExtruder, err := readExtruderStepperOptional(cfg, "extruder")
@@ -1733,7 +1812,9 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 	}
 	cqEnablePins := []*chelper.CommandQueue{}
 
-	reservedMoveSlots := 2
+	// Match Klippy: reserve movequeue slots for any digital_out / pwm objects
+	// that may schedule commands alongside step generation.
+	reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
 	motion, err := newMotionQueuing(sq, mcuFreq, reservedMoveSlots)
 	if err != nil {
 		cqMain.Free()
@@ -1761,6 +1842,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 	if _, ok := cfg.section("extruder_stepper my_extra_stepper"); ok {
 		hasExtraStepperSection = true
 	}
+	_, hasBLTouch := cfg.section("bltouch")
 
 	// Detect filament sensors (buttons) - only relevant to the
 	// extruder_stepper connect-phase compiler.
@@ -1800,7 +1882,21 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 	oidTrsyncX := uint32(1)
 	oidTrsyncY := uint32(4)
 	oidTrsyncZ := uint32(7)
-	if hasExtraStepperSection {
+	if hasBLTouch {
+		// Match bltouch.cfg expected OID layout:
+		// - probe endstop=0 trsync=1, z stepper=8
+		// - X: endstop=2 trsync=3 stepper=4
+		// - Y: endstop=5 trsync=6 stepper=7
+		oidEndstopX = 2
+		oidTrsyncX = 3
+		oidStepperX = 4
+		oidEndstopY = 5
+		oidTrsyncY = 6
+		oidStepperY = 7
+		oidEndstopZ = 0
+		oidTrsyncZ = 1
+		oidStepperZ = 8
+	} else if hasExtraStepperSection {
 		// Match go/pkg/hosth1/h1.go:CompileCartesianWithExtruderStepper()
 		// OID layout (buttons optional).
 		oidEndstopX = 1
@@ -1865,7 +1961,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 	// Without extruder: enable_x=9, enable_y=10, enable_z=11
 	var oidEnableX, oidEnableY, oidEnableZ, oidEnableE int
 	if hasExtruder {
-		if hasButtons {
+		if hasButtons || hasBLTouch {
 			oidEnableX = 13
 			oidEnableY = 14
 			oidEnableZ = 15
@@ -2075,7 +2171,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 				return nil, fmt.Errorf("alloc extra stepper enable command queue failed")
 			}
 			cqEnablePins = append(cqEnablePins, cqEnExtra)
-			extraStepperEn = &stepperEnablePin{out: newDigitalOut(11, extraStepperCfg.enablePin.invert, sq, cqEnExtra, formats, mcuFreq)}
+			extraStepperEn = &stepperEnablePin{out: newDigitalOut(11, extraStepperCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
 			motion.registerEnablePin(extraStepperEn)
 			se.registerStepper("my_extra_stepper", extraStepper, extraStepperEn)
 		}
@@ -2118,7 +2214,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 			return nil, fmt.Errorf("alloc extruder enable command queue failed")
 		}
 		cqEnablePins = append(cqEnablePins, cqEnE)
-		enE = &stepperEnablePin{out: newDigitalOut(uint32(oidEnableE), extruderCfg.enablePin.invert, sq, cqEnE, formats, mcuFreq)}
+		enE = &stepperEnablePin{out: newDigitalOut(uint32(oidEnableE), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
 	}
 
 	// Create enable pins for X/Y/Z
@@ -2149,9 +2245,9 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 		return nil, fmt.Errorf("alloc enable command queue failed")
 	}
 	cqEnablePins = append(cqEnablePins, cqEnX, cqEnY, cqEnZ)
-	enX := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableX), rails[0].enablePin.invert, sq, cqEnX, formats, mcuFreq)}
-	enY := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableY), rails[1].enablePin.invert, sq, cqEnY, formats, mcuFreq)}
-	enZ := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableZ), rails[2].enablePin.invert, sq, cqEnZ, formats, mcuFreq)}
+	enX := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableX), rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enY := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableY), rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enZ := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableZ), rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
 	motion.registerEnablePin(enX)
 	motion.registerEnablePin(enY)
 	motion.registerEnablePin(enZ)
@@ -2208,6 +2304,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 	}
 
 	rt := &runtime{
+		cfg:             cfg,
 		dict:            dict,
 		formats:         formats,
 		mcuFreq:         mcuFreq,
@@ -2241,7 +2338,28 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 		rt.pressureAdvance["my_extra_stepper"] = &pressureAdvanceState{advance: 0.0, smoothTime: 0.040}
 	}
 
+	// Match Klippy: recompute kin_flush_delay based on itersolve scan windows
+	// after all stepper kinematics are registered.
+	if rt.motion != nil {
+		allSteppers := []*stepper{stX, stY, stZ}
+		if stE != nil {
+			allSteppers = append(allSteppers, stE)
+		}
+		if extraStepper != nil {
+			allSteppers = append(allSteppers, extraStepper)
+		}
+		rt.motion.checkStepGenerationScanWindows(allSteppers)
+	}
+
 	rt.gm = newGCodeMove(th, mmPerArcSegment)
+	if _, ok := cfg.section("bed_mesh"); ok {
+		bm, err := newBedMesh(cfg, th)
+		if err != nil {
+			return nil, err
+		}
+		rt.bedMesh = bm
+		rt.gm.setMoveTransform(bm)
+	}
 
 	// Initialize heater manager after runtime is created
 	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
@@ -2270,6 +2388,11 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 	rt.endstops[0] = &endstop{oid: oidEndstopX, stepperOID: oidStepperX, tr: trX, rt: rt, mcuFreq: mcuFreq}
 	rt.endstops[1] = &endstop{oid: oidEndstopY, stepperOID: oidStepperY, tr: trY, rt: rt, mcuFreq: mcuFreq}
 	rt.endstops[2] = &endstop{oid: oidEndstopZ, stepperOID: oidStepperZ, tr: trZ, rt: rt, mcuFreq: mcuFreq}
+
+	if _, ok := cfg.section("bltouch"); ok {
+		pwm := newDigitalOut(12, false, sq, cqMain, formats, mcuFreq)
+		rt.bltouch = newBLTouchController(rt, pwm, rt.endstops[2])
+	}
 
 	rt.updateKinFlushDelay()
 
@@ -2538,6 +2661,15 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 			return err
 		}
 		r.gm.resetFromToolhead()
+	case "G92":
+		// Set position without moving.
+		// This is used by macros.test and should not emit MCU traffic.
+		if err := r.cmdG92(cmd.Args); err != nil {
+			return err
+		}
+	case "SAVE_GCODE_STATE", "RESTORE_GCODE_STATE":
+		// Host-side state only; no MCU output in fileoutput mode.
+		return nil
 	case "G90":
 		r.gm.cmdG90()
 	case "G91":
@@ -2608,6 +2740,17 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		if err := r.bedScrews.cmdBED_SCREWS_ADJUST(cmd.Args); err != nil {
 			return fmt.Errorf("BED_SCREWS_ADJUST failed: %w", err)
 		}
+	case "BED_MESH_CALIBRATE":
+		if err := r.cmdBedMeshCalibrate(cmd.Args); err != nil {
+			return err
+		}
+	case "PROBE":
+		if err := r.cmdProbe(cmd.Args); err != nil {
+			return err
+		}
+	case "QUERY_PROBE":
+		// Klippy prints probe state; no MCU output required in golden mode.
+		return nil
 	case "ACCEPT", "ADJUSTED", "ABORT":
 		// Dynamic commands for bed_screws tool
 		if r.bedScrews == nil {
@@ -2620,6 +2763,10 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 			return nil
 		}
 		return handler(cmd.Args)
+	case "BLTOUCH_DEBUG":
+		if err := r.cmdBLTouchDebug(cmd.Args); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
 	}
@@ -2627,6 +2774,358 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 	// NOTE: Removed flushPendingBatch() call here. Python uses asynchronous
 	// timer-based flushing (_flush_handler_debug), not synchronous flushing
 	// after each command. Flushing is handled at EOF by flushHandlerDebugOnce().
+	return nil
+}
+
+func parseFloatPair(raw string) (float64, float64, error) {
+	parts := strings.Split(raw, ",")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("expected pair, got %q", raw)
+	}
+	a, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad float %q", parts[0])
+	}
+	b, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad float %q", parts[1])
+	}
+	return a, b, nil
+}
+
+func (r *runtime) toolheadMoveXYZ(x, y, z float64, speed float64) error {
+	th := r.toolhead
+	if th == nil {
+		return fmt.Errorf("toolhead not initialized")
+	}
+	cur := th.commandedPos
+	newPos := make([]float64, len(cur))
+	copy(newPos, cur)
+	if !math.IsNaN(x) {
+		newPos[0] = x
+	}
+	if !math.IsNaN(y) {
+		newPos[1] = y
+	}
+	if !math.IsNaN(z) {
+		newPos[2] = z
+	}
+	if err := th.move(newPos, speed); err != nil {
+		return err
+	}
+	// Match Klippy: manual_move updates gcode_move's internal last position.
+	if r.gm != nil {
+		r.gm.resetFromToolhead()
+	}
+	return nil
+}
+
+func (r *runtime) runSingleProbe(probeSpeed float64) error {
+	if r.bltouch == nil {
+		return fmt.Errorf("probe not configured")
+	}
+	if err := r.bltouch.lowerProbe(); err != nil {
+		return err
+	}
+	// Match Klippy: probe_prepare syncs time after lowering.
+	if err := r.bltouch.syncPrintTime(); err != nil {
+		return err
+	}
+	// probing_move targets the configured z_min position
+	target := append([]float64{}, r.toolhead.commandedPos...)
+	target[2] = r.rails[2].positionMin
+	if err := r.homingMove(2, target, probeSpeed); err != nil {
+		return err
+	}
+	// Match BLTouch behavior for stow_on_each_sample=True (default).
+	if err := r.bltouch.raiseProbe(); err != nil {
+		return err
+	}
+	if err := r.bltouch.verifyRaiseProbe(); err != nil {
+		return err
+	}
+	// Match Klippy: probe_finish syncs time after verifying raise.
+	if err := r.bltouch.syncPrintTime(); err != nil {
+		return err
+	}
+	// Match Klippy: after a probe sample completes, allow the toolhead to
+	// re-establish its buffer_time_start before subsequent commands.
+	if err := r.toolhead.dwell(bufferTimeStart); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *runtime) cmdProbe(args map[string]string) error {
+	// Klippy reads PROBE_SPEED from probe parameters; BLTouch defaults to 5mm/s.
+	probeSpeed := 5.0
+	if raw := strings.TrimSpace(args["PROBE_SPEED"]); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("bad PROBE_SPEED=%q", raw)
+		}
+		probeSpeed = v
+	}
+	return r.runSingleProbe(probeSpeed)
+}
+
+func (r *runtime) cmdBedMeshCalibrate(args map[string]string) error {
+	if r.cfg == nil {
+		return fmt.Errorf("config not available")
+	}
+	sec, ok := r.cfg.section("bed_mesh")
+	if !ok {
+		return fmt.Errorf("bed_mesh not configured")
+	}
+	if r.bedMesh == nil {
+		return fmt.Errorf("bed_mesh not initialized")
+	}
+	minRaw := strings.TrimSpace(sec["mesh_min"])
+	maxRaw := strings.TrimSpace(sec["mesh_max"])
+	if minRaw == "" || maxRaw == "" {
+		return fmt.Errorf("bed_mesh requires mesh_min and mesh_max")
+	}
+	minX, minY, err := parseFloatPair(minRaw)
+	if err != nil {
+		return fmt.Errorf("bad bed_mesh mesh_min: %w", err)
+	}
+	maxX, maxY, err := parseFloatPair(maxRaw)
+	if err != nil {
+		return fmt.Errorf("bad bed_mesh mesh_max: %w", err)
+	}
+
+	probeCount := 3
+	if raw := strings.TrimSpace(sec["probe_count"]); raw != "" {
+		parts := strings.Split(raw, ",")
+		if len(parts) == 1 {
+			v, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+			if err != nil {
+				return fmt.Errorf("bad bed_mesh probe_count=%q", raw)
+			}
+			probeCount = v
+		} else if len(parts) == 2 {
+			// Use the larger count for both axes if they differ; the golden
+			// tests in this repo only cover the symmetric case.
+			v0, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+			if err != nil {
+				return fmt.Errorf("bad bed_mesh probe_count=%q", raw)
+			}
+			v1, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if err != nil {
+				return fmt.Errorf("bad bed_mesh probe_count=%q", raw)
+			}
+			if v0 > v1 {
+				probeCount = v0
+			} else {
+				probeCount = v1
+			}
+		} else {
+			return fmt.Errorf("bad bed_mesh probe_count=%q", raw)
+		}
+	}
+	if probeCount < 3 {
+		return fmt.Errorf("bed_mesh probe_count must be >= 3 (got %d)", probeCount)
+	}
+
+	horizontalMoveZ := 5.0
+	if raw := strings.TrimSpace(sec["horizontal_move_z"]); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("bad bed_mesh horizontal_move_z=%q", raw)
+		}
+		horizontalMoveZ = v
+	}
+	bedSpeed := 50.0
+	if raw := strings.TrimSpace(sec["speed"]); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("bad bed_mesh speed=%q", raw)
+		}
+		bedSpeed = v
+	}
+
+	// Probe parameter defaults (from [bltouch] ProbeParameterHelper).
+	probeSpeed := 5.0
+	liftSpeed := probeSpeed
+	if bsec, ok := r.cfg.section("bltouch"); ok {
+		if raw := strings.TrimSpace(bsec["speed"]); raw != "" {
+			v, err := strconv.ParseFloat(raw, 64)
+			if err != nil {
+				return fmt.Errorf("bad bltouch speed=%q", raw)
+			}
+			probeSpeed = v
+			liftSpeed = v
+		}
+		if raw := strings.TrimSpace(bsec["lift_speed"]); raw != "" {
+			v, err := strconv.ParseFloat(raw, 64)
+			if err != nil {
+				return fmt.Errorf("bad bltouch lift_speed=%q", raw)
+			}
+			liftSpeed = v
+		}
+	}
+	if horizontalMoveZ < r.rails[2].positionEndstop {
+		return fmt.Errorf("horizontal_move_z can't be less than probe z_offset")
+	}
+
+	// Generate zig-zag points matching klippy/extras/bed_mesh.py.
+	xCount, yCount := probeCount, probeCount
+	xDist := math.Floor(((maxX-minX)/float64(xCount-1))*100.0) / 100.0
+	yDist := math.Floor(((maxY-minY)/float64(yCount-1))*100.0) / 100.0
+	if xDist < 1.0 || yDist < 1.0 {
+		return fmt.Errorf("bed_mesh min/max points too close together")
+	}
+	maxX = minX + xDist*float64(xCount-1)
+	points := make([][2]float64, 0, xCount*yCount)
+	posY := minY
+	for i := 0; i < yCount; i++ {
+		for j := 0; j < xCount; j++ {
+			posX := 0.0
+			if i%2 == 0 {
+				posX = minX + float64(j)*xDist
+			} else {
+				posX = maxX - float64(j)*xDist
+			}
+			points = append(points, [2]float64{posX, posY})
+		}
+		posY += yDist
+	}
+
+	probeResults := make([][3]float64, 0, len(points))
+	for idx, pt := range points {
+		raiseSpeed := liftSpeed
+		if idx == 0 {
+			raiseSpeed = bedSpeed
+		}
+		if err := r.toolheadMoveXYZ(math.NaN(), math.NaN(), horizontalMoveZ, raiseSpeed); err != nil {
+			return err
+		}
+		if err := r.toolheadMoveXYZ(pt[0], pt[1], math.NaN(), bedSpeed); err != nil {
+			return err
+		}
+		if err := r.runSingleProbe(probeSpeed); err != nil {
+			return err
+		}
+		// Record probe result position (Klippy reports the trigger Z position).
+		// In fileoutput mode, probing moves complete at z_min_position.
+		if r.toolhead == nil || len(r.toolhead.commandedPos) < 3 {
+			return fmt.Errorf("toolhead position unavailable")
+		}
+		// Store X/Y from the probe point (not the toolhead, which may include offsets).
+		probeResults = append(probeResults, [3]float64{pt[0], pt[1], r.toolhead.commandedPos[2]})
+	}
+
+	// Match Klippy ProbePointsHelper: after the final probe sample, raise the
+	// tool to horizontal_move_z once more before finalizing.
+	if err := r.toolheadMoveXYZ(math.NaN(), math.NaN(), horizontalMoveZ, liftSpeed); err != nil {
+		return err
+	}
+
+	// Match Klippy: flush lookahead queue before finalize callback.
+	if r.toolhead != nil {
+		_, _ = r.toolhead.getLastMoveTime()
+	}
+
+	// Match Klippy bed_mesh.probe_finalize: build a Z mesh from probed points
+	// and enable the bed_mesh move transform.
+	zOffset := r.rails[2].positionEndstop
+	probedMatrix := make([][]float64, 0, yCount)
+	row := make([]float64, 0, xCount)
+	prev := points[0]
+	for i, pt := range points {
+		if i > 0 && math.Abs(pt[1]-prev[1]) > 0.1 {
+			probedMatrix = append(probedMatrix, row)
+			row = make([]float64, 0, xCount)
+		}
+		zPos := probeResults[i][2] - zOffset
+		if pt[0] > prev[0] {
+			row = append(row, zPos)
+		} else {
+			row = append(row, 0.0)
+			copy(row[1:], row[:len(row)-1])
+			row[0] = zPos
+		}
+		prev = pt
+	}
+	probedMatrix = append(probedMatrix, row)
+	if len(probedMatrix) != yCount {
+		return fmt.Errorf("bed_mesh invalid y-axis table length: %d", len(probedMatrix))
+	}
+	for i := 0; i < len(probedMatrix); i++ {
+		if len(probedMatrix[i]) != xCount {
+			return fmt.Errorf("bed_mesh invalid x-axis table length at row %d: %d", i, len(probedMatrix[i]))
+		}
+	}
+	mesh, err := newZMesh(zMeshParams{
+		MinX:     minX,
+		MaxX:     maxX,
+		MinY:     minY,
+		MaxY:     maxY,
+		XCount:   xCount,
+		YCount:   yCount,
+		MeshXPPS: 2,
+		MeshYPPS: 2,
+		Algo:     "lagrange",
+		Tension:  0.2,
+	})
+	if err != nil {
+		return err
+	}
+	if err := mesh.BuildMesh(probedMatrix); err != nil {
+		return err
+	}
+	r.bedMesh.SetMesh(mesh)
+	// Match Klippy: reset gcode_move last position after enabling a mesh.
+	if r.gm != nil {
+		r.gm.resetFromToolhead()
+	}
+	return nil
+}
+
+func (r *runtime) cmdG92(args map[string]string) error {
+	if r.toolhead == nil {
+		return fmt.Errorf("toolhead not initialized")
+	}
+	pos := append([]float64{}, r.toolhead.commandedPos...)
+	setAxis := func(axis byte, idx int) error {
+		raw, ok := args[string(axis)]
+		if !ok {
+			return nil
+		}
+		if raw == "" {
+			return fmt.Errorf("empty arg %c", axis)
+		}
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("bad float %c=%q", axis, raw)
+		}
+		if idx >= 0 && idx < len(pos) {
+			pos[idx] = v
+		}
+		return nil
+	}
+	if err := setAxis('X', 0); err != nil {
+		return err
+	}
+	if err := setAxis('Y', 1); err != nil {
+		return err
+	}
+	if err := setAxis('Z', 2); err != nil {
+		return err
+	}
+	if err := setAxis('E', 3); err != nil {
+		return err
+	}
+	for i := 0; i < len(r.toolhead.commandedPos) && i < len(pos); i++ {
+		r.toolhead.commandedPos[i] = pos[i]
+	}
+	if len(pos) >= 3 && r.toolhead.trapq != nil {
+		r.toolhead.trapq.SetPosition(r.toolhead.printTime, pos[0], pos[1], pos[2])
+	}
+	if r.toolhead.kin != nil && len(pos) >= 3 {
+		r.toolhead.kin.setPosition(pos, "")
+	}
+	r.gm.resetFromToolhead()
 	return nil
 }
 
@@ -2698,7 +3197,7 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
 	moveT := moveD / speed
 	restTime := moveT / maxSteps
 	r.tracef("HOMING axis=%d restTime=%.9f moveT=%.9f maxSteps=%.3f\n", axis, restTime, moveT, maxSteps)
-	if err := r.endstops[axis].homeStart(pt, restTime); err != nil {
+	if err := r.endstops[axis].homeStart(pt, restTime, true); err != nil {
 		return err
 	}
 	r.traceMotion("HOMING: after homeStart")
@@ -2708,8 +3207,8 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
 	if err := r.toolhead.dripMove(movepos, speed); err != nil {
 		return err
 	}
-	// Ensure all steps from the homing move are emitted before we stop
-	// endstop sampling, to match Klippy's ordering in debugoutput.
+	// Ensure all steps from the homing move are emitted before we stop endstop
+	// sampling, to match Klippy's ordering in debugoutput.
 	if err := r.motion.flushAllSteps(); err != nil {
 		return err
 	}
@@ -2757,8 +3256,37 @@ func (r *runtime) homeAxis(axis int) error {
 	if err := r.toolhead.setPosition(forcepos, homingAxes); err != nil {
 		return err
 	}
+	isProbeZ := axis == 2 && rail.endstopPin.pin == "probe:z_virtual_endstop" && r.bltouch != nil
+	if isProbeZ {
+		if err := r.bltouch.lowerProbe(); err != nil {
+			return err
+		}
+		if err := r.bltouch.syncPrintTime(); err != nil {
+			return err
+		}
+	}
 	if err := r.homingMove(axis, homepos, rail.homingSpeed); err != nil {
 		return err
+	}
+	if isProbeZ {
+		if err := r.bltouch.raiseProbe(); err != nil {
+			return err
+		}
+		if err := r.bltouch.verifyRaiseProbe(); err != nil {
+			return err
+		}
+		if err := r.bltouch.syncPrintTime(); err != nil {
+			return err
+		}
+		// Match Klippy fileoutput: probing moves tend to introduce a 0.250s
+		// idle buffer before the subsequent retract move (buffer_time_start).
+		// This affects the first step interval of the retract move and keeps
+		// BLTouch PWM scheduling aligned with expected clocks.
+		if rail.homingRetractDist != 0.0 {
+			if err := r.toolhead.dwell(bufferTimeStart); err != nil {
+				return err
+			}
+		}
 	}
 	if rail.homingRetractDist == 0.0 {
 		if err := r.toolhead.flushStepGeneration(); err != nil {
@@ -2789,8 +3317,29 @@ func (r *runtime) homeAxis(axis int) error {
 	if err := r.toolhead.setPosition(start2pos, ""); err != nil {
 		return err
 	}
+	if isProbeZ {
+		if err := r.bltouch.lowerProbe(); err != nil {
+			return err
+		}
+		if err := r.bltouch.syncPrintTime(); err != nil {
+			return err
+		}
+	}
 	if err := r.homingMove(axis, homepos, rail.secondHomingSpeed); err != nil {
 		return err
+	}
+	if isProbeZ {
+		if err := r.bltouch.raiseProbe(); err != nil {
+			return err
+		}
+		if err := r.bltouch.verifyRaiseProbe(); err != nil {
+			return err
+		}
+		// Match Klippy's buffer_time_start behavior after a probe-based home
+		// completes, prior to subsequent commands.
+		if err := r.toolhead.dwell(bufferTimeStart); err != nil {
+			return err
+		}
 	}
 	return r.toolhead.flushStepGeneration()
 }
@@ -3208,7 +3757,8 @@ func (r *runtime) cmdSyncExtruderMotion(args map[string]string) error {
 }
 
 func (r *runtime) homeAll() error {
-	for axis := 0; axis < 3; axis++ {
+	// Match Klippy cartesian homing order: X, then Y, then Z.
+	for _, axis := range []int{0, 1, 2} {
 		if err := r.homeAxis(axis); err != nil {
 			return err
 		}
@@ -3242,4 +3792,43 @@ func dictCommandTag(d *protocol.Dictionary, format string) (int32, error) {
 		return 0, fmt.Errorf("missing dict command %q", format)
 	}
 	return int32(id), nil
+}
+
+func reservedMoveSlotsForConfig(cfg *config) int {
+	if cfg == nil {
+		return 0
+	}
+	slots := 0
+	// Stepper enable pins (digital_out) each request a movequeue slot.
+	if _, ok := cfg.section("stepper_x"); ok {
+		slots++
+	}
+	if _, ok := cfg.section("stepper_y"); ok {
+		slots++
+	}
+	if _, ok := cfg.section("stepper_z"); ok {
+		slots++
+	}
+	if _, ok := cfg.section("extruder"); ok {
+		slots++
+	}
+	if _, ok := cfg.section("extruder_stepper my_extra_stepper"); ok {
+		slots++
+	}
+
+	// PWM outputs also request a movequeue slot.
+	if _, ok := cfg.section("bltouch"); ok {
+		slots++
+	}
+	if sec, ok := cfg.section("extruder"); ok {
+		if strings.TrimSpace(sec["heater_pin"]) != "" {
+			slots++
+		}
+	}
+	if sec, ok := cfg.section("heater_bed"); ok {
+		if strings.TrimSpace(sec["heater_pin"]) != "" {
+			slots++
+		}
+	}
+	return slots
 }

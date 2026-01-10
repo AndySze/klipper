@@ -31,6 +31,8 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"pressure_advance.cfg":  true,
 		"bed_screws.cfg":        true,
 		"out_of_bounds.cfg":     true,
+		"macros.cfg":            true,
+		"bltouch.cfg":           true,
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only cartesian configs supported)", base)
@@ -66,6 +68,11 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		rt.setTrace(opts.Trace)
 	}
 
+	macros, err := loadGCodeMacros(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+
 	// Connect-phase + init commands.
 	// Check if config has heater_bed section, extruder, and extruder_stepper to determine which compiler to use.
 	_, hasBedHeater := cfg.section("heater_bed")
@@ -73,7 +80,12 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	_, hasExtraStepper := cfg.section("extruder_stepper my_extra_stepper")
 
 	var initLines []string
-	if hasBedHeater {
+	if base == "bltouch.cfg" {
+		initLines, err = hosth1.CompileBLTouchConnectPhase(cfgPath, dict)
+		if err != nil {
+			return nil, err
+		}
+	} else if hasBedHeater {
 		// Use the full connect-phase compiler for configs with heater_bed
 		initLines, err = hosth1.CompileExampleCartesianConnectPhase(cfgPath, dict)
 		if err != nil {
@@ -139,11 +151,8 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		if skipRuntimeGCode {
 			continue
 		}
-		cmd, err := parseGCodeLine(line)
-		if err != nil {
-			return nil, err
-		}
-		if err := rt.exec(cmd); err != nil {
+
+		if err := execGCodeWithMacros(rt, macros, line, 0); err != nil {
 			if shouldFail {
 				didFail = true
 				break
@@ -170,7 +179,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		}
 		// Some upstream regressions end with motors disabled in debugoutput.
 		baseTest := filepath.Base(testPath)
-		if baseTest == "bed_screws.test" || baseTest == "extruders.test" || baseTest == "pressure_advance.test" {
+		if baseTest == "bed_screws.test" || baseTest == "extruders.test" || baseTest == "pressure_advance.test" || baseTest == "macros.test" || baseTest == "bltouch.test" {
 			if err := rt.onEOF(); err != nil {
 				return nil, err
 			}
