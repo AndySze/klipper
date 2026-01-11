@@ -1678,6 +1678,9 @@ type runtime struct {
 	// Input shaper for vibration reduction
 	inputShaper *inputshaper.InputShaper
 
+	// Probe system
+	probe *Probe
+
 	trace io.Writer
 
 	rawPath string
@@ -2550,6 +2553,15 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 
 	rt.updateKinFlushDelay()
 
+	// Initialize probe if configured
+	if probe, err := newProbe(rt, cfg); err != nil {
+		rt.tracef("Warning: failed to initialize probe: %v\n", err)
+	} else if probe != nil {
+		rt.probe = probe
+		rt.tracef("Initialized probe: offsets=(%.3f, %.3f, %.3f)\n",
+			probe.config.XOffset, probe.config.YOffset, probe.config.ZOffset)
+	}
+
 	// Load and setup heaters from config
 	heaterConfigs, err := readHeaterConfigs(cfg)
 	if err != nil {
@@ -2907,6 +2919,10 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		if err := r.cmdProbe(cmd.Args); err != nil {
 			return err
 		}
+	case "PROBE_ACCURACY":
+		if err := r.cmdProbeAccuracy(cmd.Args); err != nil {
+			return err
+		}
 	case "QUERY_PROBE":
 		// Klippy prints probe state; no MCU output required in golden mode.
 		return nil
@@ -3028,6 +3044,32 @@ func (r *runtime) cmdProbe(args map[string]string) error {
 		probeSpeed = v
 	}
 	return r.runSingleProbe(probeSpeed)
+}
+
+func (r *runtime) cmdProbeAccuracy(args map[string]string) error {
+	if r.probe == nil {
+		return fmt.Errorf("probe not configured")
+	}
+
+	params := r.probe.GetProbeParams(args)
+	sampleCount := 10
+	if v, err := floatArg(args, "SAMPLES", 10); err == nil {
+		sampleCount = int(v)
+	}
+
+	pos := r.toolhead.commandedPos
+	r.tracef("PROBE_ACCURACY at X:%.3f Y:%.3f Z:%.3f (samples=%d retract=%.3f speed=%.1f lift_speed=%.1f)\n",
+		pos[0], pos[1], pos[2], sampleCount, params.SampleRetractDist, params.ProbeSpeed, params.LiftSpeed)
+
+	result, err := r.probe.RunProbeAccuracy(params, sampleCount)
+	if err != nil {
+		return err
+	}
+
+	r.tracef("probe accuracy results: maximum %.6f, minimum %.6f, range %.6f, average %.6f, median %.6f, standard deviation %.6f\n",
+		result.Maximum, result.Minimum, result.Range, result.Average, result.Median, result.StdDev)
+
+	return nil
 }
 
 func (r *runtime) cmdBedMeshCalibrate(args map[string]string) error {
