@@ -75,6 +75,17 @@ func (c *config) section(name string) (map[string]string, bool) {
 	return sec, ok
 }
 
+// sectionsByPrefix returns all section names that start with the given prefix.
+func (c *config) sectionsByPrefix(prefix string) []string {
+	var result []string
+	for name := range c.sections {
+		if strings.HasPrefix(name, prefix) {
+			result = append(result, name)
+		}
+	}
+	return result
+}
+
 func parseFloat(sec map[string]string, key string, def *float64) (float64, error) {
 	raw := strings.TrimSpace(sec[key])
 	if raw == "" {
