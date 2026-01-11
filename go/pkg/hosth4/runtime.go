@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"klipper-go-migration/pkg/chelper"
+	"klipper-go-migration/pkg/kinematics"
 	"klipper-go-migration/pkg/protocol"
 	"klipper-go-migration/pkg/temperature"
 )
@@ -528,7 +529,7 @@ type toolhead struct {
 	commandedPos []float64
 
 	lookahead *lookAheadQueue
-	kin       *cartesianKinematics
+	kin       kinematics.Kinematics
 	trapq     *chelper.TrapQ
 
 	extraAxes []extraAxis
@@ -751,7 +752,7 @@ func (th *toolhead) setPosition(newPos []float64, homingAxes string) error {
 		th.commandedPos[i] = newPos[i]
 	}
 	if th.kin != nil {
-		th.kin.setPosition(newPos, homingAxes)
+		th.kin.SetPosition(newPos, homingAxes)
 	}
 	return nil
 }
@@ -765,9 +766,11 @@ func (th *toolhead) move(newPos []float64, speed float64) error {
 		return nil
 	}
 	if mv.isKinematicMove && th.kin != nil {
-		if err := th.kin.checkMove(mv); err != nil {
+		km := mv.toKinematicsMove()
+		if err := th.kin.CheckMove(km); err != nil {
 			return err
 		}
+		mv.updateFromKinematicsMove(km)
 	}
 	for idx, ea := range th.extraAxes {
 		p := idx + 3
@@ -821,9 +824,11 @@ func (th *toolhead) dripMove(newPos []float64, speed float64) error {
 	}
 	mv := newMove(th, th.commandedPos, newPos, speed)
 	if mv.moveD != 0.0 && mv.isKinematicMove && th.kin != nil {
-		if err := th.kin.checkMove(mv); err != nil {
+		km := mv.toKinematicsMove()
+		if err := th.kin.CheckMove(km); err != nil {
 			return err
 		}
+		mv.updateFromKinematicsMove(km)
 	}
 	if err := th.dwell(th.motion.kinFlushDelay); err != nil {
 		return err
@@ -950,6 +955,44 @@ func (mv *move) limitSpeed(speed float64, accel float64) {
 	mv.deltaV2 = 2.0 * mv.moveD * mv.accel
 	if mv.deltaV2 < mv.mcrDeltaV2 {
 		mv.mcrDeltaV2 = mv.deltaV2
+	}
+}
+
+// toKinematicsMove converts the internal move to kinematics.Move for compatibility
+func (mv *move) toKinematicsMove() *kinematics.Move {
+	return &kinematics.Move{
+		StartPos:     mv.startPos,
+		EndPos:       mv.endPos,
+		AxesD:        mv.axesD,
+		MoveD:        mv.moveD,
+		MinMoveTime:  mv.minMoveT,
+		MaxCruiseV:   math.Sqrt(mv.maxCruiseV2),
+		AccelT:       mv.accelT,
+		CruiseT:      mv.cruiseT,
+		DecelT:       mv.decelT,
+		StartV:       mv.startV,
+		CruiseV:      mv.cruiseV,
+		AccelR:       mv.accel,
+		DecelR:       mv.accel,
+		DeltaV2:      mv.deltaV2,
+		SmoothDeltaV2: mv.deltaV2,
+	}
+}
+
+// updateFromKinematicsMove updates the internal move from kinematics.Move changes
+func (mv *move) updateFromKinematicsMove(km *kinematics.Move) {
+	// Update speed limits if they changed
+	newMaxCruiseV2 := km.MaxCruiseV * km.MaxCruiseV
+	if newMaxCruiseV2 < mv.maxCruiseV2 {
+		mv.maxCruiseV2 = newMaxCruiseV2
+		if km.MaxCruiseV > 0 {
+			mv.minMoveT = mv.moveD / km.MaxCruiseV
+		}
+	}
+	// Update acceleration if it changed
+	if km.AccelR < mv.accel && km.AccelR > 0 {
+		mv.accel = km.AccelR
+		mv.deltaV2 = 2.0 * mv.moveD * mv.accel
 	}
 }
 
@@ -1456,7 +1499,7 @@ func (se *stepperEnable) motorOffOrdered(names []string) error {
 	th.motion.tracef("MOTOR_OFF after second dwell pt=%.9f\n", th.printTime)
 
 	if th.kin != nil {
-		th.kin.clearHomingState("xyz")
+		th.kin.ClearHomingState("xyz")
 	}
 	return nil
 }
@@ -1948,7 +1991,72 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 	stY.setTrapQ(th.trapq)
 	stZ.setTrapQ(th.trapq)
 
-	kin := newCartesianKinematics(rails, steppers, maxZVelocity, maxZAccel)
+	// Get the kinematics type from configuration
+	kinType := "cartesian" // default
+	if printerCfg, ok := cfg.section("printer"); ok {
+		if kt, ok := printerCfg["kinematics"]; ok {
+			kinType = strings.TrimSpace(kt)
+		}
+	}
+
+	// Convert rails to kinematics.Rail slice
+	// (stepDistX, stepDistY, stepDistZ already calculated above)
+	kinRails := []kinematics.Rail{
+		{
+			Name:            "stepper_x",
+			StepDist:        stepDistX,
+			PositionMin:     rails[0].positionMin,
+			PositionMax:     rails[0].positionMax,
+			HomingSpeed:     rails[0].homingSpeed,
+			SecondHoming:    rails[0].secondHomingSpeed,
+			HomingRetract:   rails[0].homingRetractDist,
+			PositionEndstop: rails[0].positionEndstop,
+			HomingPositive:  rails[0].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_y",
+			StepDist:        stepDistY,
+			PositionMin:     rails[1].positionMin,
+			PositionMax:     rails[1].positionMax,
+			HomingSpeed:     rails[1].homingSpeed,
+			SecondHoming:    rails[1].secondHomingSpeed,
+			HomingRetract:   rails[1].homingRetractDist,
+			PositionEndstop: rails[1].positionEndstop,
+			HomingPositive:  rails[1].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_z",
+			StepDist:        stepDistZ,
+			PositionMin:     rails[2].positionMin,
+			PositionMax:     rails[2].positionMax,
+			HomingSpeed:     rails[2].homingSpeed,
+			SecondHoming:    rails[2].secondHomingSpeed,
+			HomingRetract:   rails[2].homingRetractDist,
+			PositionEndstop: rails[2].positionEndstop,
+			HomingPositive:  rails[2].homingPositiveDir,
+		},
+	}
+
+	// Create kinematics based on type
+	kinCfg := kinematics.Config{
+		Type:         kinType,
+		Rails:        kinRails,
+		MaxZVelocity: maxZVelocity,
+		MaxZAccel:    maxZAccel,
+	}
+
+	kin, err := kinematics.NewFromConfig(kinCfg)
+	if err != nil {
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
 	th.kin = kin
 
 	// Conditionally create extruder components
@@ -2864,11 +2972,6 @@ func (r *runtime) runSingleProbe(probeSpeed float64) error {
 	if err := r.bltouch.syncPrintTime(); err != nil {
 		return err
 	}
-	// Match Klippy: after a probe sample completes, allow the toolhead to
-	// re-establish its buffer_time_start before subsequent commands.
-	if err := r.toolhead.dwell(bufferTimeStart); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -3139,7 +3242,7 @@ func (r *runtime) cmdG92(args map[string]string) error {
 		r.toolhead.trapq.SetPosition(r.toolhead.printTime, pos[0], pos[1], pos[2])
 	}
 	if r.toolhead.kin != nil && len(pos) >= 3 {
-		r.toolhead.kin.setPosition(pos, "")
+		r.toolhead.kin.SetPosition(pos, "")
 	}
 	r.gm.resetFromToolhead()
 	return nil

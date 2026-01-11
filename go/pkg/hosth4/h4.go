@@ -47,8 +47,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		return nil, fmt.Errorf("missing [printer] section")
 	}
 	kin := strings.TrimSpace(printerSec["kinematics"])
-	if kin != "cartesian" {
-		return nil, fmt.Errorf("host-h4 only supports kinematics=cartesian (got %q)", kin)
+	// Support cartesian, corexy, and corexz kinematics
+	if kin != "cartesian" && kin != "corexy" && kin != "corexz" {
+		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz kinematics (got %q)", kin)
 	}
 
 	rt, err := newRuntime(cfgPath, dict, cfg)
