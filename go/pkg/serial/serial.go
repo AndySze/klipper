@@ -1,0 +1,491 @@
+// Package serial provides serial port communication for Klipper MCU connections.
+package serial
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+// Common errors
+var (
+	ErrNotConnected = errors.New("serial: not connected")
+	ErrTimeout      = errors.New("serial: operation timed out")
+	ErrClosed       = errors.New("serial: port closed")
+)
+
+// Config holds serial port configuration.
+type Config struct {
+	// Device path (e.g., /dev/ttyUSB0, /dev/ttyACM0)
+	Device string
+
+	// Baud rate (default: 250000)
+	BaudRate int
+
+	// Connection timeout (default: 60 seconds)
+	ConnectTimeout time.Duration
+
+	// Read timeout for individual operations (default: 5 seconds)
+	ReadTimeout time.Duration
+
+	// RTS/DTR control
+	RTSOnConnect bool
+	DTROnConnect bool
+}
+
+// DefaultConfig returns a Config with default values.
+func DefaultConfig() Config {
+	return Config{
+		BaudRate:       250000,
+		ConnectTimeout: 60 * time.Second,
+		ReadTimeout:    5 * time.Second,
+		RTSOnConnect:   true,
+		DTROnConnect:   true,
+	}
+}
+
+// Port represents a serial port connection.
+type Port struct {
+	mu       sync.Mutex
+	fd       int
+	device   string
+	config   Config
+	closed   bool
+	oldTermios *unix.Termios
+}
+
+// ListPorts returns a list of available serial port device paths.
+func ListPorts() ([]string, error) {
+	var ports []string
+
+	// Common serial device patterns by OS
+	var patterns []string
+	switch runtime.GOOS {
+	case "linux":
+		patterns = []string{
+			"/dev/ttyUSB*",
+			"/dev/ttyACM*",
+			"/dev/ttyS*",
+			"/dev/serial/by-id/*",
+		}
+	case "darwin":
+		patterns = []string{
+			"/dev/tty.usbserial*",
+			"/dev/tty.usbmodem*",
+			"/dev/cu.usbserial*",
+			"/dev/cu.usbmodem*",
+		}
+	default:
+		return nil, fmt.Errorf("serial: unsupported platform %s", runtime.GOOS)
+	}
+
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			// Resolve symlinks (especially for /dev/serial/by-id/)
+			resolved, err := filepath.EvalSymlinks(m)
+			if err != nil {
+				resolved = m
+			}
+			// Check if already in list
+			found := false
+			for _, p := range ports {
+				if p == resolved {
+					found = true
+					break
+				}
+			}
+			if !found {
+				ports = append(ports, resolved)
+			}
+		}
+	}
+
+	sort.Strings(ports)
+	return ports, nil
+}
+
+// Open opens a serial port with the given configuration.
+func Open(cfg Config) (*Port, error) {
+	if cfg.Device == "" {
+		return nil, errors.New("serial: device path required")
+	}
+	if cfg.BaudRate == 0 {
+		cfg.BaudRate = 250000
+	}
+	if cfg.ConnectTimeout == 0 {
+		cfg.ConnectTimeout = 60 * time.Second
+	}
+	if cfg.ReadTimeout == 0 {
+		cfg.ReadTimeout = 5 * time.Second
+	}
+
+	// Open the device
+	fd, err := unix.Open(cfg.Device, unix.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("serial: open %s: %w", cfg.Device, err)
+	}
+
+	// Get current termios settings
+	oldTermios, err := unix.IoctlGetTermios(fd, ioctlGetTermios)
+	if err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: get termios: %w", err)
+	}
+
+	// Configure port
+	termios := *oldTermios
+
+	// Input flags - disable all input processing
+	termios.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP |
+		unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON | unix.IXOFF | unix.IXANY
+
+	// Output flags - disable all output processing
+	termios.Oflag &^= unix.OPOST
+
+	// Control flags - 8N1
+	termios.Cflag &^= unix.CSIZE | unix.PARENB | unix.PARODD | unix.CSTOPB
+	termios.Cflag |= unix.CS8 | unix.CREAD | unix.CLOCAL
+
+	// Local flags - raw mode
+	termios.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
+
+	// Set baud rate
+	speed, err := baudRateToSpeed(cfg.BaudRate)
+	if err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	setSpeed(&termios, speed)
+
+	// Control characters
+	termios.Cc[unix.VMIN] = 0  // Non-blocking read
+	termios.Cc[unix.VTIME] = 1 // 100ms timeout per character
+
+	// Apply settings
+	if err := unix.IoctlSetTermios(fd, ioctlSetTermios, &termios); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: set termios: %w", err)
+	}
+
+	// Clear non-blocking flag after configuration
+	if err := unix.SetNonblock(fd, false); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: set blocking: %w", err)
+	}
+
+	port := &Port{
+		fd:         fd,
+		device:     cfg.Device,
+		config:     cfg,
+		oldTermios: oldTermios,
+	}
+
+	// Set RTS/DTR
+	if err := port.setModemControl(cfg.RTSOnConnect, cfg.DTROnConnect); err != nil {
+		port.Close()
+		return nil, fmt.Errorf("serial: set modem control: %w", err)
+	}
+
+	return port, nil
+}
+
+// Read reads up to len(buf) bytes from the port.
+// Returns the number of bytes read and any error.
+func (p *Port) Read(buf []byte) (int, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return 0, ErrClosed
+	}
+	fd := p.fd
+	timeout := p.config.ReadTimeout
+	p.mu.Unlock()
+
+	// Set up poll for read with timeout
+	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	timeoutMs := int(timeout.Milliseconds())
+
+	n, err := unix.Poll(pfd, timeoutMs)
+	if err != nil {
+		if errors.Is(err, unix.EINTR) {
+			return 0, nil // Interrupted, try again
+		}
+		return 0, fmt.Errorf("serial: poll: %w", err)
+	}
+	if n == 0 {
+		return 0, ErrTimeout
+	}
+
+	// Check for errors
+	if pfd[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+		return 0, io.EOF
+	}
+
+	// Read available data
+	n, err = unix.Read(fd, buf)
+	if err != nil {
+		return 0, fmt.Errorf("serial: read: %w", err)
+	}
+	return n, nil
+}
+
+// Write writes buf to the port.
+// Returns the number of bytes written and any error.
+func (p *Port) Write(buf []byte) (int, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return 0, ErrClosed
+	}
+	fd := p.fd
+	p.mu.Unlock()
+
+	n, err := unix.Write(fd, buf)
+	if err != nil {
+		return 0, fmt.Errorf("serial: write: %w", err)
+	}
+	return n, nil
+}
+
+// Close closes the serial port.
+func (p *Port) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+
+	// Restore original settings if possible
+	if p.oldTermios != nil {
+		_ = unix.IoctlSetTermios(p.fd, ioctlSetTermios, p.oldTermios)
+	}
+
+	return unix.Close(p.fd)
+}
+
+// Device returns the device path.
+func (p *Port) Device() string {
+	return p.device
+}
+
+// SetReadTimeout sets the read timeout.
+func (p *Port) SetReadTimeout(d time.Duration) {
+	p.mu.Lock()
+	p.config.ReadTimeout = d
+	p.mu.Unlock()
+}
+
+// Flush discards any data in the input and output buffers.
+func (p *Port) Flush() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return ErrClosed
+	}
+	fd := p.fd
+	p.mu.Unlock()
+
+	return unix.IoctlSetInt(fd, ioctlTCFlush, unix.TCIOFLUSH)
+}
+
+// setModemControl sets RTS and DTR signals.
+func (p *Port) setModemControl(rts, dtr bool) error {
+	status, err := unix.IoctlGetInt(p.fd, unix.TIOCMGET)
+	if err != nil {
+		return err
+	}
+
+	if rts {
+		status |= unix.TIOCM_RTS
+	} else {
+		status &^= unix.TIOCM_RTS
+	}
+	if dtr {
+		status |= unix.TIOCM_DTR
+	} else {
+		status &^= unix.TIOCM_DTR
+	}
+
+	return unix.IoctlSetInt(p.fd, unix.TIOCMSET, status)
+}
+
+// SetRTS sets the RTS signal.
+func (p *Port) SetRTS(on bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return ErrClosed
+	}
+
+	status, err := unix.IoctlGetInt(p.fd, unix.TIOCMGET)
+	if err != nil {
+		return err
+	}
+	if on {
+		status |= unix.TIOCM_RTS
+	} else {
+		status &^= unix.TIOCM_RTS
+	}
+	return unix.IoctlSetInt(p.fd, unix.TIOCMSET, status)
+}
+
+// SetDTR sets the DTR signal.
+func (p *Port) SetDTR(on bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return ErrClosed
+	}
+
+	status, err := unix.IoctlGetInt(p.fd, unix.TIOCMGET)
+	if err != nil {
+		return err
+	}
+	if on {
+		status |= unix.TIOCM_DTR
+	} else {
+		status &^= unix.TIOCM_DTR
+	}
+	return unix.IoctlSetInt(p.fd, unix.TIOCMSET, status)
+}
+
+// SendBreak sends a break signal.
+func (p *Port) SendBreak() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return ErrClosed
+	}
+	fd := p.fd
+	p.mu.Unlock()
+
+	return unix.IoctlSetInt(fd, ioctlTCSBrk, 0)
+}
+
+// baudRateToSpeed converts a baud rate to a speed constant.
+func baudRateToSpeed(baud int) (uint32, error) {
+	speeds := map[int]uint32{
+		50:      unix.B50,
+		75:      unix.B75,
+		110:     unix.B110,
+		134:     unix.B134,
+		150:     unix.B150,
+		200:     unix.B200,
+		300:     unix.B300,
+		600:     unix.B600,
+		1200:    unix.B1200,
+		1800:    unix.B1800,
+		2400:    unix.B2400,
+		4800:    unix.B4800,
+		9600:    unix.B9600,
+		19200:   unix.B19200,
+		38400:   unix.B38400,
+		57600:   unix.B57600,
+		115200:  unix.B115200,
+		230400:  unix.B230400,
+	}
+
+	// Handle platform-specific high baud rates
+	if runtime.GOOS == "linux" {
+		speeds[460800] = 0x1004  // B460800
+		speeds[500000] = 0x1005  // B500000
+		speeds[576000] = 0x1006  // B576000
+		speeds[921600] = 0x1007  // B921600
+		speeds[1000000] = 0x1008 // B1000000
+		speeds[1152000] = 0x1009 // B1152000
+		speeds[1500000] = 0x100A // B1500000
+		speeds[2000000] = 0x100B // B2000000
+		speeds[2500000] = 0x100C // B2500000
+		speeds[3000000] = 0x100D // B3000000
+		speeds[3500000] = 0x100E // B3500000
+		speeds[4000000] = 0x100F // B4000000
+		// Klipper default
+		speeds[250000] = 0x1003 // B250000 (custom rate)
+	}
+
+	if speed, ok := speeds[baud]; ok {
+		return speed, nil
+	}
+
+	// For non-standard baud rates on Linux, we can try to set it directly
+	if runtime.GOOS == "linux" {
+		// Use BOTHER to set arbitrary baud rate
+		return 0x1000 | uint32(baud), nil // BOTHER
+	}
+
+	return 0, fmt.Errorf("serial: unsupported baud rate %d", baud)
+}
+
+// Detect attempts to detect and open an MCU on any available port.
+func Detect(cfg Config, timeout time.Duration) (*Port, error) {
+	ports, err := ListPorts()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ports) == 0 {
+		return nil, errors.New("serial: no serial ports found")
+	}
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, device := range ports {
+			cfg.Device = device
+			port, err := Open(cfg)
+			if err != nil {
+				continue
+			}
+			return port, nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return nil, fmt.Errorf("serial: no MCU found on ports %v", ports)
+}
+
+// IsDeviceAvailable checks if a device path exists and is accessible.
+func IsDeviceAvailable(device string) bool {
+	info, err := os.Stat(device)
+	if err != nil {
+		return false
+	}
+	// Check if it's a character device
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	// Check if we can open it
+	fd, err := unix.Open(device, unix.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return false
+	}
+	unix.Close(fd)
+	return true
+}
+
+// ResolveDevice resolves a device path, following symlinks.
+func ResolveDevice(device string) (string, error) {
+	// Handle by-id and by-path symlinks
+	if strings.HasPrefix(device, "/dev/serial/") {
+		resolved, err := filepath.EvalSymlinks(device)
+		if err != nil {
+			return "", fmt.Errorf("serial: resolve %s: %w", device, err)
+		}
+		return resolved, nil
+	}
+	return device, nil
+}
