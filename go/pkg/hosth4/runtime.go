@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"klipper-go-migration/pkg/chelper"
+	"klipper-go-migration/pkg/inputshaper"
 	"klipper-go-migration/pkg/kinematics"
 	"klipper-go-migration/pkg/protocol"
 	"klipper-go-migration/pkg/temperature"
@@ -1674,6 +1675,9 @@ type runtime struct {
 
 	screwsTiltAdjust *screwsTiltAdjust
 
+	// Input shaper for vibration reduction
+	inputShaper *inputshaper.InputShaper
+
 	trace io.Writer
 
 	rawPath string
@@ -2511,6 +2515,39 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 		rt.screwsTiltAdjust = sta
 	}
 
+	// Initialize input shaper if configured
+	if sec, ok := cfg.section("input_shaper"); ok {
+		shaperTypeX := inputshaper.ShaperType(sec["shaper_type_x"])
+		shaperTypeY := inputshaper.ShaperType(sec["shaper_type_y"])
+		shaperTypeZ := inputshaper.ShaperType(sec["shaper_type_z"])
+		// Fall back to shaper_type if axis-specific not set
+		if shaperTypeX == "" {
+			shaperTypeX = inputshaper.ShaperType(sec["shaper_type"])
+		}
+		if shaperTypeY == "" {
+			shaperTypeY = inputshaper.ShaperType(sec["shaper_type"])
+		}
+		if shaperTypeZ == "" {
+			shaperTypeZ = inputshaper.ShaperType(sec["shaper_type"])
+		}
+
+		defDamping := inputshaper.DefaultDampingRatio
+		dampingRatio, _ := parseFloat(sec, "damping_ratio_x", &defDamping)
+		defFreq := 0.0
+		freqX, _ := parseFloat(sec, "shaper_freq_x", &defFreq)
+		freqY, _ := parseFloat(sec, "shaper_freq_y", &defFreq)
+		freqZ, _ := parseFloat(sec, "shaper_freq_z", &defFreq)
+
+		is, err := inputshaper.NewInputShaper(shaperTypeX, shaperTypeY, shaperTypeZ, freqX, freqY, freqZ, dampingRatio)
+		if err != nil {
+			rt.tracef("Warning: failed to initialize input shaper: %v\n", err)
+		} else {
+			rt.inputShaper = is
+			rt.tracef("Initialized input shaper: X=%s@%.1fHz, Y=%s@%.1fHz\n",
+				shaperTypeX, freqX, shaperTypeY, freqY)
+		}
+	}
+
 	rt.updateKinFlushDelay()
 
 	// Load and setup heaters from config
@@ -2842,6 +2879,11 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 	case "SET_PRESSURE_ADVANCE":
 		// Set pressure advance parameters
 		if err := r.cmdSetPressureAdvance(cmd.Args); err != nil {
+			return err
+		}
+	case "SET_INPUT_SHAPER":
+		// Set input shaper parameters
+		if err := r.cmdSetInputShaper(cmd.Args); err != nil {
 			return err
 		}
 	case "SYNC_EXTRUDER_MOTION":
@@ -3326,12 +3368,17 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
 	if err := r.toolhead.dripMove(movepos, speed); err != nil {
 		return err
 	}
-	// Ensure all steps from the homing move are emitted before we stop endstop
-	// sampling, to match Klippy's ordering in debugoutput.
+	// Match Klippy: send endstop_home disable BEFORE flushing remaining steps.
+	// In Python's homing.py, home_wait() is called which sends the disable command,
+	// then flush_step_generation() generates the final deceleration steps.
+	r.traceMotion("HOMING: before homeStop")
+	if err := r.endstops[axis].homeStop(); err != nil {
+		return err
+	}
+	// Now flush all remaining steps (final deceleration) after endstop is disabled.
 	if err := r.motion.flushAllSteps(); err != nil {
 		return err
 	}
-	r.traceMotion("HOMING: before homeStop")
 	if r.trace != nil {
 		st := r.steppers[axis]
 		if st != nil && st.stepqueue != nil {
@@ -3357,7 +3404,7 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
 			}
 		}
 	}
-	return r.endstops[axis].homeStop()
+	return nil
 }
 
 func (r *runtime) homeAxis(axis int) error {
@@ -3814,6 +3861,71 @@ func (r *runtime) cmdSetPressureAdvance(args map[string]string) error {
 	st.advance = advance
 	st.smoothTime = smoothTime
 	r.tracef("SET_PRESSURE_ADVANCE: EXTRUDER=%s ADVANCE=%f SMOOTH_TIME=%f\n", extruderName, advance, smoothTime)
+	return nil
+}
+
+func (r *runtime) cmdSetInputShaper(args map[string]string) error {
+	// SET_INPUT_SHAPER [SHAPER_TYPE=<type>] [SHAPER_TYPE_X=<type>] [SHAPER_TYPE_Y=<type>]
+	//                  [SHAPER_FREQ_X=<freq>] [SHAPER_FREQ_Y=<freq>]
+	//                  [DAMPING_RATIO_X=<ratio>] [DAMPING_RATIO_Y=<ratio>]
+	if r.inputShaper == nil {
+		return fmt.Errorf("input shaper not configured")
+	}
+
+	// Update each axis shaper
+	for _, shaper := range r.inputShaper.GetShapers() {
+		axis := strings.ToUpper(shaper.Axis)
+
+		// Get shaper type
+		var shaperType *inputshaper.ShaperType
+		if st, ok := args["SHAPER_TYPE_"+axis]; ok && st != "" {
+			t := inputshaper.ShaperType(strings.ToLower(st))
+			shaperType = &t
+		} else if st, ok := args["SHAPER_TYPE"]; ok && st != "" {
+			t := inputshaper.ShaperType(strings.ToLower(st))
+			shaperType = &t
+		}
+
+		// Get damping ratio
+		var dampingRatio *float64
+		if dr, ok := args["DAMPING_RATIO_"+axis]; ok && dr != "" {
+			v, err := strconv.ParseFloat(dr, 64)
+			if err != nil {
+				return fmt.Errorf("invalid DAMPING_RATIO_%s: %v", axis, err)
+			}
+			dampingRatio = &v
+		}
+
+		// Get shaper frequency
+		var shaperFreq *float64
+		if sf, ok := args["SHAPER_FREQ_"+axis]; ok && sf != "" {
+			v, err := strconv.ParseFloat(sf, 64)
+			if err != nil {
+				return fmt.Errorf("invalid SHAPER_FREQ_%s: %v", axis, err)
+			}
+			shaperFreq = &v
+		}
+
+		// Update if any parameter changed
+		if shaperType != nil || dampingRatio != nil || shaperFreq != nil {
+			if err := shaper.Update(shaperType, dampingRatio, shaperFreq); err != nil {
+				return fmt.Errorf("axis %s: %w", axis, err)
+			}
+		}
+	}
+
+	// Report current settings
+	for _, shaper := range r.inputShaper.GetShapers() {
+		if shaper.Axis == "z" && !shaper.IsEnabled() {
+			continue
+		}
+		status := shaper.GetStatus()
+		r.tracef("shaper_type_%s:%s shaper_freq_%s:%s damping_ratio_%s:%s\n",
+			shaper.Axis, status["shaper_type"],
+			shaper.Axis, status["shaper_freq"],
+			shaper.Axis, status["damping_ratio"])
+	}
+
 	return nil
 }
 
