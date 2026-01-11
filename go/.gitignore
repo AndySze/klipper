@@ -8,7 +8,6 @@
 debug*
 
 # Go build artifacts
-klipper-go-golden
 klipper-go
 
 # Temporary test outputs
