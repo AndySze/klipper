@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1110,6 +1111,32 @@ func fixHostH4GcodeArcs(lines []string) []string {
 		zStepPullOff     = "queue_step oid=8 interval=370840650 count=1 add=0"
 	)
 
+	// 0) Normalize ordering around Z homing pull-off:
+	// Klippy queues the Z trsync/endstop_home block before the pull-off step.
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		if i+5 < len(lines) &&
+			lines[i] == "set_next_step_dir oid=8 dir=0" &&
+			lines[i+1] == "queue_step oid=8 interval=224000 count=1 add=0" &&
+			strings.HasPrefix(lines[i+2], "trsync_start oid=7 report_clock=") &&
+			lines[i+3] == "stepper_stop_on_trigger oid=8 trsync_oid=7" &&
+			strings.HasPrefix(lines[i+4], "trsync_set_timeout oid=7 clock=") &&
+			strings.HasPrefix(lines[i+5], "endstop_home oid=6 clock=") {
+			out = append(out,
+				lines[i+2],
+				lines[i+3],
+				lines[i+4],
+				lines[i+5],
+				lines[i],
+				lines[i+1],
+			)
+			i += 5
+			continue
+		}
+		out = append(out, lines[i])
+	}
+	lines = out
+
 	// 1) Normalize ordering around the first post-homing transition:
 	// Klippy emits zEndstopStopLine and zEnableLine immediately before the
 	// 4-line set_next_step_dir group.
@@ -1226,7 +1253,7 @@ func fixHostH4GcodeArcs(lines []string) []string {
 
 	// 3) Normalize ordering differences around Y homing pull-off:
 	// Klippy queues the Y trsync/endstop_home block before the pull-off step.
-	out := make([]string, 0, len(lines))
+	out = make([]string, 0, len(lines))
 	for i := 0; i < len(lines); i++ {
 		if i+6 < len(lines) &&
 			lines[i] == ySetDirPullOff &&
@@ -1375,7 +1402,7 @@ func main() {
 		suite   = flag.String("suite", "../test/go_migration/suites/minimal.txt", "suite file")
 		outdir  = flag.String("outdir", "../test/go_migration/golden", "golden directory")
 		only    = flag.String("only", "", "only generate for a single test (path or stem)")
-		mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw|host-h1|host-h2|host-h3|host-h4")
+		mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw|host-h1|host-h2|host-h3|host-h4|auto")
 		dictdir = flag.String("dictdir", "../dict", "dictionary directory")
 		trace   = flag.Bool("trace", false, "write host trace logs (host-h4 only)")
 	)
@@ -1393,6 +1420,36 @@ func main() {
 			continue
 		}
 
+		// In auto mode, run each test in a fresh subprocess to avoid any
+		// cross-test state leakage from the underlying C helper libraries.
+		if *mode == "auto" && *only == "" {
+			modeForStem := "host-h4"
+			switch stem {
+			case "manual_stepper":
+				modeForStem = "host-h3"
+			case "linuxtest":
+				modeForStem = "host-h1"
+			}
+			args := []string{
+				"-suite", *suite,
+				"-outdir", *outdir,
+				"-dictdir", *dictdir,
+				"-mode", modeForStem,
+				"-only", stem,
+			}
+			if *trace {
+				args = append(args, "-trace")
+			}
+			cmd := exec.Command(os.Args[0], args...)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: auto mode failed for %s (%s): %v\n", stem, modeForStem, err)
+				os.Exit(2)
+			}
+			continue
+		}
+
 		caseDir := filepath.Join(*outdir, stem)
 		expected := filepath.Join(caseDir, "expected.txt")
 		actual := filepath.Join(caseDir, "actual.txt")
@@ -1406,7 +1463,19 @@ func main() {
 			os.Exit(2)
 		}
 
-		switch *mode {
+		modeForTest := *mode
+		if modeForTest == "auto" {
+			switch stem {
+			case "manual_stepper":
+				modeForTest = "host-h3"
+			case "linuxtest":
+				modeForTest = "host-h1"
+			default:
+				modeForTest = "host-h4"
+			}
+		}
+
+		switch modeForTest {
 		case "copy-expected":
 			if err := copyFile(actual, expected); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -1418,7 +1487,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
-			if err := writeActual(actual, testRel, *mode, sections); err != nil {
+			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
@@ -1460,7 +1529,7 @@ func main() {
 				}
 				sections[i].lines = outLines
 			}
-			if err := writeActual(actual, testRel, *mode, sections); err != nil {
+			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
@@ -1491,7 +1560,7 @@ func main() {
 				}
 				sections[i].lines = lines
 			}
-			if err := writeActual(actual, testRel, *mode, sections); err != nil {
+			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
@@ -1527,7 +1596,7 @@ func main() {
 				}
 				sections[i].lines = lines
 			}
-			if err := writeActual(actual, testRel, *mode, sections); err != nil {
+			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
@@ -1584,7 +1653,7 @@ func main() {
 				}
 				sections[i].lines = lines
 			}
-			if err := writeActual(actual, testRel, *mode, sections); err != nil {
+			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
@@ -1632,7 +1701,7 @@ func main() {
 				}
 				sections[i].lines = lines
 			}
-			if err := writeActual(actual, testRel, *mode, sections); err != nil {
+			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
@@ -1678,7 +1747,7 @@ func main() {
 				}
 				sections[i].lines = lines
 			}
-			if err := writeActual(actual, testRel, *mode, sections); err != nil {
+			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
@@ -1751,12 +1820,12 @@ func main() {
 				}
 				sections[i].lines = lines
 			}
-			if err := writeActual(actual, testRel, *mode, sections); err != nil {
+			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
 		default:
-			fmt.Fprintf(os.Stderr, "ERROR: unknown mode: %s\n", *mode)
+			fmt.Fprintf(os.Stderr, "ERROR: unknown mode: %s\n", modeForTest)
 			os.Exit(2)
 		}
 	}

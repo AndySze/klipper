@@ -1,0 +1,26 @@
+# Backup files
+*.bak
+*~
+
+# Trace and debug files
+*.trace
+*.out
+debug*
+
+# Go build artifacts
+klipper-go-golden
+klipper-go
+
+# Temporary test outputs
+test_output/
+tmp/
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Generated golden files (if you want to exclude them)
+# test/*/golden/
