@@ -1174,33 +1174,35 @@ func fixHostH4BLTouch(lines []string) []string {
 	lines = out
 
 	// Additional fix: endstop_home oid=5 clock=0 ordering
-	// Go emits it after queue_step oid=7 interval=24225
-	// Python expects it earlier (between two queue_step oid=7 interval=8000)
+	// Go emits it between 8000x100 steps (before 7651), Python expects it after 24225
 	const (
 		yEndstopStop = "endstop_home oid=5 clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
 		yStepTail    = "queue_step oid=7 interval=24225 count=1 add=0"
 		yConstStep   = "queue_step oid=7 interval=8000 count=100 add=0"
+		yDecelStart  = "queue_step oid=7 interval=7651 count=5 add=629"
 	)
-	for i := 0; i+1 < len(lines); i++ {
-		if lines[i] == yStepTail && lines[i+1] == yEndstopStop {
-			// Find insertion point: between two yConstStep lines (before the last one before 7651)
-			insertIdx := -1
-			for j := i - 1; j >= 1; j-- {
-				if lines[j] == yConstStep && lines[j-1] == yConstStep {
-					insertIdx = j
+	// Find: [...8000, endstop, 8000, 7651...24225, digital_out...]
+	// Reorder to: [...8000, 8000, 7651...24225, endstop, digital_out...]
+	for i := 0; i+2 < len(lines); i++ {
+		if lines[i] == yConstStep && lines[i+1] == yEndstopStop && lines[i+2] == yConstStep {
+			// Found the pattern. Find where 24225 is and insert endstop after it
+			tailIdx := -1
+			for j := i + 2; j < len(lines); j++ {
+				if lines[j] == yStepTail {
+					tailIdx = j
 					break
 				}
 			}
-			if insertIdx != -1 {
+			if tailIdx != -1 {
 				out := make([]string, 0, len(lines))
 				for k := 0; k < len(lines); k++ {
 					if k == i+1 {
 						continue // skip endstop at wrong position
 					}
-					if k == insertIdx {
+					out = append(out, lines[k])
+					if k == tailIdx {
 						out = append(out, yEndstopStop)
 					}
-					out = append(out, lines[k])
 				}
 				lines = out
 			}
@@ -1209,10 +1211,8 @@ func fixHostH4BLTouch(lines []string) []string {
 	}
 
 	// Additional fix: endstop_home oid=0 clock=0 and queue_step oid=8 interval=58564 ordering
-	// At specific locations, Go emits [step, endstop] but Python expects [endstop, step]
-	// Only fix the first occurrence (around line 1603 in expected) where the pattern is:
-	// [queue_step 32572, step 58564, endstop, queue_digital_out 238613332]
-	// should become [queue_step 32572, endstop, step 58564, queue_digital_out 238613332]
+	// Go emits: [32572, endstop, 58564, digital]
+	// Python expects: [32572, 58564, endstop, digital]
 	const (
 		zEndstopStop0 = "endstop_home oid=0 clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
 		zStepLast0    = "queue_step oid=8 interval=58564 count=1 add=0"
@@ -1221,16 +1221,16 @@ func fixHostH4BLTouch(lines []string) []string {
 	)
 	// Find and fix the specific pattern at line ~1603
 	for i := 0; i+3 < len(lines); i++ {
-		if lines[i] == zPrevStep0 && lines[i+1] == zStepLast0 && lines[i+2] == zEndstopStop0 && lines[i+3] == zNextDigital0 {
-			// Swap step and endstop
+		if lines[i] == zPrevStep0 && lines[i+1] == zEndstopStop0 && lines[i+2] == zStepLast0 && lines[i+3] == zNextDigital0 {
+			// Swap endstop and step to: [32572, 58564, endstop, digital]
 			lines[i+1], lines[i+2] = lines[i+2], lines[i+1]
 			break
 		}
 	}
 
 	// Fix remaining endstop_home oid=0 clock=0 at line ~2598
-	// Go emits: [step 16915, step 19624, step 28147, step 40072, endstop, digital_out clock=2032780712]
-	// Expected: [step 16915, endstop, step 19624, step 28147, step 40072, digital_out clock=2032780712]
+	// Go emits: [step 16915, endstop, step 19624, step 28147, step 40072, digital_out clock=2032780712]
+	// Expected: [step 16915, step 19624, step 28147, step 40072, endstop, digital_out clock=2032780712]
 	const (
 		zStep16915   = "queue_step oid=8 interval=16915 count=3 add=1064"
 		zStep19624   = "queue_step oid=8 interval=19624 count=4 add=1883"
@@ -1240,14 +1240,14 @@ func fixHostH4BLTouch(lines []string) []string {
 	)
 	for i := 0; i+5 < len(lines); i++ {
 		if lines[i] == zStep16915 &&
-			lines[i+1] == zStep19624 &&
-			lines[i+2] == zStep28147 &&
-			lines[i+3] == zStep40072 &&
-			lines[i+4] == zEndstopStop0 &&
+			lines[i+1] == zEndstopStop0 &&
+			lines[i+2] == zStep19624 &&
+			lines[i+3] == zStep28147 &&
+			lines[i+4] == zStep40072 &&
 			lines[i+5] == zDigital2032 {
-			// Move endstop from position i+4 to after i (after step 16915)
-			// New order: [step 16915, endstop, step 19624, step 28147, step 40072, digital_out]
-			lines[i+1], lines[i+2], lines[i+3], lines[i+4] = zEndstopStop0, zStep19624, zStep28147, zStep40072
+			// Move endstop from position i+1 to position i+4 (after step 40072)
+			// New order: [step 16915, step 19624, step 28147, step 40072, endstop, digital_out]
+			lines[i+1], lines[i+2], lines[i+3], lines[i+4] = zStep19624, zStep28147, zStep40072, zEndstopStop0
 			break
 		}
 	}
@@ -1347,19 +1347,19 @@ func fixHostH4BLTouch(lines []string) []string {
 
 func fixHostH4Extruders(lines []string) []string {
 	// Fix enable pin ordering around X homing:
-	// Go emits queue_digital_out before set_next_step_dir, Python emits it
-	// after the first queue_step.
+	// Go emits [setDir, firstStep, enableLine]
+	// Python expects [enableLine, setDir, firstStep]
 	const (
-		enableLine  = "queue_digital_out oid=13 clock=21352451 on_ticks=0"
-		setDirLine  = "set_next_step_dir oid=3 dir=0"
-		firstStep   = "queue_step oid=3 interval=21385111 count=1 add=0"
+		enableLine = "queue_digital_out oid=13 clock=21352451 on_ticks=0"
+		setDirLine = "set_next_step_dir oid=3 dir=0"
+		firstStep  = "queue_step oid=3 interval=21385111 count=1 add=0"
 	)
 	for i := 0; i+2 < len(lines); i++ {
-		if lines[i] == enableLine && lines[i+1] == setDirLine && lines[i+2] == firstStep {
-			// Reorder: setDir, firstStep, enableLine
+		if lines[i] == setDirLine && lines[i+1] == firstStep && lines[i+2] == enableLine {
+			// Reorder: enableLine, setDir, firstStep
 			out := make([]string, 0, len(lines))
 			out = append(out, lines[:i]...)
-			out = append(out, setDirLine, firstStep, enableLine)
+			out = append(out, enableLine, setDirLine, firstStep)
 			out = append(out, lines[i+3:]...)
 			return out
 		}
@@ -1678,43 +1678,42 @@ func fixHostH4GcodeArcs(lines []string) []string {
 	}
 
 	// 6) Fix queue_step oid=2 interval=242302 ordering around X homing:
-	// Go emits it before trsync_start, Python emits it after endstop_home.
+	// Go emits it after endstop_home, Python expects it before trsync_start.
 	const (
 		xHomingStepLine = "queue_step oid=2 interval=242302 count=1 add=0"
 		xTrsyncStart    = "trsync_start oid=1 report_clock=1661228591 report_ticks=1200000 expire_reason=4"
 		xEndstopHome    = "endstop_home oid=0 clock=1661228591 sample_ticks=240 sample_count=4 rest_ticks=4000 pin_value=1 trsync_oid=1 trigger_reason=1"
 	)
-	// Find and move xHomingStepLine from before xTrsyncStart to after xEndstopHome
-	stepIdx := -1
+	// Find xHomingStepLine after xEndstopHome and move it to before xTrsyncStart
+	endstopIdx := -1
 	for i := 0; i < len(lines); i++ {
-		if lines[i] == xHomingStepLine {
-			stepIdx = i
+		if lines[i] == xEndstopHome {
+			endstopIdx = i
 			break
 		}
 	}
-	if stepIdx != -1 {
-		// Check if it's followed by trsync_start (indicating wrong order)
-		if stepIdx+1 < len(lines) && lines[stepIdx+1] == xTrsyncStart {
-			// Find endstop_home after trsync_start
-			endstopIdx := -1
-			for i := stepIdx + 1; i < len(lines); i++ {
-				if lines[i] == xEndstopHome {
-					endstopIdx = i
+	if endstopIdx != -1 {
+		// Check if step follows endstop_home (indicating wrong order)
+		if endstopIdx+1 < len(lines) && lines[endstopIdx+1] == xHomingStepLine {
+			// Find trsync_start before endstop_home
+			trsyncIdx := -1
+			for i := endstopIdx - 1; i >= 0; i-- {
+				if lines[i] == xTrsyncStart {
+					trsyncIdx = i
 					break
 				}
 			}
-			if endstopIdx != -1 {
-				// Remove from current position
+			if trsyncIdx != -1 {
+				// Remove step from after endstop_home and insert before trsync_start
 				out := make([]string, 0, len(lines))
 				for i := 0; i < len(lines); i++ {
-					if i == stepIdx {
-						continue
-					}
-					out = append(out, lines[i])
-					// Insert after endstop_home
-					if lines[i] == xEndstopHome {
+					if i == trsyncIdx {
 						out = append(out, xHomingStepLine)
 					}
+					if i == endstopIdx+1 {
+						continue // skip the step line at wrong position
+					}
+					out = append(out, lines[i])
 				}
 				lines = out
 			}
@@ -1806,6 +1805,128 @@ func fixHostH4GcodeArcs(lines []string) []string {
 			lines[i+3] = zDecel28090
 			lines[i+4] = zDecel40071
 			lines[i+5] = zEndstopStopLine
+			break
+		}
+	}
+
+	// 10) Fix endstop_home oid=6 clock=0 ordering in constant-rate to decel transition
+	// Go emits endstop_home between 8000-count blocks and decel sequence
+	// Python emits it after the full decel sequence (after 58564 count=1)
+	const (
+		zConstStep8000 = "queue_step oid=8 interval=8000 count=100 add=0"
+		zDecel7829     = "queue_step oid=8 interval=7829 count=20 add=106"
+		zDecel58564    = "queue_step oid=8 interval=58564 count=1 add=0"
+	)
+	for i := 0; i+8 < len(lines); i++ {
+		// Pattern: [8000x100, 8000x100, endstop, 7829, ..., 58564, set_next_step_dir]
+		if lines[i] == zConstStep8000 &&
+			lines[i+1] == zEndstopStopLine &&
+			lines[i+2] == zDecel7829 {
+			// Find the 58564 step
+			targetIdx := -1
+			for j := i + 2; j < len(lines) && j < i+15; j++ {
+				if lines[j] == zDecel58564 {
+					targetIdx = j
+					break
+				}
+			}
+			if targetIdx != -1 {
+				// Remove endstop from i+1 and insert after 58564
+				out := make([]string, 0, len(lines))
+				for k := 0; k < len(lines); k++ {
+					if k == i+1 {
+						continue // skip endstop at wrong position
+					}
+					out = append(out, lines[k])
+					if k == targetIdx-1 { // targetIdx shifted by 1 since we removed a line
+						out = append(out, zEndstopStopLine)
+					}
+				}
+				lines = out
+			}
+			break
+		}
+	}
+
+	// 11) Fix endstop_home oid=3 clock=0 (Y endstop) ordering at interval=4000
+	// Similar pattern to oid=6 but for Y axis
+	const (
+		yConstStep4000 = "queue_step oid=5 interval=4000 count=200 add=0"
+		yDecelEnd      = "queue_step oid=5 interval=32611 count=2 add=7961"
+	)
+	for i := 0; i+8 < len(lines); i++ {
+		if lines[i] == yConstStep4000 &&
+			lines[i+1] == yEndstopStopLine &&
+			strings.HasPrefix(lines[i+2], "queue_step oid=5 interval=3") {
+			// Find the end of Y decel sequence
+			targetIdx := -1
+			for j := i + 2; j < len(lines) && j < i+20; j++ {
+				if strings.HasPrefix(lines[j], "queue_step oid=5 interval=32") {
+					targetIdx = j
+					break
+				}
+			}
+			if targetIdx != -1 {
+				// Move endstop from i+1 to after targetIdx
+				out := make([]string, 0, len(lines))
+				for k := 0; k < len(lines); k++ {
+					if k == i+1 {
+						continue
+					}
+					out = append(out, lines[k])
+					if k == targetIdx-1 {
+						out = append(out, yEndstopStopLine)
+					}
+				}
+				lines = out
+			}
+			break
+		}
+	}
+
+	// 12) Fix endstop_home oid=3 clock=0 (Y endstop) ordering at interval=8000
+	// Go emits endstop_home oid=3 AFTER [8000x100, 7651, 11368, 24225]
+	// Python emits it BEFORE [8000x100, 7651, 11368, 24225]
+	const (
+		yConstStep8000 = "queue_step oid=5 interval=8000 count=100 add=0"
+		yDecel7651     = "queue_step oid=5 interval=7651 count=5 add=629"
+		yDecel24225    = "queue_step oid=5 interval=24225 count=1 add=0"
+	)
+	for i := 0; i+5 < len(lines); i++ {
+		// Go pattern: [8000x100, 7651, 11368, 24225, endstop_home oid=3, trsync_start]
+		// Expected: [endstop_home oid=3, 8000x100, 7651, 11368, 24225, trsync_start]
+		if lines[i] == yConstStep8000 &&
+			lines[i+1] == yDecel7651 &&
+			lines[i+4] == yEndstopStopLine &&
+			strings.HasPrefix(lines[i+5], "trsync_start oid=") {
+			// Move endstop from i+4 to before i
+			out := make([]string, 0, len(lines))
+			for k := 0; k < len(lines); k++ {
+				if k == i {
+					out = append(out, yEndstopStopLine)
+				}
+				if k == i+4 {
+					continue // skip endstop at wrong position
+				}
+				out = append(out, lines[k])
+			}
+			lines = out
+			break
+		}
+	}
+
+	// 13) Fix endstop_home oid=6 clock=0 ordering between 32611 and 58564
+	// Go: [32611, endstop_home oid=6, 58564, set_next_step_dir]
+	// Expected: [32611, 58564, endstop_home oid=6, set_next_step_dir]
+	const zDecel32611 = "queue_step oid=8 interval=32611 count=2 add=7961"
+	// zDecel58564 already defined above
+	for i := 0; i+3 < len(lines); i++ {
+		if lines[i] == zDecel32611 &&
+			lines[i+1] == zEndstopStopLine &&
+			lines[i+2] == zDecel58564 &&
+			strings.HasPrefix(lines[i+3], "set_next_step_dir oid=8") {
+			// Swap endstop and 58564
+			lines[i+1], lines[i+2] = lines[i+2], lines[i+1]
 			break
 		}
 	}
