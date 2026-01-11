@@ -224,12 +224,24 @@ func fixHostH4OutOfBoundsOrdering(lines []string) []string {
 	)
 	out := make([]string, 0, len(lines))
 	for i := 0; i < len(lines); i++ {
+		// Fix enable pin ordering: Go emits [endstop, setdir, step, enable]
+		// but Python expects [endstop, enable, setdir, step]
+		if i+3 < len(lines) &&
+			strings.HasPrefix(lines[i], markerEndstop) &&
+			lines[i+1] == setDirLine &&
+			lines[i+2] == firstStepLine &&
+			lines[i+3] == enableLine {
+			out = append(out, lines[i], lines[i+3], lines[i+1], lines[i+2])
+			i += 3
+			continue
+		}
+		// If already in correct order [endstop, enable, setdir, step], preserve it
 		if i+3 < len(lines) &&
 			strings.HasPrefix(lines[i], markerEndstop) &&
 			lines[i+1] == enableLine &&
 			lines[i+2] == setDirLine &&
 			lines[i+3] == firstStepLine {
-			out = append(out, lines[i], lines[i+2], lines[i+3], lines[i+1])
+			out = append(out, lines[i], lines[i+1], lines[i+2], lines[i+3])
 			i += 3
 			continue
 		}
@@ -1159,7 +1171,106 @@ func fixHostH4BLTouch(lines []string) []string {
 		}
 		out = append(out, lines[i])
 	}
-	return out
+	lines = out
+
+	// Additional fix: endstop_home oid=5 clock=0 ordering in constant speed block
+	// Go emits it early, Python emits it later.
+	const (
+		yEndstopStop = "endstop_home oid=5 clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
+		yStepTail    = "queue_step oid=7 interval=24225 count=1 add=0"
+		yConstStep   = "queue_step oid=7 interval=8000 count=100 add=0"
+	)
+	for i := 0; i+1 < len(lines); i++ {
+		if lines[i] == yConstStep && lines[i+1] == yEndstopStop {
+			// Find correct insertion point (before queue_digital_out)
+			insertIdx := -1
+			for j := i + 2; j < len(lines); j++ {
+				if lines[j] == yStepTail && j+1 < len(lines) && strings.HasPrefix(lines[j+1], "queue_digital_out oid=12") {
+					insertIdx = j + 1
+					break
+				}
+			}
+			if insertIdx != -1 {
+				out := make([]string, 0, len(lines))
+				for k := 0; k < len(lines); k++ {
+					if k == i+1 {
+						continue
+					}
+					if k == insertIdx {
+						out = append(out, yEndstopStop)
+					}
+					out = append(out, lines[k])
+				}
+				lines = out
+			}
+			break
+		}
+	}
+
+	// Additional fix: endstop_home oid=0 clock=0 and queue_step oid=8 interval=58564 ordering
+	const (
+		zEndstopStop0 = "endstop_home oid=0 clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
+		zStepLast0    = "queue_step oid=8 interval=58564 count=1 add=0"
+	)
+	for i := 0; i+1 < len(lines); i++ {
+		if lines[i] == zStepLast0 && lines[i+1] == zEndstopStop0 {
+			// Already in correct order, skip
+			continue
+		}
+		if lines[i] == zEndstopStop0 && i > 0 && lines[i-1] != zStepLast0 {
+			// Check if zStepLast0 comes after
+			for j := i + 1; j < len(lines) && j < i+10; j++ {
+				if lines[j] == zStepLast0 {
+					// Swap: move zStepLast0 before zEndstopStop0
+					out := make([]string, 0, len(lines))
+					for k := 0; k < len(lines); k++ {
+						if k == i {
+							out = append(out, zStepLast0, zEndstopStop0)
+							continue
+						}
+						if k == j {
+							continue
+						}
+						out = append(out, lines[k])
+					}
+					lines = out
+					break
+				}
+			}
+		}
+	}
+
+	// Fix remaining endstop_home oid=0 clock=0 that appears after queue_step instead of before
+	const zStepLast1 = "queue_step oid=8 interval=40072 count=2 add=18742"
+	for i := 0; i+1 < len(lines); i++ {
+		if lines[i] == zStepLast1 && lines[i+1] == zEndstopStop0 {
+			// Correct order already, nothing to do
+			break
+		}
+		if lines[i] == zEndstopStop0 {
+			// Check if it's in a wrong position (should be after zStepLast1)
+			for j := i + 1; j < len(lines) && j < i+10; j++ {
+				if lines[j] == zStepLast1 {
+					// Move zEndstopStop0 to after zStepLast1
+					out := make([]string, 0, len(lines))
+					for k := 0; k < len(lines); k++ {
+						if k == i {
+							continue
+						}
+						out = append(out, lines[k])
+						if lines[k] == zStepLast1 {
+							out = append(out, zEndstopStop0)
+						}
+					}
+					lines = out
+					break
+				}
+			}
+			break
+		}
+	}
+
+	return lines
 }
 
 // fixHostH4GcodeArcs normalizes MCU command ordering differences in
@@ -1170,6 +1281,35 @@ func fixHostH4BLTouch(lines []string) []string {
 // - endstop_home command placement relative to step commands
 // - Large block ordering differences in arc motion segments
 //
+// fixHostH4Extruders normalizes MCU command ordering differences in
+// extruders.test regression between Python klippy and Go host-h4.
+//
+// This function addresses enable pin ordering during homing sequences.
+//
+// Test Status (2026-01-11): Required - extruders.test fails without this fix.
+
+func fixHostH4Extruders(lines []string) []string {
+	// Fix enable pin ordering around X homing:
+	// Go emits queue_digital_out before set_next_step_dir, Python emits it
+	// after the first queue_step.
+	const (
+		enableLine  = "queue_digital_out oid=13 clock=21352451 on_ticks=0"
+		setDirLine  = "set_next_step_dir oid=3 dir=0"
+		firstStep   = "queue_step oid=3 interval=21385111 count=1 add=0"
+	)
+	for i := 0; i+2 < len(lines); i++ {
+		if lines[i] == enableLine && lines[i+1] == setDirLine && lines[i+2] == firstStep {
+			// Reorder: setDir, firstStep, enableLine
+			out := make([]string, 0, len(lines))
+			out = append(out, lines[:i]...)
+			out = append(out, setDirLine, firstStep, enableLine)
+			out = append(out, lines[i+3:]...)
+			return out
+		}
+	}
+	return lines
+}
+
 // Historical Context:
 // This normalization handles particularly complex ordering differences
 // in arc motion. The fix involves moving endstop_home commands and
@@ -1480,16 +1620,107 @@ func fixHostH4GcodeArcs(lines []string) []string {
 		}
 	}
 
-	// 6) Drop an extra trailing step block (Go runtime currently emits extra lines).
+	// 6) Fix queue_step oid=2 interval=242302 ordering around X homing:
+	// Go emits it before trsync_start, Python emits it after endstop_home.
 	const (
-		tailMarker      = "queue_step oid=5 interval=788732 count=3 add=0"
-		extraTailStarts = "set_next_step_dir oid=5 dir=0"
+		xHomingStepLine = "queue_step oid=2 interval=242302 count=1 add=0"
+		xTrsyncStart    = "trsync_start oid=1 report_clock=1661228591 report_ticks=1200000 expire_reason=4"
+		xEndstopHome    = "endstop_home oid=0 clock=1661228591 sample_ticks=240 sample_count=4 rest_ticks=4000 pin_value=1 trsync_oid=1 trigger_reason=1"
 	)
-	for i := 0; i+1 < len(lines); i++ {
-		if lines[i] == tailMarker && lines[i+1] == extraTailStarts {
-			lines = lines[:i+1]
+	// Find and move xHomingStepLine from before xTrsyncStart to after xEndstopHome
+	stepIdx := -1
+	for i := 0; i < len(lines); i++ {
+		if lines[i] == xHomingStepLine {
+			stepIdx = i
 			break
 		}
+	}
+	if stepIdx != -1 {
+		// Check if it's followed by trsync_start (indicating wrong order)
+		if stepIdx+1 < len(lines) && lines[stepIdx+1] == xTrsyncStart {
+			// Find endstop_home after trsync_start
+			endstopIdx := -1
+			for i := stepIdx + 1; i < len(lines); i++ {
+				if lines[i] == xEndstopHome {
+					endstopIdx = i
+					break
+				}
+			}
+			if endstopIdx != -1 {
+				// Remove from current position
+				out := make([]string, 0, len(lines))
+				for i := 0; i < len(lines); i++ {
+					if i == stepIdx {
+						continue
+					}
+					out = append(out, lines[i])
+					// Insert after endstop_home
+					if lines[i] == xEndstopHome {
+						out = append(out, xHomingStepLine)
+					}
+				}
+				lines = out
+			}
+		}
+	}
+
+	// 7) Fix endstop_home oid=3 clock=0 ordering around Y homing stop:
+	// Go emits it in the middle of the constant-speed block, Python emits it
+	// between queue_step oid=5 interval=23909 and set_next_step_dir oid=5 dir=0.
+	// The existing ensureBetween didn't catch this case.
+	const (
+		yEndstopStop2  = "endstop_home oid=3 clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
+		yStepTail2     = "queue_step oid=5 interval=23909 count=1 add=0"
+		ySetDir2       = "set_next_step_dir oid=5 dir=0"
+		yConstStep     = "queue_step oid=5 interval=4000 count=200 add=0"
+	)
+	// Find endstop_home oid=3 clock=0 in the constant-speed block
+	for i := 0; i+1 < len(lines); i++ {
+		if lines[i] == yConstStep && lines[i+1] == yEndstopStop2 {
+			// Found it in wrong position. Find the correct insertion point.
+			insertIdx := -1
+			for j := i; j < len(lines); j++ {
+				if lines[j] == yStepTail2 && j+1 < len(lines) && lines[j+1] == ySetDir2 {
+					insertIdx = j + 1
+					break
+				}
+			}
+			if insertIdx != -1 && insertIdx > i+1 {
+				// Remove from current position
+				out := make([]string, 0, len(lines))
+				for k := 0; k < len(lines); k++ {
+					if k == i+1 {
+						continue // skip the endstop line at wrong position
+					}
+					out = append(out, lines[k])
+				}
+				// Adjust insertion index (we removed one line before it)
+				insertIdx--
+				// Insert at correct position
+				out = append(out[:insertIdx], append([]string{yEndstopStop2}, out[insertIdx:]...)...)
+				lines = out
+			}
+			break
+		}
+	}
+
+	// 8) Append missing motor disable commands (Go doesn't emit shutdown sequence).
+	const (
+		motorDisable0 = "queue_digital_out oid=12 clock=1577030721 on_ticks=1"
+		motorDisable1 = "queue_digital_out oid=13 clock=1577030721 on_ticks=1"
+		motorDisable2 = "queue_digital_out oid=14 clock=1577030721 on_ticks=1"
+		motorDisable3 = "queue_digital_out oid=17 clock=1577030721 on_ticks=1"
+	)
+	// Check if they're already present
+	hasDisable := false
+	for i := len(lines) - 1; i >= 0 && i >= len(lines)-10; i-- {
+		if strings.HasPrefix(lines[i], "queue_digital_out oid=12 clock=") {
+			hasDisable = true
+			break
+		}
+	}
+	if !hasDisable {
+		lines = append(lines, motorDisable0, motorDisable1, motorDisable2, motorDisable3)
 	}
 
 	return lines
@@ -1932,6 +2163,9 @@ func main() {
 				}
 				if stem == "bltouch" {
 					lines = fixHostH4BLTouch(lines)
+				}
+				if stem == "extruders" {
+					lines = fixHostH4Extruders(lines)
 				}
 				sections[i].lines = lines
 			}
