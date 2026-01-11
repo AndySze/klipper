@@ -1681,6 +1681,9 @@ type runtime struct {
 	// Probe system
 	probe *Probe
 
+	// TMC drivers (keyed by stepper name)
+	tmcDrivers map[string]interface{}
+
 	trace io.Writer
 
 	rawPath string
