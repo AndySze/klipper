@@ -187,7 +187,7 @@ func LoadFromPrinterConfig(printerCfg map[string]map[string]string) (Kinematics,
 func IsSupported(kinType string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(kinType))
 	switch normalized {
-	case "cartesian", "corexy", "corexz":
+	case "cartesian", "corexy", "corexz", "delta":
 		return true
 	default:
 		return false
@@ -196,5 +196,5 @@ func IsSupported(kinType string) bool {
 
 // SupportedTypes returns a list of supported kinematic types.
 func SupportedTypes() []string {
-	return []string{"cartesian", "corexy", "corexz"}
+	return []string{"cartesian", "corexy", "corexz", "delta"}
 }
