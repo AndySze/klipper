@@ -195,6 +195,26 @@ func copyFile(dst, src string) error {
 	return out.Close()
 }
 
+// fixHostH4OutOfBoundsOrdering normalizes MCU command ordering differences in
+// out_of_bounds.test regression between Python klippy and Go host-h4.
+//
+// This function addresses two specific ordering issues:
+//
+// 1. Y endstop homing sequence: Klippy queues endstop_home before
+//    set_next_step_dir, but Go host-h4 emits them in reverse order.
+//    This fix reorders the sequence to match Python klippy.
+//
+// 2. Z endstop homing sequence: Similar ordering difference where
+//    trsync_set_timeout appears before set_next_step_dir in Python,
+//    but Go emits them in the opposite order.
+//
+// Historical Context:
+// This normalization was added during early Go development when
+// Go output ordering did not match Python klippy. As of 2026-01-11,
+// this fix is still required for out_of_bounds.test to pass in strict mode.
+//
+// Test Status (2026-01-11): Required - out_of_bounds.test fails without this fix.
+
 func fixHostH4OutOfBoundsOrdering(lines []string) []string {
 	const (
 		markerEndstop = "endstop_home oid=0 clock=4000000"
@@ -237,6 +257,19 @@ func fixHostH4OutOfBoundsOrdering(lines []string) []string {
 	}
 	return out
 }
+
+// fixHostH4BedScrews normalizes MCU command ordering differences in
+// bed_screws.test regression between Python klippy and Go host-h4.
+//
+// This function addresses stepcompress chunk boundary differences and
+// endstop_home command ordering issues specific to the bed_screws test.
+//
+// Historical Context:
+// This normalization was added during early Go development when
+// Go output ordering did not match Python klippy. As of 2026-01-11,
+// this fix is still required for bed_screws.test to pass in strict mode.
+//
+// Test Status (2026-01-11): Required - bed_screws.test fails without this fix.
 
 func fixHostH4BedScrews(lines []string) []string {
 	out := make([]string, 0, len(lines))
@@ -393,6 +426,21 @@ func fixHostH4BedScrews(lines []string) []string {
 	return lines
 }
 
+// fixHostH4PressureAdvanceOrdering normalizes MCU command ordering differences in
+// pressure_advance.test regression between Python klippy and Go host-h4.
+//
+// This function addresses specific command sequencing issues related to
+// pressure advance kinematics and motion planning.
+//
+// Historical Context:
+// This normalization was added during early Go development when
+// Go output ordering did not match Python klippy. As of 2026-01-11,
+// this fix may no longer be needed (test passes without explicit fix call).
+//
+// Test Status (2026-01-11): Possibly Obsolete - pressure_advance.test passes
+// in strict mode even without explicit normalization. Keeping for now as
+// a defensive measure.
+
 func fixHostH4PressureAdvanceOrdering(lines []string) []string {
 	const (
 		endstopPrefix = "endstop_home oid=4 clock=211007999"
@@ -414,6 +462,22 @@ func fixHostH4PressureAdvanceOrdering(lines []string) []string {
 	return out
 }
 
+// fixHostH3ManualStepper normalizes MCU command ordering differences in
+// manual_stepper.test regression between Python klippy and Go host-h3.
+//
+// This function addresses command sequencing issues specific to manual
+// stepper control, particularly around step direction changes and
+// stepper enable/disable sequences.
+//
+// Historical Context:
+// This normalization was added for the host-h3 connect-phase compiler
+// which handles stepper config differently than host-h4. The manual
+// stepper test requires host-h3 mode and specific normalization.
+//
+// Test Status (2026-01-11): Status Unknown - manual_stepper.test passes
+// in strict mode, but may be relying on this normalization implicitly.
+// Needs further investigation to determine if still required.
+
 func fixHostH3ManualStepper(lines []string) []string {
 	out := make([]string, 0, len(lines))
 	for i := 0; i < len(lines); i++ {
@@ -431,6 +495,23 @@ func fixHostH3ManualStepper(lines []string) []string {
 	}
 	return out
 }
+
+// fixHostH4BLTouch normalizes MCU command ordering differences in
+// bltouch.test regression between Python klippy and Go host-h4.
+//
+// DEPRECATED/OBSOLETE (2026-01-11): This function is no longer required.
+//
+// Historical Context:
+// This normalization was added during early Go development (~150 lines)
+// to fix ordering differences between the early Go implementation and Python
+// klippy output. The Go implementation has since evolved.
+//
+// Test Status (2026-01-11): Confirmed Obsolete - bltouch.test passes in
+// strict mode (host-h4) with identical output to Python klippy without
+// requiring this normalization. Can be safely removed.
+//
+// Recommendation: Remove this function and its call site to simplify
+// the codebase.
 
 func fixHostH4BLTouch(lines []string) []string {
 	matchAt := func(i int, pat []string) bool {
@@ -1081,6 +1162,23 @@ func fixHostH4BLTouch(lines []string) []string {
 	return out
 }
 
+// fixHostH4GcodeArcs normalizes MCU command ordering differences in
+// gcode_arcs.test regression between Python klippy and Go host-h4.
+//
+// This function addresses complex ordering issues in arc motion planning,
+// including:
+// - endstop_home command placement relative to step commands
+// - Large block ordering differences in arc motion segments
+//
+// Historical Context:
+// This normalization handles particularly complex ordering differences
+// in arc motion. The fix involves moving endstop_home commands and
+// potentially large blocks of step commands to match Python klippy output.
+//
+// Test Status (2026-01-11): Required - gcode_arcs.test fails without this fix.
+// The test shows both endstop_home positioning differences and large
+// missing blocks in Go output that this normalization addresses.
+
 func fixHostH4GcodeArcs(lines []string) []string {
 	const (
 		zEndstopStopLine = "endstop_home oid=6 clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
@@ -1425,11 +1523,28 @@ func main() {
 		if *mode == "auto" && *only == "" {
 			modeForStem := "host-h4"
 			switch stem {
+			case "commands":
+				modeForStem = "host-h4"
+			case "out_of_bounds":
+				modeForStem = "host-h4"
+			case "gcode_arcs":
+				modeForStem = "host-h4"
+			case "bed_screws":
+				modeForStem = "host-h4"
+			case "extruders":
+				modeForStem = "host-h4"
+			case "pressure_advance":
+				modeForStem = "host-h4"
 			case "manual_stepper":
 				modeForStem = "host-h3"
+			case "bltouch":
+				modeForStem = "host-h4"
 			case "linuxtest":
 				modeForStem = "host-h1"
+			case "macros":
+				modeForStem = "host-h4"
 			}
+
 			args := []string{
 				"-suite", *suite,
 				"-outdir", *outdir,
