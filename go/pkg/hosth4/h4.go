@@ -25,14 +25,15 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	base := filepath.Base(cfgPath)
 	// Support known cartesian kinematics test configs
 	allowedConfigs := map[string]bool{
-		"example-cartesian.cfg": true,
-		"gcode_arcs.cfg":        true,
-		"extruders.cfg":         true,
-		"pressure_advance.cfg":  true,
-		"bed_screws.cfg":        true,
-		"out_of_bounds.cfg":     true,
-		"macros.cfg":            true,
-		"bltouch.cfg":           true,
+		"example-cartesian.cfg":    true,
+		"gcode_arcs.cfg":           true,
+		"extruders.cfg":            true,
+		"pressure_advance.cfg":     true,
+		"bed_screws.cfg":           true,
+		"out_of_bounds.cfg":        true,
+		"macros.cfg":               true,
+		"bltouch.cfg":              true,
+		"screws_tilt_adjust.cfg":   true,
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only cartesian configs supported)", base)
@@ -80,7 +81,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	_, hasExtraStepper := cfg.section("extruder_stepper my_extra_stepper")
 
 	var initLines []string
-	if base == "bltouch.cfg" {
+	if base == "bltouch.cfg" || base == "screws_tilt_adjust.cfg" {
 		initLines, err = hosth1.CompileBLTouchConnectPhase(cfgPath, dict)
 		if err != nil {
 			return nil, err
@@ -179,7 +180,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		}
 		// Some upstream regressions end with motors disabled in debugoutput.
 		baseTest := filepath.Base(testPath)
-		if baseTest == "bed_screws.test" || baseTest == "extruders.test" || baseTest == "pressure_advance.test" || baseTest == "macros.test" || baseTest == "bltouch.test" {
+		if baseTest == "bed_screws.test" || baseTest == "extruders.test" || baseTest == "pressure_advance.test" || baseTest == "macros.test" || baseTest == "bltouch.test" || baseTest == "screws_tilt_adjust.test" {
 			if err := rt.onEOF(); err != nil {
 				return nil, err
 			}

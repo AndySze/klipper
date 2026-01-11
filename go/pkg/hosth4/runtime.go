@@ -1629,6 +1629,8 @@ type runtime struct {
 
 	bltouch *bltouchController
 
+	screwsTiltAdjust *screwsTiltAdjust
+
 	trace io.Writer
 
 	rawPath string
@@ -2394,6 +2396,13 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtim
 		rt.bltouch = newBLTouchController(rt, pwm, rt.endstops[2])
 	}
 
+	// Initialize screws_tilt_adjust if configured
+	if sta, err := newScrewsTiltAdjust(rt, cfg); err != nil {
+		return nil, fmt.Errorf("screws_tilt_adjust init: %w", err)
+	} else if sta != nil {
+		rt.screwsTiltAdjust = sta
+	}
+
 	rt.updateKinFlushDelay()
 
 	// Load and setup heaters from config
@@ -2765,6 +2774,13 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		return handler(cmd.Args)
 	case "BLTOUCH_DEBUG":
 		if err := r.cmdBLTouchDebug(cmd.Args); err != nil {
+			return err
+		}
+	case "SCREWS_TILT_CALCULATE":
+		if r.screwsTiltAdjust == nil {
+			return fmt.Errorf("screws_tilt_adjust not configured")
+		}
+		if err := r.screwsTiltAdjust.cmdSCREWS_TILT_CALCULATE(cmd.Args); err != nil {
 			return err
 		}
 	default:

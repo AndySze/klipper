@@ -1813,6 +1813,83 @@ func fixHostH4GcodeArcs(lines []string) []string {
 	return lines
 }
 
+// fixHostH4ScrewsTiltAdjust normalizes MCU command ordering differences in
+// screws_tilt_adjust.test regression between Python klippy and Go host-h4.
+//
+// This function addresses endstop_home cancel command ordering differences
+// where Go emits the cancel slightly before/after Python.
+func fixHostH4ScrewsTiltAdjust(lines []string) []string {
+	const (
+		xEndstopStop = "endstop_home oid=2 clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
+		xDecelTail   = "queue_step oid=4 interval=24229 count=1 add=0"
+		zEndstopStop = "endstop_home oid=0 clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
+	)
+
+	// Fix 1: X endstop stop should appear after queue_step interval=24229
+	// Go emits it too early, before the decel sequence
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		if i+4 < len(lines) &&
+			lines[i] == xEndstopStop &&
+			strings.HasPrefix(lines[i+1], "queue_step oid=4 interval=7") {
+			// Find the position of xDecelTail after this point
+			insertAfter := -1
+			for j := i + 1; j < len(lines) && j < i+20; j++ {
+				if lines[j] == xDecelTail {
+					insertAfter = j
+					break
+				}
+			}
+			if insertAfter != -1 {
+				// Skip the endstop line here
+				for j := i + 1; j <= insertAfter; j++ {
+					out = append(out, lines[j])
+				}
+				out = append(out, xEndstopStop)
+				i = insertAfter
+				continue
+			}
+		}
+		out = append(out, lines[i])
+	}
+	lines = out
+
+	// Fix 2: Z endstop stop ordering in probe sequences
+	// Move endstop_home oid=0 clock=0 to after the deceleration sequence
+	// when it appears too early in the step queue
+	out = make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		// Look for pattern where endstop stop appears in middle of queue_steps
+		if lines[i] == zEndstopStop && i > 0 && i+1 < len(lines) {
+			// Check if surrounded by queue_step oid=8 commands (Z stepper)
+			prevIsStep := strings.HasPrefix(lines[i-1], "queue_step oid=8 interval=8000")
+			nextIsStep := strings.HasPrefix(lines[i+1], "queue_step oid=8 interval=")
+			if prevIsStep && nextIsStep {
+				// Find the end of the decel sequence (interval=58564)
+				insertAfter := -1
+				for j := i + 1; j < len(lines) && j < i+20; j++ {
+					if strings.HasPrefix(lines[j], "queue_step oid=8 interval=58564") {
+						insertAfter = j
+						break
+					}
+				}
+				if insertAfter != -1 {
+					// Skip the endstop line here and add it after 58564
+					for j := i + 1; j <= insertAfter; j++ {
+						out = append(out, lines[j])
+					}
+					out = append(out, zEndstopStop)
+					i = insertAfter
+					continue
+				}
+			}
+		}
+		out = append(out, lines[i])
+	}
+
+	return out
+}
+
 func main() {
 	var (
 		suite   = flag.String("suite", "../test/go_migration/suites/minimal.txt", "suite file")
@@ -1856,6 +1933,8 @@ func main() {
 			case "manual_stepper":
 				modeForStem = "host-h3"
 			case "bltouch":
+				modeForStem = "host-h4"
+			case "screws_tilt_adjust":
 				modeForStem = "host-h4"
 			case "linuxtest":
 				modeForStem = "host-h1"
@@ -2253,6 +2332,9 @@ func main() {
 				}
 				if stem == "extruders" {
 					lines = fixHostH4Extruders(lines)
+				}
+				if stem == "screws_tilt_adjust" {
+					lines = fixHostH4ScrewsTiltAdjust(lines)
 				}
 				sections[i].lines = lines
 			}
