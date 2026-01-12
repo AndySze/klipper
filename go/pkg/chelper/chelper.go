@@ -25,6 +25,9 @@ void extruder_set_pressure_advance(struct stepper_kinematics *sk, double print_t
 struct stepper_kinematics *generic_cartesian_stepper_alloc(double a_x, double a_y, double a_z);
 void generic_cartesian_stepper_set_coeffs(struct stepper_kinematics *sk
     , double a_x, double a_y, double a_z);
+
+// kin_corexy.c - corexy kinematics
+struct stepper_kinematics *corexy_stepper_alloc(char type);
 */
 import "C"
 
@@ -546,4 +549,14 @@ func NewGenericCartesianStepperKinematics(aX, aY, aZ float64) (*StepperKinematic
 // cartesian stepper.
 func (sk *StepperKinematics) SetGenericCartesianCoeffs(aX, aY, aZ float64) {
 	C.generic_cartesian_stepper_set_coeffs(sk.ptr, C.double(aX), C.double(aY), C.double(aZ))
+}
+
+// NewCoreXYStepperKinematics creates a corexy stepper kinematics.
+// stepperType should be '+' for the first stepper (x+y) or '-' for the second stepper (x-y).
+func NewCoreXYStepperKinematics(stepperType byte) (*StepperKinematics, error) {
+	sk := C.corexy_stepper_alloc(C.char(stepperType))
+	if sk == nil {
+		return nil, fmt.Errorf("corexy_stepper_alloc failed")
+	}
+	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
 }

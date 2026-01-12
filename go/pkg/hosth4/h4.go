@@ -25,21 +25,22 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	base := filepath.Base(cfgPath)
 	// Support known kinematics test configs
 	allowedConfigs := map[string]bool{
-		"example-cartesian.cfg":    true,
-		"gcode_arcs.cfg":           true,
-		"extruders.cfg":            true,
-		"pressure_advance.cfg":     true,
-		"bed_screws.cfg":           true,
-		"out_of_bounds.cfg":        true,
-		"macros.cfg":               true,
-		"bltouch.cfg":              true,
-		"screws_tilt_adjust.cfg":   true,
-		"example-delta.cfg":        true, // Delta kinematics support
-		"delta_calibrate.cfg":      true, // Delta calibration (no heaters)
-		"load_cell.cfg":            true, // Load cell sensors (no kinematics)
-		"sdcard_loop.cfg":          true, // Virtual SD card with looping
-		"generic_cartesian.cfg":    true, // Generic cartesian kinematics
-		"corexyuv.cfg":             true, // CoreXY UV (generic cartesian)
+		"example-cartesian.cfg":            true,
+		"gcode_arcs.cfg":                   true,
+		"extruders.cfg":                    true,
+		"pressure_advance.cfg":             true,
+		"bed_screws.cfg":                   true,
+		"out_of_bounds.cfg":                true,
+		"macros.cfg":                       true,
+		"bltouch.cfg":                      true,
+		"screws_tilt_adjust.cfg":           true,
+		"example-delta.cfg":                true, // Delta kinematics support
+		"delta_calibrate.cfg":              true, // Delta calibration (no heaters)
+		"load_cell.cfg":                    true, // Load cell sensors (no kinematics)
+		"sdcard_loop.cfg":                  true, // Virtual SD card with looping
+		"generic_cartesian.cfg":            true, // Generic cartesian kinematics
+		"corexyuv.cfg":                     true, // CoreXY UV (generic cartesian)
+		"hybrid_corexy_dual_carriage.cfg":  true, // Hybrid CoreXY with dual carriage
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)
@@ -53,9 +54,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		return nil, fmt.Errorf("missing [printer] section")
 	}
 	kin := strings.TrimSpace(printerSec["kinematics"])
-	// Support cartesian, corexy, corexz, delta, generic_cartesian kinematics, and "none" for sensor-only configs
-	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" && kin != "generic_cartesian" && kin != "none" {
-		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta/generic_cartesian/none kinematics (got %q)", kin)
+	// Support cartesian, corexy, corexz, delta, generic_cartesian, hybrid_corexy kinematics, and "none" for sensor-only configs
+	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" && kin != "generic_cartesian" && kin != "hybrid_corexy" && kin != "none" {
+		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta/generic_cartesian/hybrid_corexy/none kinematics (got %q)", kin)
 	}
 
 	rt, err := newRuntime(cfgPath, dict, cfg)
@@ -129,6 +130,12 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	} else if kin == "generic_cartesian" {
 		// Use generic cartesian connect-phase compiler
 		initLines, err = hosth1.CompileGenericCartesianConnectPhase(cfgPath, dict)
+		if err != nil {
+			return nil, err
+		}
+	} else if kin == "hybrid_corexy" {
+		// Use hybrid corexy connect-phase compiler
+		initLines, err = hosth1.CompileHybridCoreXYConnectPhase(cfgPath, dict)
 		if err != nil {
 			return nil, err
 		}

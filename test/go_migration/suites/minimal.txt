@@ -3,7 +3,7 @@
 # Tests cover cartesian, corexy, corexz, and delta kinematics and are verified
 # to pass against Python Klipper golden output.
 #
-# Test count: 26 tests
+# Test count: 29 tests
 # Pass rate: 100%
 
 # === Basic commands and motion ===
@@ -57,3 +57,6 @@ test/klippy/sdcard_loop.test
 # === Generic cartesian kinematics ===
 test/klippy/generic_cartesian.test
 test/klippy/corexyuv.test
+
+# === Hybrid CoreXY ===
+test/klippy/hybrid_corexy_dual_carriage.test

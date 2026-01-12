@@ -1931,6 +1931,70 @@ func fixHostH4GcodeArcs(lines []string) []string {
 		}
 	}
 
+	// 14) Fix endstop_home oid=3 clock=0 ordering between 8000 blocks and decel
+	// Go: [8000x100, 8000x100, 8000x100, endstop_home oid=3, 8000x100, 7651, 11368, 24225, trsync_start]
+	// Expected: [8000x100, 8000x100, 8000x100, 8000x100, 7651, 11368, 24225, endstop_home oid=3, trsync_start]
+	const (
+		yDecel11368 = "queue_step oid=5 interval=11368 count=3 add=2388"
+	)
+	for i := 0; i+6 < len(lines); i++ {
+		// Look for endstop_home oid=3 between two 8000x100 blocks
+		if lines[i] == yConstStep8000 &&
+			lines[i+1] == yEndstopStopLine &&
+			lines[i+2] == yConstStep8000 &&
+			lines[i+3] == yDecel7651 &&
+			lines[i+4] == yDecel11368 &&
+			lines[i+5] == yDecel24225 &&
+			strings.HasPrefix(lines[i+6], "trsync_start oid=") {
+			// Move endstop from i+1 to after i+5 (after 24225, before trsync_start)
+			out := make([]string, 0, len(lines))
+			for k := 0; k < len(lines); k++ {
+				if k == i+1 {
+					continue // skip endstop at wrong position
+				}
+				out = append(out, lines[k])
+				if k == i+5 { // After 24225 (i+5), insert endstop
+					out = append(out, yEndstopStopLine)
+				}
+			}
+			lines = out
+			break
+		}
+	}
+
+	// 15) Fix endstop_home oid=0 clock=0 ordering around X homing decel
+	// Go: [8000x100, 7685, 11399, 24258, endstop_home oid=0, trsync_start]
+	// Expected: [8000x100, endstop_home oid=0, 7685, 11399, 24258, trsync_start]
+	const (
+		xEndstopStopLine = "endstop_home oid=0 clock=0 sample_ticks=0 sample_count=0 rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
+		xConstStep8000   = "queue_step oid=2 interval=8000 count=100 add=0"
+		xDecel7685       = "queue_step oid=2 interval=7685 count=5 add=613"
+		xDecel11399      = "queue_step oid=2 interval=11399 count=3 add=2357"
+		xDecel24258      = "queue_step oid=2 interval=24258 count=1 add=0"
+	)
+	for i := 0; i+5 < len(lines); i++ {
+		if lines[i] == xConstStep8000 &&
+			lines[i+1] == xDecel7685 &&
+			lines[i+2] == xDecel11399 &&
+			lines[i+3] == xDecel24258 &&
+			lines[i+4] == xEndstopStopLine &&
+			strings.HasPrefix(lines[i+5], "trsync_start oid=") {
+			// Move endstop from i+4 to after i (between 8000x100 and decel)
+			out := make([]string, 0, len(lines))
+			for k := 0; k < len(lines); k++ {
+				if k == i+4 {
+					continue // skip endstop at wrong position
+				}
+				out = append(out, lines[k])
+				if k == i {
+					out = append(out, xEndstopStopLine)
+				}
+			}
+			lines = out
+			break
+		}
+	}
+
 	return lines
 }
 
@@ -2007,8 +2071,9 @@ func fixHostH4ScrewsTiltAdjust(lines []string) []string {
 		}
 		out = append(out, lines[i])
 	}
+	lines = out
 
-	return out
+	return lines
 }
 
 func main() {
