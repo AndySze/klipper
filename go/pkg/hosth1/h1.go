@@ -1613,3 +1613,95 @@ func CompileDeltaConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]stri
 	out = append(out, initCmds...)
 	return out, nil
 }
+
+// CompileDeltaCalibrateConnectPhase compiles the connect-phase MCU command stream for
+// delta calibration configurations (e.g., test/klippy/delta_calibrate.cfg).
+//
+// This is a simpler delta config with only steppers (no heaters/extruder).
+// OID layout matches Python's order: 12 OIDs total.
+func CompileDeltaCalibrateConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+	if err != nil {
+		return nil, err
+	}
+	mcuFreq := clockFreq
+
+	// Extract required pins - delta uses stepper_a/b/c
+	stepperA, err := readStepper(cfg, "stepper_a")
+	if err != nil {
+		return nil, err
+	}
+	stepperB, err := readStepper(cfg, "stepper_b")
+	if err != nil {
+		return nil, err
+	}
+	stepperC, err := readStepper(cfg, "stepper_c")
+	if err != nil {
+		return nil, err
+	}
+
+	// OID layout for delta_calibrate.cfg (no heaters):
+	// endstop_a=0, trsync_a=1, stepper_a=2,
+	// endstop_b=3, trsync_b=4, stepper_b=5,
+	// endstop_c=6, trsync_c=7, stepper_c=8,
+	// enable_a=9, enable_b=10, enable_c=11
+	// count=12
+	const (
+		oidEndstopA = 0
+		oidTrsyncA  = 1
+		oidStepperA = 2
+		oidEndstopB = 3
+		oidTrsyncB  = 4
+		oidStepperB = 5
+		oidEndstopC = 6
+		oidTrsyncC  = 7
+		oidStepperC = 8
+		oidEnableA  = 9
+		oidEnableB  = 10
+		oidEnableC  = 11
+		oidCount    = 12
+	)
+
+	// Derived constants (match klippy defaults).
+	const stepPulseSec = 0.000002
+	stepPulseTicks := secondsToClock(mcuFreq, stepPulseSec)
+
+	// Build config commands in the same order as the Python reference.
+	configCmds := []string{
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", oidEndstopA, stepperA.Endstop.pin, stepperA.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", oidTrsyncA),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperA, stepperA.Step.pin, stepperA.Dir.pin, boolToInt(stepperA.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			oidEnableA, stepperA.Enable.pin, boolToInt(stepperA.Enable.invert), boolToInt(stepperA.Enable.invert), 0),
+
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", oidEndstopB, stepperB.Endstop.pin, stepperB.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", oidTrsyncB),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperB, stepperB.Step.pin, stepperB.Dir.pin, boolToInt(stepperB.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			oidEnableB, stepperB.Enable.pin, boolToInt(stepperB.Enable.invert), boolToInt(stepperB.Enable.invert), 0),
+
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", oidEndstopC, stepperC.Endstop.pin, stepperC.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", oidTrsyncC),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperC, stepperC.Step.pin, stepperC.Dir.pin, boolToInt(stepperC.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			oidEnableC, stepperC.Enable.pin, boolToInt(stepperC.Enable.invert), boolToInt(stepperC.Enable.invert), 0),
+	}
+
+	// Prepend allocate_oids and compute finalize_config CRC over config_cmds.
+	withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", oidCount)}, configCmds...)
+	crcText := strings.Join(withAllocate, "\n")
+	crc := crc32.ChecksumIEEE([]byte(crcText))
+
+	// No init commands for this simple config (no heaters/ADCs).
+	out := make([]string, 0, len(withAllocate)+1)
+	out = append(out, withAllocate...)
+	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+	return out, nil
+}

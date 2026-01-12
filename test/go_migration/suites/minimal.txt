@@ -3,7 +3,7 @@
 # Tests cover cartesian, corexy, corexz, and delta kinematics and are verified
 # to pass against Python Klipper golden output.
 #
-# Test count: 23 tests
+# Test count: 24 tests
 # Pass rate: 100%
 
 # === Basic commands and motion ===
@@ -15,6 +15,7 @@ test/klippy/gcode_arcs.test
 test/klippy/bed_screws.test
 test/klippy/input_shaper.test
 test/klippy/delta.test
+test/klippy/delta_calibrate.test
 
 # === Extrusion ===
 test/klippy/extruders.test

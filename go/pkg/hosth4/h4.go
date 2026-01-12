@@ -35,6 +35,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"bltouch.cfg":              true,
 		"screws_tilt_adjust.cfg":   true,
 		"example-delta.cfg":        true, // Delta kinematics support
+		"delta_calibrate.cfg":      true, // Delta calibration (no heaters)
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)
@@ -88,9 +89,15 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		if err != nil {
 			return nil, err
 		}
-	} else if kin == "delta" {
-		// Use delta-specific connect-phase compiler
+	} else if kin == "delta" && hasBedHeater {
+		// Use delta-specific connect-phase compiler (with heaters)
 		initLines, err = hosth1.CompileDeltaConnectPhase(cfgPath, dict)
+		if err != nil {
+			return nil, err
+		}
+	} else if kin == "delta" && !hasBedHeater {
+		// Use delta calibrate connect-phase compiler (no heaters)
+		initLines, err = hosth1.CompileDeltaCalibrateConnectPhase(cfgPath, dict)
 		if err != nil {
 			return nil, err
 		}

@@ -75,8 +75,17 @@ func (c *Config) parseFile(path string, visited map[string]bool) error {
 			continue
 		}
 
-		// Strip comments
-		if idx := strings.IndexByte(line, '#'); idx >= 0 {
+		// Handle Klipper SAVE_CONFIG format: lines starting with "#*#" are
+		// auto-generated config that should be parsed as regular config.
+		// Strip the "#*#" prefix and continue parsing.
+		if strings.HasPrefix(line, "#*#") {
+			line = strings.TrimSpace(line[3:])
+			if line == "" {
+				continue
+			}
+			// Fall through to normal parsing
+		} else if idx := strings.IndexByte(line, '#'); idx >= 0 {
+			// Strip regular comments
 			line = strings.TrimSpace(line[:idx])
 			if line == "" {
 				continue
@@ -182,8 +191,17 @@ func LoadString(data string) (*Config, error) {
 			continue
 		}
 
-		// Strip comments
-		if idx := strings.IndexByte(line, '#'); idx >= 0 {
+		// Handle Klipper SAVE_CONFIG format: lines starting with "#*#" are
+		// auto-generated config that should be parsed as regular config.
+		// Strip the "#*#" prefix and continue parsing.
+		if strings.HasPrefix(line, "#*#") {
+			line = strings.TrimSpace(line[3:])
+			if line == "" {
+				continue
+			}
+			// Fall through to normal parsing
+		} else if idx := strings.IndexByte(line, '#'); idx >= 0 {
+			// Strip regular comments
 			line = strings.TrimSpace(line[:idx])
 			if line == "" {
 				continue
