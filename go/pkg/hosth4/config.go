@@ -10,9 +10,18 @@ import (
 
 // pin represents a parsed pin specification (local type for hosth4).
 type pin struct {
-	pin    string
+	chip   string // MCU chip name (default: "mcu")
+	pin    string // Pin name on the MCU
 	invert bool
 	pullup int
+}
+
+// fullName returns the full pin name including chip prefix if not "mcu".
+func (p pin) fullName() string {
+	if p.chip != "" && p.chip != "mcu" {
+		return p.chip + ":" + p.pin
+	}
+	return p.pin
 }
 
 // =============================================================================
@@ -128,12 +137,13 @@ func parsePin(sec map[string]string, key string, canInvert bool, canPullup bool)
 
 // pinFromConfig converts a config.Pin to the local pin type.
 func pinFromConfig(p config.Pin) pin {
-	name := p.Name
-	if p.Chip != "" && p.Chip != "mcu" {
-		name = p.Chip + ":" + p.Name
+	chip := p.Chip
+	if chip == "" {
+		chip = "mcu"
 	}
 	return pin{
-		pin:    name,
+		chip:   chip,
+		pin:    p.Name,
 		invert: p.Invert,
 		pullup: p.Pullup,
 	}
