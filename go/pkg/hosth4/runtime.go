@@ -1888,6 +1888,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		return newRotaryDeltaRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
 	}
 
+	// For deltesian, use separate initialization path
+	isDeltesian := kinType == "deltesian"
+	if isDeltesian {
+		return newDeltesianRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
+	}
+
 	var sx, sy, sz stepperCfg
 	if isDelta {
 		// Delta uses stepper_a, stepper_b, stepper_c
@@ -6520,4 +6526,405 @@ func newHybridCoreXZRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	}
 
 	return rt, nil
+}
+
+// newDeltesianRuntime creates a runtime for deltesian kinematics.
+// Deltesian uses stepper_left, stepper_right, stepper_y with arm-based
+// kinematics for the X-Z plane.
+func newDeltesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[string]*protocol.MessageFormat, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel float64, queueStepID, setDirID int32) (*runtime, error) {
+	// Read stepper configs with deltesian names
+	stepperLeft, err := readStepperByName(cfg, "stepper_left", 'l')
+	if err != nil {
+		return nil, err
+	}
+	stepperRight, err := readStepperByName(cfg, "stepper_right", 'r')
+	if err != nil {
+		return nil, err
+	}
+	stepperY, err := readStepperByName(cfg, "stepper_y", 'y')
+	if err != nil {
+		return nil, err
+	}
+
+	// Read arm parameters from stepper_left section
+	leftSec, _ := cfg.section("stepper_left")
+	armLength := 217.0
+	if v := leftSec["arm_length"]; v != "" {
+		armLength, _ = strconv.ParseFloat(v, 64)
+	}
+	armXLength := 160.0
+	if v := leftSec["arm_x_length"]; v != "" {
+		armXLength, _ = strconv.ParseFloat(v, 64)
+	}
+	arm2Left := armLength * armLength
+
+	// Read arm parameters from stepper_right section (default to left values)
+	rightSec, _ := cfg.section("stepper_right")
+	armLengthRight := armLength
+	if v := rightSec["arm_length"]; v != "" {
+		armLengthRight, _ = strconv.ParseFloat(v, 64)
+	}
+	armXLengthRight := armXLength
+	if v := rightSec["arm_x_length"]; v != "" {
+		armXLengthRight, _ = strconv.ParseFloat(v, 64)
+	}
+	arm2Right := armLengthRight * armLengthRight
+
+	// Map deltesian steppers to OID layout
+	rails := [3]stepperCfg{stepperLeft, stepperRight, stepperY}
+
+	// Read extruder config
+	extruderCfg, err := readExtruderStepper(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create serial queue output file
+	tmpDir := filepath.Join("out", "go_migration_tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, err
+	}
+	rawPath := filepath.Join(tmpDir, "serial-"+randSuffix()+".bin")
+	f, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	sq, err := chelper.NewSerialQueue(int(f.Fd()), 'f', 0, "serialq mcu")
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	sq.SetClockEst(1e12, chelper.Monotonic(), 0, 0)
+
+	cqMain := chelper.NewCommandQueue()
+	if cqMain == nil {
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc main command queue failed")
+	}
+	cqEnablePins := []*chelper.CommandQueue{}
+
+	reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
+	motion, err := newMotionQueuing(sq, mcuFreq, reservedMoveSlots)
+	if err != nil {
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	numAxes := 4 // X, Y, Z, E
+	th, err := newToolhead(mcuFreq, motion, maxVelocity, maxAccel, numAxes)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	se := newStepperEnable(th)
+
+	// OID layout for deltesian (same as cartesian):
+	// 0-2: left (endstop, trsync, stepper)
+	// 3-5: right (endstop, trsync, stepper)
+	// 6-8: Y (endstop, trsync, stepper)
+	// 9: stepper extruder
+	// 10-11: heater_bed (adc, pwm)
+	// 12-14: enable pins (left, right, y)
+	// 15-17: extruder (adc, pwm, enable)
+
+	// Calculate step distances
+	stepDistLeft := rails[0].rotationDistance / float64(rails[0].fullSteps*rails[0].microsteps)
+	stepDistRight := rails[1].rotationDistance / float64(rails[1].fullSteps*rails[1].microsteps)
+	stepDistY := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
+
+	// Create stepper_left with Deltesian kinematics
+	stLeft, err := newStepper(motion, sq, "stepper_left", 'l', 2, stepDistLeft, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	// Replace cartesian kinematics with deltesian kinematics
+	if stLeft.sk != nil {
+		stLeft.sk.Free()
+	}
+	skLeft, err := chelper.NewDeltesianStepperKinematics(arm2Left, -armXLength)
+	if err != nil {
+		stLeft.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create deltesian kinematics for stepper_left: %w", err)
+	}
+	if err := stLeft.se.SetStepperKinematics(skLeft); err != nil {
+		skLeft.Free()
+		stLeft.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stLeft.sk = skLeft
+	stLeft.setTrapQ(th.trapq)
+
+	// Create stepper_right with Deltesian kinematics
+	stRight, err := newStepper(motion, sq, "stepper_right", 'r', 5, stepDistRight, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		stLeft.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	// Replace cartesian kinematics with deltesian kinematics
+	if stRight.sk != nil {
+		stRight.sk.Free()
+	}
+	skRight, err := chelper.NewDeltesianStepperKinematics(arm2Right, armXLengthRight)
+	if err != nil {
+		stRight.free()
+		stLeft.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create deltesian kinematics for stepper_right: %w", err)
+	}
+	if err := stRight.se.SetStepperKinematics(skRight); err != nil {
+		skRight.Free()
+		stRight.free()
+		stLeft.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stRight.sk = skRight
+	stRight.setTrapQ(th.trapq)
+
+	// Create stepper_y with Cartesian Y kinematics
+	stY, err := newStepper(motion, sq, "stepper_y", 'y', 8, stepDistY, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		stRight.free()
+		stLeft.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stY.setTrapQ(th.trapq)
+
+	// Create extruder TrapQ and stepper
+	tqExtruder, err := chelper.NewTrapQ()
+	if err != nil {
+		stY.free()
+		stRight.free()
+		stLeft.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create extruder trapq: %w", err)
+	}
+	extStepDist := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
+	stE, err := newStepper(motion, sq, "extruder", 'e', 9, extStepDist, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		tqExtruder.Free()
+		stY.free()
+		stRight.free()
+		stLeft.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stE.setTrapQ(tqExtruder)
+
+	// Set up enable pins
+	cqEnLeft := chelper.NewCommandQueue()
+	cqEnRight := chelper.NewCommandQueue()
+	cqEnY := chelper.NewCommandQueue()
+	cqEnE := chelper.NewCommandQueue()
+	if cqEnLeft == nil || cqEnRight == nil || cqEnY == nil || cqEnE == nil {
+		stE.free()
+		tqExtruder.Free()
+		stY.free()
+		stRight.free()
+		stLeft.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc enable command queue failed")
+	}
+	cqEnablePins = append(cqEnablePins, cqEnLeft, cqEnRight, cqEnY, cqEnE)
+	enLeft := &stepperEnablePin{out: newDigitalOut(12, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enRight := &stepperEnablePin{out: newDigitalOut(13, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enY := &stepperEnablePin{out: newDigitalOut(14, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enE := &stepperEnablePin{out: newDigitalOut(17, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	motion.registerEnablePin(enLeft)
+	motion.registerEnablePin(enRight)
+	motion.registerEnablePin(enY)
+	motion.registerEnablePin(enE)
+	se.registerStepper("stepper_left", stLeft, enLeft)
+	se.registerStepper("stepper_right", stRight, enRight)
+	se.registerStepper("stepper_y", stY, enY)
+	se.registerStepper("extruder", stE, enE)
+
+	steppers := [3]*stepper{stLeft, stRight, stY}
+
+	// Create kinematics for bounds checking
+	kinRails := []kinematics.Rail{
+		{
+			Name:            "stepper_left",
+			StepDist:        stepDistLeft,
+			PositionMin:     rails[0].positionMin,
+			PositionMax:     rails[0].positionMax,
+			HomingSpeed:     rails[0].homingSpeed,
+			PositionEndstop: rails[0].positionEndstop,
+			HomingPositive:  rails[0].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_right",
+			StepDist:        stepDistRight,
+			PositionMin:     rails[1].positionMin,
+			PositionMax:     rails[1].positionMax,
+			HomingSpeed:     rails[1].homingSpeed,
+			PositionEndstop: rails[1].positionEndstop,
+			HomingPositive:  rails[1].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_y",
+			StepDist:        stepDistY,
+			PositionMin:     rails[2].positionMin,
+			PositionMax:     rails[2].positionMax,
+			HomingSpeed:     rails[2].homingSpeed,
+			PositionEndstop: rails[2].positionEndstop,
+			HomingPositive:  rails[2].homingPositiveDir,
+		},
+	}
+	kinCfg := kinematics.Config{
+		Type:         "deltesian",
+		Rails:        kinRails,
+		MaxZVelocity: maxZVelocity,
+		MaxZAccel:    maxZAccel,
+	}
+	kin, err := kinematics.NewFromConfig(kinCfg)
+	if err != nil {
+		stE.free()
+		tqExtruder.Free()
+		stY.free()
+		stRight.free()
+		stLeft.free()
+		motion.free()
+		for _, cq := range cqEnablePins {
+			cq.Free()
+		}
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	th.kin = kin
+
+	// Create extruder axis
+	extAxis := newExtruderAxis("extruder", tqExtruder)
+	th.extraAxes = []extraAxis{extAxis}
+
+	// Create MCU for temperature control
+	mcu := &mcu{freq: mcuFreq, clock: 0}
+
+	// Create bed mesh
+	bm, err := newBedMesh(cfg, th)
+	if err != nil {
+		stE.free()
+		tqExtruder.Free()
+		stY.free()
+		stRight.free()
+		stLeft.free()
+		motion.free()
+		for _, cq := range cqEnablePins {
+			cq.Free()
+		}
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	// G-code arcs resolution
+	mmPerArcSegment, err := readGcodeArcsResolution(cfg)
+	if err != nil {
+		stE.free()
+		tqExtruder.Free()
+		stY.free()
+		stRight.free()
+		stLeft.free()
+		motion.free()
+		for _, cq := range cqEnablePins {
+			cq.Free()
+		}
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	gm := newGCodeMove(th, mmPerArcSegment)
+
+	// Motor off order
+	deltesianMotorOffOrder := []string{"extruder", "stepper_y", "stepper_right", "stepper_left"}
+
+	rtDeltesian := &runtime{
+		cfg:           cfg,
+		dict:          dict,
+		formats:       formats,
+		mcuFreq:       mcuFreq,
+		queueStepID:   queueStepID,
+		setDirID:      setDirID,
+		sq:            sq,
+		cqMain:        cqMain,
+		cqEnablePins:  cqEnablePins,
+		motion:        motion,
+		toolhead:      th,
+		stepperEnable: se,
+		rails:         rails,
+		steppers:      steppers,
+		extruderCfg:   extruderCfg,
+		stepperE:      stE,
+		extruder:      extAxis,
+		gm:            gm,
+		motorOffOrder: deltesianMotorOffOrder,
+		bedMesh:       bm,
+		mcu:           mcu,
+		rawPath:       rawPath,
+		rawFile:       f,
+	}
+
+	// Initialize heater manager
+	rtDeltesian.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rtDeltesian))
+
+	// Load and setup heaters from config
+	deltesianHeaterConfigs, err := readHeaterConfigs(cfg)
+	if err != nil {
+		rtDeltesian.tracef("Warning: failed to load heater configs: %v\n", err)
+	} else {
+		for _, hc := range deltesianHeaterConfigs {
+			if err := rtDeltesian.setupHeater(hc); err != nil {
+				rtDeltesian.tracef("Warning: failed to setup heater %s: %v\n", hc.name, err)
+			}
+		}
+	}
+
+	return rtDeltesian, nil
 }

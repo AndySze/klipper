@@ -1,0 +1,8 @@
+# Test deltesian kinematics (connect phase only)
+# Note: deltesian check_move has an upstream bug referencing self.max_velocity
+# which doesn't exist, so we only test the connect phase.
+DICTIONARY atmega2560.dict
+CONFIG ../../config/example-deltesian.cfg
+
+# Just verify configuration loads - no motion to avoid triggering bug
+M105

@@ -38,6 +38,9 @@ struct stepper_kinematics *polar_stepper_alloc(char type);
 // kin_rotary_delta.c - rotary delta kinematics
 struct stepper_kinematics *rotary_delta_stepper_alloc(double shoulder_radius
     , double shoulder_height, double angle, double upper_arm, double lower_arm);
+
+// kin_deltesian.c - deltesian kinematics
+struct stepper_kinematics *deltesian_stepper_alloc(double arm2, double arm_x);
 */
 import "C"
 
@@ -603,6 +606,16 @@ func NewRotaryDeltaStepperKinematics(shoulderRadius, shoulderHeight, angle, uppe
 		C.double(angle), C.double(upperArm), C.double(lowerArm))
 	if sk == nil {
 		return nil, fmt.Errorf("rotary_delta_stepper_alloc failed")
+	}
+	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
+// NewDeltesianStepperKinematics creates a deltesian stepper kinematics.
+// arm2 is the arm length squared, arm_x is the X position of the arm pivot.
+func NewDeltesianStepperKinematics(arm2, armX float64) (*StepperKinematics, error) {
+	sk := C.deltesian_stepper_alloc(C.double(arm2), C.double(armX))
+	if sk == nil {
+		return nil, fmt.Errorf("deltesian_stepper_alloc failed")
 	}
 	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
 }
