@@ -31,6 +31,10 @@ struct stepper_kinematics *corexy_stepper_alloc(char type);
 
 // kin_polar.c - polar kinematics
 struct stepper_kinematics *polar_stepper_alloc(char type);
+
+// kin_rotary_delta.c - rotary delta kinematics
+struct stepper_kinematics *rotary_delta_stepper_alloc(double shoulder_radius
+    , double shoulder_height, double angle, double upper_arm, double lower_arm);
 */
 import "C"
 
@@ -570,6 +574,22 @@ func NewPolarStepperKinematics(stepperType byte) (*StepperKinematics, error) {
 	sk := C.polar_stepper_alloc(C.char(stepperType))
 	if sk == nil {
 		return nil, fmt.Errorf("polar_stepper_alloc failed")
+	}
+	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
+// NewRotaryDeltaStepperKinematics creates a rotary delta stepper kinematics.
+// Parameters:
+//   - shoulderRadius: radius from center to shoulder joint
+//   - shoulderHeight: height of shoulder joint
+//   - angle: angle of this arm (in radians)
+//   - upperArm: length of upper arm
+//   - lowerArm: length of lower arm
+func NewRotaryDeltaStepperKinematics(shoulderRadius, shoulderHeight, angle, upperArm, lowerArm float64) (*StepperKinematics, error) {
+	sk := C.rotary_delta_stepper_alloc(C.double(shoulderRadius), C.double(shoulderHeight),
+		C.double(angle), C.double(upperArm), C.double(lowerArm))
+	if sk == nil {
+		return nil, fmt.Errorf("rotary_delta_stepper_alloc failed")
 	}
 	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
 }

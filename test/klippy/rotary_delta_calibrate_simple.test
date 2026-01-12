@@ -1,0 +1,20 @@
+# Test case for basic movement on rotary delta printers
+# Simplified version that tests homing and movement only
+# (full calibration has macOS multiprocessing issues)
+CONFIG rotary_delta_calibrate.cfg
+DICTIONARY atmega2560.dict
+
+# Start by homing the printer.
+G28
+
+# Test basic movements
+G1 X10 Y10 Z10 F3000
+G1 X20 Y0 Z15
+G1 X0 Y20 Z20
+G1 X-10 Y-10 Z25
+G1 X0 Y0 Z30
+
+# Test rapid movement
+G0 X15 Y15 Z5
+G0 X-15 Y-15 Z8
+G0 X0 Y0 Z10

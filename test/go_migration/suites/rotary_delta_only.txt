@@ -1,0 +1,1 @@
+test/klippy/rotary_delta_calibrate_simple.test

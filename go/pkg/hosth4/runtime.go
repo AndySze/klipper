@@ -1876,6 +1876,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		return newPolarRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
 	}
 
+	// For rotary_delta, use separate initialization path
+	isRotaryDelta := kinType == "rotary_delta"
+	if isRotaryDelta {
+		return newRotaryDeltaRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
+	}
+
 	var sx, sy, sz stepperCfg
 	if isDelta {
 		// Delta uses stepper_a, stepper_b, stepper_c
@@ -5771,6 +5777,390 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 			}
 		}
 	}
+
+	return rt, nil
+}
+
+// newRotaryDeltaRuntime creates a runtime for rotary_delta kinematics.
+// Rotary delta uses rotating arms instead of linear rails, with
+// shoulder_radius, shoulder_height, and arm lengths defining the geometry.
+func newRotaryDeltaRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[string]*protocol.MessageFormat, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel float64, queueStepID, setDirID int32) (*runtime, error) {
+	// Read printer section for shoulder geometry
+	printerSec, ok := cfg.section("printer")
+	if !ok {
+		return nil, fmt.Errorf("missing [printer] section")
+	}
+
+	// Get shoulder_radius and shoulder_height from printer section
+	shoulderRadius := 33.9 // Default from rotary_delta_calibrate.cfg
+	if v := printerSec["shoulder_radius"]; v != "" {
+		shoulderRadius, _ = strconv.ParseFloat(v, 64)
+	}
+	shoulderHeight := 412.9 // Default from rotary_delta_calibrate.cfg
+	if v := printerSec["shoulder_height"]; v != "" {
+		shoulderHeight, _ = strconv.ParseFloat(v, 64)
+	}
+
+	// Read stepper configs
+	stepperA, err := readStepperByName(cfg, "stepper_a", 'a')
+	if err != nil {
+		return nil, err
+	}
+	stepperB, err := readStepperByName(cfg, "stepper_b", 'b')
+	if err != nil {
+		return nil, err
+	}
+	stepperC, err := readStepperByName(cfg, "stepper_c", 'c')
+	if err != nil {
+		return nil, err
+	}
+
+	// Read arm lengths and angles from stepper sections (may come from SAVE_CONFIG)
+	secA, _ := cfg.section("stepper_a")
+	upperArmA := 170.0
+	if v := secA["upper_arm_length"]; v != "" {
+		upperArmA, _ = strconv.ParseFloat(v, 64)
+	}
+	lowerArmA := 320.0
+	if v := secA["lower_arm_length"]; v != "" {
+		lowerArmA, _ = strconv.ParseFloat(v, 64)
+	}
+	// lower_arm can also override lower_arm_length (from SAVE_CONFIG)
+	if v := secA["lower_arm"]; v != "" {
+		lowerArmA, _ = strconv.ParseFloat(v, 64)
+	}
+	angleA := 30.0 // degrees
+	if v := secA["angle"]; v != "" {
+		angleA, _ = strconv.ParseFloat(v, 64)
+	}
+
+	secB, _ := cfg.section("stepper_b")
+	upperArmB := 170.0
+	if v := secB["upper_arm_length"]; v != "" {
+		upperArmB, _ = strconv.ParseFloat(v, 64)
+	}
+	lowerArmB := 320.0
+	if v := secB["lower_arm_length"]; v != "" {
+		lowerArmB, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := secB["lower_arm"]; v != "" {
+		lowerArmB, _ = strconv.ParseFloat(v, 64)
+	}
+	angleB := 150.0 // degrees
+	if v := secB["angle"]; v != "" {
+		angleB, _ = strconv.ParseFloat(v, 64)
+	}
+
+	secC, _ := cfg.section("stepper_c")
+	upperArmC := 170.0
+	if v := secC["upper_arm_length"]; v != "" {
+		upperArmC, _ = strconv.ParseFloat(v, 64)
+	}
+	lowerArmC := 320.0
+	if v := secC["lower_arm_length"]; v != "" {
+		lowerArmC, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := secC["lower_arm"]; v != "" {
+		lowerArmC, _ = strconv.ParseFloat(v, 64)
+	}
+	angleC := 270.0 // degrees
+	if v := secC["angle"]; v != "" {
+		angleC, _ = strconv.ParseFloat(v, 64)
+	}
+
+	rails := [3]stepperCfg{stepperA, stepperB, stepperC}
+
+	// Create serial queue output file
+	tmpDir := filepath.Join("out", "go_migration_tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, err
+	}
+	rawPath := filepath.Join(tmpDir, "serial-"+randSuffix()+".bin")
+	f, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	sq, err := chelper.NewSerialQueue(int(f.Fd()), 'f', 0, "serialq mcu")
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	sq.SetClockEst(1e12, chelper.Monotonic(), 0, 0)
+
+	cqMain := chelper.NewCommandQueue()
+	if cqMain == nil {
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc main command queue failed")
+	}
+	cqEnablePins := []*chelper.CommandQueue{}
+
+	reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
+	motion, err := newMotionQueuing(sq, mcuFreq, reservedMoveSlots)
+	if err != nil {
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	numAxes := 3 // X, Y, Z (no extruder in calibration config)
+	th, err := newToolhead(mcuFreq, motion, maxVelocity, maxAccel, numAxes)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	se := newStepperEnable(th)
+
+	// OID layout for rotary_delta_calibrate (same as delta_calibrate):
+	// 0-2: stepper_a (endstop, trsync, step)
+	// 3-5: stepper_b (endstop, trsync, step)
+	// 6-8: stepper_c (endstop, trsync, step)
+	// 9-11: enable pins
+
+	// Convert angles to radians for kinematics
+	angleARad := angleA * math.Pi / 180.0
+	angleBRad := angleB * math.Pi / 180.0
+	angleCRad := angleC * math.Pi / 180.0
+
+	// Calculate step distances considering gear ratio
+	stepDistA := rails[0].rotationDistance / float64(rails[0].fullSteps*rails[0].microsteps)
+	stepDistB := rails[1].rotationDistance / float64(rails[1].fullSteps*rails[1].microsteps)
+	stepDistC := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
+
+	// Create stepper_a with rotary delta kinematics
+	stA, err := newStepper(motion, sq, "stepper_a", 'a', 2, stepDistA, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	// Replace default kinematics with rotary delta
+	if stA.sk != nil {
+		stA.sk.Free()
+	}
+	skA, err := chelper.NewRotaryDeltaStepperKinematics(shoulderRadius, shoulderHeight, angleARad, upperArmA, lowerArmA)
+	if err != nil {
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create rotary delta kinematics for stepper_a: %w", err)
+	}
+	if err := stA.se.SetStepperKinematics(skA); err != nil {
+		skA.Free()
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stA.sk = skA
+	stA.setTrapQ(th.trapq)
+
+	// Create stepper_b with rotary delta kinematics
+	stB, err := newStepper(motion, sq, "stepper_b", 'b', 5, stepDistB, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	if stB.sk != nil {
+		stB.sk.Free()
+	}
+	skB, err := chelper.NewRotaryDeltaStepperKinematics(shoulderRadius, shoulderHeight, angleBRad, upperArmB, lowerArmB)
+	if err != nil {
+		stB.free()
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create rotary delta kinematics for stepper_b: %w", err)
+	}
+	if err := stB.se.SetStepperKinematics(skB); err != nil {
+		skB.Free()
+		stB.free()
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stB.sk = skB
+	stB.setTrapQ(th.trapq)
+
+	// Create stepper_c with rotary delta kinematics
+	stC, err := newStepper(motion, sq, "stepper_c", 'c', 8, stepDistC, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		stB.free()
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	if stC.sk != nil {
+		stC.sk.Free()
+	}
+	skC, err := chelper.NewRotaryDeltaStepperKinematics(shoulderRadius, shoulderHeight, angleCRad, upperArmC, lowerArmC)
+	if err != nil {
+		stC.free()
+		stB.free()
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create rotary delta kinematics for stepper_c: %w", err)
+	}
+	if err := stC.se.SetStepperKinematics(skC); err != nil {
+		skC.Free()
+		stC.free()
+		stB.free()
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stC.sk = skC
+	stC.setTrapQ(th.trapq)
+
+	steppers := [3]*stepper{stA, stB, stC}
+
+	// Create enable pins
+	enA := &stepperEnablePin{out: newDigitalOut(9, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enB := &stepperEnablePin{out: newDigitalOut(10, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enC := &stepperEnablePin{out: newDigitalOut(11, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+
+	motion.registerEnablePin(enA)
+	motion.registerEnablePin(enB)
+	motion.registerEnablePin(enC)
+
+	se.registerStepper("stepper_a", stA, enA)
+	se.registerStepper("stepper_b", stB, enB)
+	se.registerStepper("stepper_c", stC, enC)
+
+	// Create kinematics for bounds checking (use delta style)
+	kinRails := []kinematics.Rail{
+		{
+			Name:            "stepper_a",
+			StepDist:        stepDistA,
+			PositionMin:     0,
+			PositionMax:     rails[0].positionEndstop,
+			HomingSpeed:     rails[0].homingSpeed,
+			PositionEndstop: rails[0].positionEndstop,
+			HomingPositive:  true,
+		},
+		{
+			Name:            "stepper_b",
+			StepDist:        stepDistB,
+			PositionMin:     0,
+			PositionMax:     rails[1].positionEndstop,
+			HomingSpeed:     rails[1].homingSpeed,
+			PositionEndstop: rails[1].positionEndstop,
+			HomingPositive:  true,
+		},
+		{
+			Name:            "stepper_c",
+			StepDist:        stepDistC,
+			PositionMin:     0,
+			PositionMax:     rails[2].positionEndstop,
+			HomingSpeed:     rails[2].homingSpeed,
+			PositionEndstop: rails[2].positionEndstop,
+			HomingPositive:  true,
+		},
+	}
+
+	kinCfg := kinematics.Config{
+		Type:         "delta", // Use delta-style bounds checking
+		Rails:        kinRails,
+		MaxZVelocity: maxZVelocity,
+		MaxZAccel:    maxZAccel,
+	}
+	_, err = kinematics.NewFromConfig(kinCfg)
+	if err != nil {
+		stC.free()
+		stB.free()
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	mcu := &mcu{freq: mcuFreq, clock: 0}
+
+	bm, err := newBedMesh(cfg, th)
+	if err != nil {
+		stC.free()
+		stB.free()
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	motorOffOrder := []string{"stepper_a", "stepper_b", "stepper_c"}
+
+	// G-code arcs resolution
+	mmPerArcSegment, err := readGcodeArcsResolution(cfg)
+	if err != nil {
+		stC.free()
+		stB.free()
+		stA.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	gm := newGCodeMove(th, mmPerArcSegment)
+
+	rt := &runtime{
+		cfg:           cfg,
+		dict:          dict,
+		formats:       formats,
+		mcuFreq:       mcuFreq,
+		queueStepID:   queueStepID,
+		setDirID:      setDirID,
+		sq:            sq,
+		cqMain:        cqMain,
+		cqEnablePins:  cqEnablePins,
+		motion:        motion,
+		toolhead:      th,
+		stepperEnable: se,
+		rails:         rails,
+		steppers:      steppers,
+		gm:            gm,
+		motorOffOrder: motorOffOrder,
+		bedMesh:       bm,
+		mcu:           mcu,
+		rawPath:       rawPath,
+		rawFile:       f,
+	}
+
+	// Initialize heater manager (even without heaters)
+	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
 
 	return rt, nil
 }

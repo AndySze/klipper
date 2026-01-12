@@ -1,9 +1,9 @@
 # Go Migration Test Suite
 #
-# Tests cover cartesian, corexy, corexz, delta, and polar kinematics and are verified
+# Tests cover cartesian, corexy, corexz, delta, polar, rotary_delta kinematics and are verified
 # to pass against Python Klipper golden output.
 #
-# Test count: 30 tests
+# Test count: 31 tests
 # Pass rate: 100%
 
 # === Basic commands and motion ===
@@ -63,3 +63,6 @@ test/klippy/hybrid_corexy_dual_carriage.test
 
 # === Polar kinematics ===
 test/klippy/polar.test
+
+# === Rotary delta kinematics ===
+test/klippy/rotary_delta_calibrate_simple.test

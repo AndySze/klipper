@@ -2702,3 +2702,13 @@ func CompilePolarConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]stri
 	out = append(out, initCmds...)
 	return out, nil
 }
+
+// CompileRotaryDeltaConnectPhase emits the connect-phase MCU commands for
+// rotary_delta_calibrate.cfg (no heaters).
+// Rotary delta has the same OID layout as regular delta calibrate -
+// stepper_a, stepper_b, stepper_c with endstops.
+func CompileRotaryDeltaConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	// Rotary delta calibrate has the same MCU config structure as regular delta calibrate.
+	// The difference is in the kinematics calculation, which happens at runtime.
+	return CompileDeltaCalibrateConnectPhase(cfgPath, dict)
+}

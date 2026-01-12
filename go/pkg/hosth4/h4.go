@@ -42,6 +42,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"corexyuv.cfg":                     true, // CoreXY UV (generic cartesian)
 		"hybrid_corexy_dual_carriage.cfg":  true, // Hybrid CoreXY with dual carriage
 		"example-polar.cfg":                true, // Polar kinematics
+		"rotary_delta_calibrate.cfg":       true, // Rotary delta calibration
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)
@@ -55,9 +56,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		return nil, fmt.Errorf("missing [printer] section")
 	}
 	kin := strings.TrimSpace(printerSec["kinematics"])
-	// Support cartesian, corexy, corexz, delta, generic_cartesian, hybrid_corexy, polar kinematics, and "none" for sensor-only configs
-	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" && kin != "generic_cartesian" && kin != "hybrid_corexy" && kin != "polar" && kin != "none" {
-		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta/generic_cartesian/hybrid_corexy/polar/none kinematics (got %q)", kin)
+	// Support cartesian, corexy, corexz, delta, generic_cartesian, hybrid_corexy, polar, rotary_delta kinematics, and "none" for sensor-only configs
+	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" && kin != "generic_cartesian" && kin != "hybrid_corexy" && kin != "polar" && kin != "rotary_delta" && kin != "none" {
+		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta/generic_cartesian/hybrid_corexy/polar/rotary_delta/none kinematics (got %q)", kin)
 	}
 
 	rt, err := newRuntime(cfgPath, dict, cfg)
@@ -143,6 +144,12 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	} else if kin == "polar" {
 		// Use polar connect-phase compiler
 		initLines, err = hosth1.CompilePolarConnectPhase(cfgPath, dict)
+		if err != nil {
+			return nil, err
+		}
+	} else if kin == "rotary_delta" {
+		// Use rotary delta connect-phase compiler
+		initLines, err = hosth1.CompileRotaryDeltaConnectPhase(cfgPath, dict)
 		if err != nil {
 			return nil, err
 		}
