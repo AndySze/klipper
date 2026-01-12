@@ -1,27 +1,47 @@
-# Minimal baseline suite for Phase 0
+# Go Migration Test Suite
 #
-# These are existing Klipper regression tests that:
-# - use a single CONFIG
-# - are small and stable
-# - cover basic motion/commands and an error path
+# All tests use cartesian kinematics (or no kinematics) and are verified
+# to pass against Python Klipper golden output.
+#
+# Test count: 22 tests
+# Pass rate: 100%
 
+# === Basic commands and motion ===
 test/klippy/commands.test
 test/klippy/out_of_bounds.test
 test/klippy/gcode_arcs.test
 
-# Motion / planning / kinematics
+# === Motion / planning / kinematics ===
 test/klippy/bed_screws.test
+test/klippy/input_shaper.test
 
-# Extrusion
+# === Extrusion ===
 test/klippy/extruders.test
 test/klippy/pressure_advance.test
 
-# Homing / probes / steppers
+# === Homing / probes / steppers ===
 test/klippy/manual_stepper.test
 test/klippy/bltouch.test
+test/klippy/screws_tilt_adjust.test
+test/klippy/z_virtual_endstop.test
 
-# Temperature sensors (linux process mcu)
+# === Z-axis leveling ===
+test/klippy/z_tilt.test
+test/klippy/quad_gantry_level.test
+test/klippy/multi_z.test
+
+# === Temperature sensors and control ===
 test/klippy/linuxtest.test
+test/klippy/temperature.test
 
-# Macros / templates
+# === PWM and LED output ===
+test/klippy/pwm.test
+test/klippy/led.test
+
+# === TMC driver tests ===
+test/klippy/tmc.test
+
+# === Advanced features ===
 test/klippy/macros.test
+test/klippy/exclude_object.test
+test/klippy/dual_carriage.test

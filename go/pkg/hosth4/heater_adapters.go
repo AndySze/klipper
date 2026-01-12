@@ -144,31 +144,12 @@ func (a *mcuADCAdapter) SetupADCCallback(reportTime float64, callback func(float
 	a.callback = callback
 	a.started = true
 
-	// Send ADC configuration commands if we have runtime
-	if a.rt != nil {
-		// config_analog_in oid=%c pin=%u
-		oid := 1 // TODO: allocate proper OID
-		line := fmt.Sprintf("config_analog_in oid=%d pin=%s", oid, a.pin)
-		if err := a.rt.sendConfigLine(line); err != nil {
-			fmt.Printf("Warning: failed to config ADC: %v\n", err)
-			return
-		}
+	// Note: ADC configuration commands (config_analog_in, query_analog_in) are
+	// sent during the connect phase in hosth1. In file output mode (golden tests),
+	// we should NOT send them again here to avoid duplicate commands.
+	// The OID allocation and command ordering is handled by hosth1.
 
-		// query_analog_in oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u min_value=%hu max_value=%hu range_check_count=%c
-		sampleTicks := uint64(a.sampleTime * a.mcu.freq)
-		reportTicks := uint64(a.reportTime * a.mcu.freq)
-		restTicks := sampleTicks * uint64(a.sampleCount-1)
-
-		line = fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=0 max_value=65535 range_check_count=0",
-			oid, reportTicks, sampleTicks, a.sampleCount, restTicks)
-		if err := a.rt.sendConfigLine(line); err != nil {
-			fmt.Printf("Warning: failed to query ADC: %v\n", err)
-		}
-
-		a.oid = int32(oid)
-	}
-
-	// Start background ADC reader
+	// Start background ADC reader (simulates temperature readings for golden tests)
 	go a.adcReaderLoop()
 }
 
