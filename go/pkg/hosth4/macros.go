@@ -318,13 +318,92 @@ func renderMacro(lines []string, ctx *macroEvalContext) ([]string, error) {
 		if !active {
 			continue
 		}
-		// Ignore other { ... } action blocks.
-		if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
+		// Ignore standalone { ... } action blocks.
+		if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") && !strings.Contains(line, "{% ") {
 			continue
 		}
-		out = append(out, line)
+		// Substitute inline {expr} expressions
+		rendered, err := substituteInlineExprs(line, ctx)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rendered)
 	}
 	return out, nil
+}
+
+// substituteInlineExprs replaces {expr} expressions in a line with their values.
+func substituteInlineExprs(line string, ctx *macroEvalContext) (string, error) {
+	result := line
+	for {
+		start := strings.Index(result, "{")
+		if start == -1 {
+			break
+		}
+		// Skip {% ... %} control blocks
+		if start+1 < len(result) && result[start+1] == '%' {
+			break
+		}
+		end := strings.Index(result[start:], "}")
+		if end == -1 {
+			break
+		}
+		end += start
+		expr := result[start+1 : end]
+		value, err := evalInlineExpr(expr, ctx)
+		if err != nil {
+			// If we can't evaluate, skip this expression
+			break
+		}
+		result = result[:start] + value + result[end+1:]
+	}
+	return result, nil
+}
+
+// evalInlineExpr evaluates an inline expression like "params.L|int"
+func evalInlineExpr(expr string, ctx *macroEvalContext) (string, error) {
+	expr = strings.TrimSpace(expr)
+
+	// Handle filter: expr|filter
+	if strings.Contains(expr, "|") {
+		parts := strings.SplitN(expr, "|", 2)
+		baseExpr := strings.TrimSpace(parts[0])
+		filter := strings.TrimSpace(parts[1])
+
+		// Evaluate base expression
+		value, err := evalInlineExpr(baseExpr, ctx)
+		if err != nil {
+			return "", err
+		}
+
+		// Apply filter
+		switch filter {
+		case "int":
+			// Parse as float and convert to int
+			f, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return "", fmt.Errorf("cannot convert %q to int: %w", value, err)
+			}
+			return strconv.Itoa(int(f)), nil
+		case "float":
+			return value, nil
+		default:
+			return "", fmt.Errorf("unknown filter: %q", filter)
+		}
+	}
+
+	// Handle params.X
+	if strings.HasPrefix(expr, "params.") {
+		paramName := strings.TrimPrefix(expr, "params.")
+		value, ok := ctx.params[strings.ToUpper(paramName)]
+		if !ok {
+			return "", fmt.Errorf("undefined parameter: %q", paramName)
+		}
+		return value, nil
+	}
+
+	// Return as-is for now
+	return expr, nil
 }
 
 func evalBoolExpr(expr string, ctx *macroEvalContext) (bool, error) {
@@ -385,6 +464,29 @@ func evalBoolExpr(expr string, ctx *macroEvalContext) (bool, error) {
 			return false, err
 		}
 		return ctx.printer[strings.ToLower(s)], nil
+	}
+
+	// Handle "params.X is not defined"
+	if strings.Contains(expr, " is not defined") {
+		varExpr := strings.TrimSuffix(expr, " is not defined")
+		varExpr = strings.TrimSpace(varExpr)
+		if strings.HasPrefix(varExpr, "params.") {
+			paramName := strings.TrimPrefix(varExpr, "params.")
+			_, exists := ctx.params[strings.ToUpper(paramName)]
+			return !exists, nil
+		}
+		return false, fmt.Errorf("unsupported 'is not defined' expression: %q", varExpr)
+	}
+	// Handle "params.X is defined"
+	if strings.Contains(expr, " is defined") {
+		varExpr := strings.TrimSuffix(expr, " is defined")
+		varExpr = strings.TrimSpace(varExpr)
+		if strings.HasPrefix(varExpr, "params.") {
+			paramName := strings.TrimPrefix(varExpr, "params.")
+			_, exists := ctx.params[strings.ToUpper(paramName)]
+			return exists, nil
+		}
+		return false, fmt.Errorf("unsupported 'is defined' expression: %q", varExpr)
 	}
 
 	if strings.Contains(expr, "!=") {
@@ -533,4 +635,129 @@ func execGCodeWithMacros(rt *runtime, macros *macroEngine, line string, depth in
 		}
 	}
 	return rt.exec(cmd)
+}
+
+// HomingOverride represents parsed [homing_override] configuration
+type HomingOverride struct {
+	Gcode        []string
+	SetPositionX *float64
+	SetPositionY *float64
+	SetPositionZ *float64
+	Axes         string // axes to mark as homed (e.g., "xyz")
+}
+
+// loadHomingOverride parses the [homing_override] section from a config file.
+// It handles multi-line gcode blocks properly (indented continuation lines).
+func loadHomingOverride(cfgPath string) (*HomingOverride, error) {
+	f, err := os.Open(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var ho *HomingOverride
+	inSection := false
+	inGCode := false
+
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		rawLine := s.Text()
+		line := strings.TrimRight(rawLine, "\r\n")
+		trim := strings.TrimSpace(line)
+		if trim == "" {
+			continue
+		}
+		// Strip full-line comments
+		if strings.HasPrefix(trim, "#") {
+			continue
+		}
+
+		// Section header
+		if strings.HasPrefix(trim, "[") {
+			end := strings.IndexByte(trim, ']')
+			if end > 0 {
+				sec := strings.TrimSpace(trim[1:end])
+				if strings.EqualFold(sec, "homing_override") {
+					inSection = true
+					ho = &HomingOverride{}
+					continue
+				}
+			}
+			// Any other section ends homing_override parsing
+			if inSection {
+				break
+			}
+			continue
+		}
+
+		if !inSection {
+			continue
+		}
+
+		// In a gcode: block, accept indented lines
+		if inGCode {
+			if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+				ho.Gcode = append(ho.Gcode, strings.TrimSpace(line))
+				continue
+			}
+			// Non-indented line ends the gcode block
+			inGCode = false
+		}
+
+		// Parse key/value line (strip trailing '#' comment)
+		cfgLine := line
+		if idx := strings.IndexByte(cfgLine, '#'); idx >= 0 {
+			cfgLine = strings.TrimSpace(cfgLine[:idx])
+			if cfgLine == "" {
+				continue
+			}
+		}
+		kv := strings.SplitN(cfgLine, ":", 2)
+		if len(kv) != 2 {
+			kv = strings.SplitN(cfgLine, "=", 2)
+		}
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		val := strings.TrimSpace(kv[1])
+		if key == "" {
+			continue
+		}
+
+		switch strings.ToLower(key) {
+		case "gcode":
+			if val != "" {
+				ho.Gcode = append(ho.Gcode, strings.TrimSpace(val))
+			}
+			inGCode = true
+		case "set_position_x":
+			if val != "" {
+				v, err := strconv.ParseFloat(val, 64)
+				if err == nil {
+					ho.SetPositionX = &v
+				}
+			}
+		case "set_position_y":
+			if val != "" {
+				v, err := strconv.ParseFloat(val, 64)
+				if err == nil {
+					ho.SetPositionY = &v
+				}
+			}
+		case "set_position_z":
+			if val != "" {
+				v, err := strconv.ParseFloat(val, 64)
+				if err == nil {
+					ho.SetPositionZ = &v
+				}
+			}
+		case "axes":
+			ho.Axes = strings.ToLower(val)
+		}
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+	return ho, nil
 }

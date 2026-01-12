@@ -1714,6 +1714,14 @@ type runtime struct {
 	closed  bool
 
 	testStem string
+
+	// Homing override: if set, G28 executes this gcode instead of normal homing
+	homingOverrideGcode []string
+	homingOverridePos   [3]*float64 // set_position_x/y/z (nil if not set)
+	homingOverrideAxes  string      // axes to mark as homed (e.g., "xyz")
+
+	// Virtual SD card with loop support
+	sdcard *VirtualSDCard
 }
 
 type pressureAdvanceState struct {
@@ -2549,6 +2557,23 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		rt.bedScrews = bs
 	}
 
+	// Initialize homing_override if [homing_override] section exists
+	if ho, err := loadHomingOverride(cfgPath); err != nil {
+		return nil, fmt.Errorf("load homing_override: %w", err)
+	} else if ho != nil && len(ho.Gcode) > 0 {
+		rt.homingOverrideGcode = ho.Gcode
+		rt.homingOverrideAxes = ho.Axes
+		if ho.SetPositionX != nil {
+			rt.homingOverridePos[0] = ho.SetPositionX
+		}
+		if ho.SetPositionY != nil {
+			rt.homingOverridePos[1] = ho.SetPositionY
+		}
+		if ho.SetPositionZ != nil {
+			rt.homingOverridePos[2] = ho.SetPositionZ
+		}
+	}
+
 	trX.rt = rt
 	trY.rt = rt
 	trZ.rt = rt
@@ -2874,10 +2899,41 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 	}
 	switch cmd.Name {
 	case "G28":
-		if err := r.homeAll(); err != nil {
-			return err
+		if len(r.homingOverrideGcode) > 0 {
+			// Use homing override instead of normal homing
+			// Build the initial position from set_position_x/y/z
+			newPos := make([]float64, len(r.toolhead.commandedPos))
+			copy(newPos, r.toolhead.commandedPos)
+			for i, p := range r.homingOverridePos {
+				if p != nil {
+					newPos[i] = *p
+				}
+			}
+			// Mark axes as homed and set position
+			if r.toolhead != nil && r.homingOverrideAxes != "" {
+				if err := r.toolhead.setPosition(newPos, r.homingOverrideAxes); err != nil {
+					return err
+				}
+			}
+			// Execute override gcode
+			for _, line := range r.homingOverrideGcode {
+				parsed, err := parseGCodeLine(line)
+				if err != nil {
+					return err
+				}
+				if parsed != nil {
+					if err := r.exec(parsed); err != nil {
+						return err
+					}
+				}
+			}
+			r.gm.resetFromToolhead()
+		} else {
+			if err := r.homeAll(); err != nil {
+				return err
+			}
+			r.gm.resetFromToolhead()
 		}
-		r.gm.resetFromToolhead()
 	case "G92":
 		// Set position without moving.
 		// This is used by macros.test and should not emit MCU traffic.
@@ -3003,6 +3059,22 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 			return fmt.Errorf("screws_tilt_adjust not configured")
 		}
 		if err := r.screwsTiltAdjust.cmdSCREWS_TILT_CALCULATE(cmd.Args); err != nil {
+			return err
+		}
+	case "SDCARD_LOOP_DESIST":
+		if err := r.execSDCardLoopDesist(); err != nil {
+			return err
+		}
+	case "SDCARD_PRINT_FILE":
+		if err := r.execSDCardPrintFile(cmd.Args); err != nil {
+			return err
+		}
+	case "SDCARD_LOOP_BEGIN":
+		if err := r.execSDCardLoopBegin(cmd.Args); err != nil {
+			return err
+		}
+	case "SDCARD_LOOP_END":
+		if err := r.execSDCardLoopEnd(); err != nil {
 			return err
 		}
 	default:

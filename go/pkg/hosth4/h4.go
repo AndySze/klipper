@@ -37,6 +37,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"example-delta.cfg":        true, // Delta kinematics support
 		"delta_calibrate.cfg":      true, // Delta calibration (no heaters)
 		"load_cell.cfg":            true, // Load cell sensors (no kinematics)
+		"sdcard_loop.cfg":          true, // Virtual SD card with looping
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)
@@ -76,6 +77,21 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	macros, err := loadGCodeMacros(cfgPath)
 	if err != nil {
 		return nil, err
+	}
+
+	// Initialize virtual SD card if configured
+	if vsdSec, ok := cfg.section("virtual_sdcard"); ok {
+		sdPath := vsdSec["path"]
+		if sdPath != "" {
+			// Resolve path relative to the project root (3 levels up from config file)
+			// Config is at test/klippy/*.cfg, SD path is like test/klippy/sdcard_loop
+			// Go up: cfg file → klippy dir → test dir → project root
+			if !filepath.IsAbs(sdPath) {
+				projectRoot := filepath.Dir(filepath.Dir(filepath.Dir(cfgPath)))
+				sdPath = filepath.Join(projectRoot, sdPath)
+			}
+			rt.sdcard = newVirtualSDCard(rt, sdPath, macros)
+		}
 	}
 
 	// Connect-phase + init commands.
