@@ -27,7 +27,7 @@ type bedMesh struct {
 	splitter *moveSplitter
 }
 
-func newBedMesh(cfg *config, th *toolhead) (*bedMesh, error) {
+func newBedMesh(cfg *configWrapper, th *toolhead) (*bedMesh, error) {
 	if th == nil {
 		return nil, fmt.Errorf("toolhead not initialized")
 	}

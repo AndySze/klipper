@@ -44,7 +44,7 @@ type bedScrews struct {
 }
 
 // newBedScrews creates a new bed screws adjustment helper
-func newBedScrews(rt *runtime, cfg *config) (*bedScrews, error) {
+func newBedScrews(rt *runtime, cfg *configWrapper) (*bedScrews, error) {
 	bs := &bedScrews{
 		rt:              rt,
 		speed:           50.0,

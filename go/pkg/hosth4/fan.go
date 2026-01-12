@@ -35,7 +35,7 @@ type fanConfig struct {
 }
 
 // newFan creates a new fan instance from configuration.
-func newFan(rt *runtime, cfg *config, sectionName string) (*fan, error) {
+func newFan(rt *runtime, cfg *configWrapper, sectionName string) (*fan, error) {
 	sec, ok := cfg.section(sectionName)
 	if !ok {
 		return nil, nil // not configured
@@ -182,7 +182,7 @@ type heaterFan struct {
 }
 
 // newFanManager creates a fan manager from configuration.
-func newFanManager(rt *runtime, cfg *config) (*fanManager, error) {
+func newFanManager(rt *runtime, cfg *configWrapper) (*fanManager, error) {
 	fm := &fanManager{
 		rt:        rt,
 		namedFans: make(map[string]*fan),

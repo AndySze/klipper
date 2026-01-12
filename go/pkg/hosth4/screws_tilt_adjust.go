@@ -46,7 +46,7 @@ var threadFactors = map[int]float64{
 	6: 1.0, 7: 1.0, // M6
 }
 
-func newScrewsTiltAdjust(rt *runtime, cfg *config) (*screwsTiltAdjust, error) {
+func newScrewsTiltAdjust(rt *runtime, cfg *configWrapper) (*screwsTiltAdjust, error) {
 	sec, ok := cfg.section("screws_tilt_adjust")
 	if !ok {
 		return nil, nil // Not configured

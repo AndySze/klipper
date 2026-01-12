@@ -31,7 +31,7 @@ type zTiltConfig struct {
 }
 
 // newZTilt creates a new z_tilt instance from configuration.
-func newZTilt(rt *runtime, cfg *config) (*zTilt, error) {
+func newZTilt(rt *runtime, cfg *configWrapper) (*zTilt, error) {
 	sec, ok := cfg.section("z_tilt")
 	if !ok {
 		return nil, nil // z_tilt not configured

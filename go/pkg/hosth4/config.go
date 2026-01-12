@@ -1,91 +1,59 @@
 package hosth4
 
 import (
-	"bufio"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
+
+	"klipper-go-migration/pkg/config"
 )
 
-type config struct {
-	sections map[string]map[string]string
+// pin represents a parsed pin specification (local type for hosth4).
+type pin struct {
+	pin    string
+	invert bool
+	pullup int
 }
 
-func loadConfig(path string) (*config, error) {
-	c := &config{sections: map[string]map[string]string{}}
-	abs, err := filepath.Abs(path)
+// =============================================================================
+// Backward Compatibility Layer
+// =============================================================================
+// These types and functions provide backward compatibility with the old config
+// API until all code is migrated to use the new config package directly.
+
+// configWrapper wraps config.Config to provide the old API.
+// This allows gradual migration of code that uses cfg.section() pattern.
+type configWrapper struct {
+	*config.Config
+	sections map[string]map[string]string // cached raw sections for old API
+}
+
+// loadConfig loads a configuration file and returns a configWrapper.
+func loadConfig(path string) (*configWrapper, error) {
+	cfg, err := config.Load(path)
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.Open(abs)
-	if err != nil {
-		return nil, err
+	// Build sections map for backward compatibility
+	sections := make(map[string]map[string]string)
+	for _, sec := range cfg.GetSections() {
+		sections[sec.GetName()] = sec.RawOptions()
 	}
-	defer f.Close()
-	var cur string
-	s := bufio.NewScanner(f)
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if line == "" {
-			continue
-		}
-		if idx := strings.IndexByte(line, '#'); idx >= 0 {
-			line = strings.TrimSpace(line[:idx])
-			if line == "" {
-				continue
-			}
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			cur = strings.TrimSpace(line[1 : len(line)-1])
-			if cur == "" {
-				return nil, fmt.Errorf("empty section header")
-			}
-			if _, ok := c.sections[cur]; !ok {
-				c.sections[cur] = map[string]string{}
-			}
-			continue
-		}
-		if cur == "" {
-			continue
-		}
-		kv := strings.SplitN(line, ":", 2)
-		if len(kv) != 2 {
-			kv = strings.SplitN(line, "=", 2)
-		}
-		if len(kv) != 2 {
-			continue
-		}
-		k := strings.TrimSpace(kv[0])
-		v := strings.TrimSpace(kv[1])
-		if k == "" {
-			continue
-		}
-		c.sections[cur][k] = v
-	}
-	if err := s.Err(); err != nil {
-		return nil, err
-	}
-	return c, nil
+	return &configWrapper{Config: cfg, sections: sections}, nil
 }
 
-func (c *config) section(name string) (map[string]string, bool) {
+// section returns a section as a raw map (old API).
+func (c *configWrapper) section(name string) (map[string]string, bool) {
 	sec, ok := c.sections[name]
 	return sec, ok
 }
 
 // sectionsByPrefix returns all section names that start with the given prefix.
-func (c *config) sectionsByPrefix(prefix string) []string {
-	var result []string
-	for name := range c.sections {
-		if strings.HasPrefix(name, prefix) {
-			result = append(result, name)
-		}
-	}
-	return result
+func (c *configWrapper) sectionsByPrefix(prefix string) []string {
+	return c.GetPrefixSectionNames(prefix)
 }
 
+// parseFloat parses a float from a raw section map (old API).
 func parseFloat(sec map[string]string, key string, def *float64) (float64, error) {
 	raw := strings.TrimSpace(sec[key])
 	if raw == "" {
@@ -101,6 +69,7 @@ func parseFloat(sec map[string]string, key string, def *float64) (float64, error
 	return v, nil
 }
 
+// parseInt parses an integer from a raw section map (old API).
 func parseInt(sec map[string]string, key string, def *int) (int, error) {
 	raw := strings.TrimSpace(sec[key])
 	if raw == "" {
@@ -116,6 +85,7 @@ func parseInt(sec map[string]string, key string, def *int) (int, error) {
 	return v, nil
 }
 
+// parseBool parses a boolean from a raw section map (old API).
 func parseBool(sec map[string]string, key string, def *bool) (bool, error) {
 	raw := strings.TrimSpace(sec[key])
 	if raw == "" {
@@ -134,59 +104,61 @@ func parseBool(sec map[string]string, key string, def *bool) (bool, error) {
 	}
 }
 
-type pin struct {
-	pin    string
-	invert bool
-	pullup int
-}
-
+// parsePinDesc parses a pin description string (old API).
 func parsePinDesc(desc string, canInvert bool, canPullup bool) (pin, error) {
-	d := strings.TrimSpace(desc)
-	p := pin{}
-	if canPullup && (strings.HasPrefix(d, "^") || strings.HasPrefix(d, "~")) {
-		p.pullup = 1
-		if strings.HasPrefix(d, "~") {
-			p.pullup = -1
-		}
-		d = strings.TrimSpace(d[1:])
+	p, err := config.ParsePin(desc, config.PinOptions{CanInvert: canInvert, CanPullup: canPullup})
+	if err != nil {
+		return pin{}, err
 	}
-	if canInvert && strings.HasPrefix(d, "!") {
-		p.invert = true
-		d = strings.TrimSpace(d[1:])
-	}
-	chip := "mcu"
-	if strings.Contains(d, ":") {
-		parts := strings.SplitN(d, ":", 2)
-		chip = strings.TrimSpace(parts[0])
-		if chip != "mcu" && chip != "probe" {
-			return pin{}, fmt.Errorf("unsupported pin chip %q in %q", chip, desc)
-		}
-		d = strings.TrimSpace(parts[1])
-	}
-	if strings.Join(strings.Fields(d), "") != d {
-		return pin{}, fmt.Errorf("invalid pin %q", desc)
-	}
-	if chip == "mcu" {
-		if strings.ContainsAny(d, "^~!:") {
-			return pin{}, fmt.Errorf("invalid pin %q", desc)
-		}
-		p.pin = d
-	} else {
-		// Virtual / non-MCU pin.
-		if d == "" {
-			return pin{}, fmt.Errorf("invalid pin %q", desc)
-		}
-		p.pin = chip + ":" + d
-	}
-	return p, nil
+	return pinFromConfig(p), nil
 }
 
+// parsePin parses a pin from a raw section map (old API).
 func parsePin(sec map[string]string, key string, canInvert bool, canPullup bool) (pin, error) {
 	raw := strings.TrimSpace(sec[key])
 	if raw == "" {
 		return pin{}, fmt.Errorf("missing %s", key)
 	}
 	return parsePinDesc(raw, canInvert, canPullup)
+}
+
+// =============================================================================
+// New API helpers
+// =============================================================================
+
+// pinFromConfig converts a config.Pin to the local pin type.
+func pinFromConfig(p config.Pin) pin {
+	name := p.Name
+	if p.Chip != "" && p.Chip != "mcu" {
+		name = p.Chip + ":" + p.Name
+	}
+	return pin{
+		pin:    name,
+		invert: p.Invert,
+		pullup: p.Pullup,
+	}
+}
+
+// getPin reads a pin from a config section.
+func getPin(sec *config.Section, key string, canInvert, canPullup bool) (pin, error) {
+	p, err := sec.GetPin(key, config.PinOptions{CanInvert: canInvert, CanPullup: canPullup})
+	if err != nil {
+		return pin{}, err
+	}
+	return pinFromConfig(p), nil
+}
+
+// getPinOptional reads an optional pin from a config section.
+func getPinOptional(sec *config.Section, key string, canInvert, canPullup bool) (*pin, error) {
+	p, err := sec.GetPinOptional(key, config.PinOptions{CanInvert: canInvert, CanPullup: canPullup})
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, nil
+	}
+	result := pinFromConfig(*p)
+	return &result, nil
 }
 
 type stepperCfg struct {
@@ -229,94 +201,93 @@ type extruderStepperCfg struct {
 	rotationDistance float64
 }
 
-func readStepper(cfg *config, axis byte) (stepperCfg, error) {
+func readStepper(cfg *configWrapper, axis byte) (stepperCfg, error) {
 	secName := fmt.Sprintf("stepper_%c", axis)
-	sec, ok := cfg.section(secName)
-	if !ok {
+	sec, err := cfg.GetSection(secName)
+	if err != nil {
 		return stepperCfg{}, fmt.Errorf("missing [%s] section", secName)
 	}
-	stepPin, err := parsePin(sec, "step_pin", true, false)
+
+	stepPin, err := getPin(sec, "step_pin", true, false)
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
-	dirPin, err := parsePin(sec, "dir_pin", true, false)
+	dirPin, err := getPin(sec, "dir_pin", true, false)
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
-	enablePin, err := parsePin(sec, "enable_pin", true, false)
+	enablePin, err := getPin(sec, "enable_pin", true, false)
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
-	endstopPin, err := parsePin(sec, "endstop_pin", true, true)
+	endstopPin, err := getPin(sec, "endstop_pin", true, true)
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
-	}
-	microsteps, err := parseInt(sec, "microsteps", nil)
-	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
-	}
-	defFull := 200
-	fullSteps, err := parseInt(sec, "full_steps_per_rotation", &defFull)
-	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
-	}
-	rotationDistance, err := parseFloat(sec, "rotation_distance", nil)
-	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
 
-	defPosMin := 0.0
-	positionMin, err := parseFloat(sec, "position_min", &defPosMin)
+	microsteps, err := sec.GetInt("microsteps")
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
-	positionMax, err := parseFloat(sec, "position_max", nil)
+	fullSteps, err := sec.GetInt("full_steps_per_rotation", 200)
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
+	rotationDistance, err := sec.GetFloat("rotation_distance")
+	if err != nil {
+		return stepperCfg{}, err
+	}
+
+	positionMin, err := sec.GetFloat("position_min", 0.0)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+	positionMax, err := sec.GetFloat("position_max")
+	if err != nil {
+		return stepperCfg{}, err
+	}
+
+	// position_endstop: optional for probe-based Z endstop
 	var positionEndstop float64
-	rawEndstop := strings.TrimSpace(sec["position_endstop"])
-	if rawEndstop == "" {
+	if sec.HasOption("position_endstop") {
+		positionEndstop, err = sec.GetFloat("position_endstop")
+		if err != nil {
+			return stepperCfg{}, err
+		}
+	} else {
 		// Some configs (e.g., probe-based Z endstop) do not specify position_endstop
 		// on the stepper. Klippy derives it from the probe object (z_offset).
 		if strings.HasPrefix(strings.ToLower(endstopPin.pin), "probe:") {
-			positionEndstop = defPosMin
+			positionEndstop = positionMin
 		} else {
-			return stepperCfg{}, fmt.Errorf("[%s] missing position_endstop", secName)
-		}
-	} else {
-		positionEndstop, err = parseFloat(sec, "position_endstop", nil)
-		if err != nil {
-			return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+			return stepperCfg{}, config.ErrMissingOption(secName, "position_endstop")
 		}
 	}
 
-	defHomingSpeed := 5.0
-	homingSpeed, err := parseFloat(sec, "homing_speed", &defHomingSpeed)
+	homingSpeed, err := sec.GetFloat("homing_speed", 5.0)
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
-	defSecond := homingSpeed / 2.0
-	secondHomingSpeed, err := parseFloat(sec, "second_homing_speed", &defSecond)
+	secondHomingSpeed, err := sec.GetFloat("second_homing_speed", homingSpeed/2.0)
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
-	homingRetractSpeed, err := parseFloat(sec, "homing_retract_speed", &homingSpeed)
+	homingRetractSpeed, err := sec.GetFloat("homing_retract_speed", homingSpeed)
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
-	defRetractDist := 5.0
-	homingRetractDist, err := parseFloat(sec, "homing_retract_dist", &defRetractDist)
+	homingRetractDist, err := sec.GetFloat("homing_retract_dist", 5.0)
 	if err != nil {
-		return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return stepperCfg{}, err
 	}
-	hpRaw := strings.TrimSpace(sec["homing_positive_dir"])
+
+	// homing_positive_dir: optional, can be inferred from position_endstop
 	homingPositiveKnown := false
 	homingPositiveDir := false
-	if hpRaw != "" {
-		v, err := parseBool(sec, "homing_positive_dir", nil)
+	if sec.HasOption("homing_positive_dir") {
+		v, err := sec.GetBool("homing_positive_dir")
 		if err != nil {
-			return stepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+			return stepperCfg{}, err
 		}
 		homingPositiveKnown = true
 		homingPositiveDir = v
@@ -330,7 +301,7 @@ func readStepper(cfg *config, axis byte) (stepperCfg, error) {
 			homingPositiveDir = true
 		}
 		if !homingPositiveKnown {
-			return stepperCfg{}, fmt.Errorf("[%s] unable to infer homing_positive_dir", secName)
+			return stepperCfg{}, config.NewConfigError(secName, "", "unable to infer homing_positive_dir")
 		}
 	}
 
@@ -356,37 +327,39 @@ func readStepper(cfg *config, axis byte) (stepperCfg, error) {
 	}, nil
 }
 
-func readExtruderStepper(cfg *config) (extruderStepperCfg, error) {
+func readExtruderStepper(cfg *configWrapper) (extruderStepperCfg, error) {
 	secName := "extruder"
-	sec, ok := cfg.section(secName)
-	if !ok {
+	sec, err := cfg.GetSection(secName)
+	if err != nil {
 		return extruderStepperCfg{}, fmt.Errorf("missing [%s] section", secName)
 	}
-	stepPin, err := parsePin(sec, "step_pin", true, false)
+
+	stepPin, err := getPin(sec, "step_pin", true, false)
 	if err != nil {
-		return extruderStepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, err
 	}
-	dirPin, err := parsePin(sec, "dir_pin", true, false)
+	dirPin, err := getPin(sec, "dir_pin", true, false)
 	if err != nil {
-		return extruderStepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, err
 	}
-	enablePin, err := parsePin(sec, "enable_pin", true, false)
+	enablePin, err := getPin(sec, "enable_pin", true, false)
 	if err != nil {
-		return extruderStepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, err
 	}
-	microsteps, err := parseInt(sec, "microsteps", nil)
+
+	microsteps, err := sec.GetInt("microsteps")
 	if err != nil {
-		return extruderStepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, err
 	}
-	defFull := 200
-	fullSteps, err := parseInt(sec, "full_steps_per_rotation", &defFull)
+	fullSteps, err := sec.GetInt("full_steps_per_rotation", 200)
 	if err != nil {
-		return extruderStepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, err
 	}
-	rotationDistance, err := parseFloat(sec, "rotation_distance", nil)
+	rotationDistance, err := sec.GetFloat("rotation_distance")
 	if err != nil {
-		return extruderStepperCfg{}, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, err
 	}
+
 	return extruderStepperCfg{
 		name:             secName,
 		extruderName:     "",
@@ -400,40 +373,40 @@ func readExtruderStepper(cfg *config) (extruderStepperCfg, error) {
 }
 
 // readExtruderStepperOptional reads an extruder_stepper section if it exists
-func readExtruderStepperOptional(cfg *config, secName string) (extruderStepperCfg, bool, error) {
-	sec, ok := cfg.section(secName)
-	if !ok {
+func readExtruderStepperOptional(cfg *configWrapper, secName string) (extruderStepperCfg, bool, error) {
+	sec := cfg.GetSectionOptional(secName)
+	if sec == nil {
 		return extruderStepperCfg{}, false, nil
 	}
-	extruderName := strings.TrimSpace(sec["extruder"])
-	if extruderName == "" {
-		extruderName = "extruder"
-	}
-	stepPin, err := parsePin(sec, "step_pin", true, false)
+
+	extruderName, _ := sec.Get("extruder", "extruder")
+
+	stepPin, err := getPin(sec, "step_pin", true, false)
 	if err != nil {
-		return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, false, err
 	}
-	dirPin, err := parsePin(sec, "dir_pin", true, false)
+	dirPin, err := getPin(sec, "dir_pin", true, false)
 	if err != nil {
-		return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, false, err
 	}
-	enablePin, err := parsePin(sec, "enable_pin", true, false)
+	enablePin, err := getPin(sec, "enable_pin", true, false)
 	if err != nil {
-		return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, false, err
 	}
-	microsteps, err := parseInt(sec, "microsteps", nil)
+
+	microsteps, err := sec.GetInt("microsteps")
 	if err != nil {
-		return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, false, err
 	}
-	defFull := 200
-	fullSteps, err := parseInt(sec, "full_steps_per_rotation", &defFull)
+	fullSteps, err := sec.GetInt("full_steps_per_rotation", 200)
 	if err != nil {
-		return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, false, err
 	}
-	rotationDistance, err := parseFloat(sec, "rotation_distance", nil)
+	rotationDistance, err := sec.GetFloat("rotation_distance")
 	if err != nil {
-		return extruderStepperCfg{}, false, fmt.Errorf("[%s] %v", secName, err)
+		return extruderStepperCfg{}, false, err
 	}
+
 	return extruderStepperCfg{
 		name:             secName,
 		extruderName:     extruderName,
@@ -446,54 +419,112 @@ func readExtruderStepperOptional(cfg *config, secName string) (extruderStepperCf
 	}, true, nil
 }
 
-func readGcodeArcsResolution(cfg *config) (float64, error) {
-	sec, ok := cfg.section("gcode_arcs")
-	if !ok {
+func readGcodeArcsResolution(cfg *configWrapper) (float64, error) {
+	sec := cfg.GetSectionOptional("gcode_arcs")
+	if sec == nil {
 		return 1.0, nil
 	}
-	def := 1.0
-	return parseFloat(sec, "resolution", &def)
+	return sec.GetFloat("resolution", 1.0)
 }
 
 // readHeaterConfigs reads all heater configurations from the config file
-func readHeaterConfigs(cfg *config) ([]*heaterConfig, error) {
+func readHeaterConfigs(cfg *configWrapper) ([]*heaterConfig, error) {
 	var heaters []*heaterConfig
 
 	// Check for [extruder] section
-	if sec, ok := cfg.section("extruder"); ok {
+	if sec := cfg.GetSectionOptional("extruder"); sec != nil {
 		// Only create heater if heater_pin is present
-		if _, hasHeater := sec["heater_pin"]; hasHeater {
-			hc, err := parseHeaterConfig("extruder", sec)
+		if sec.HasOption("heater_pin") {
+			hc, err := parseHeaterConfigFromSection("extruder", sec)
 			if err != nil {
-				return nil, fmt.Errorf("[extruder] %v", err)
+				return nil, err
 			}
 			heaters = append(heaters, hc)
 		}
 	}
 
 	// Check for [heater_bed] section
-	if sec, ok := cfg.section("heater_bed"); ok {
-		hc, err := parseHeaterConfig("heater_bed", sec)
+	if sec := cfg.GetSectionOptional("heater_bed"); sec != nil {
+		hc, err := parseHeaterConfigFromSection("heater_bed", sec)
 		if err != nil {
-			return nil, fmt.Errorf("[heater_bed] %v", err)
+			return nil, err
 		}
 		heaters = append(heaters, hc)
 	}
 
 	// Check for [heater_generic] sections
-	for secName := range cfg.sections {
-		if strings.HasPrefix(secName, "heater_generic ") {
-			sec, ok := cfg.section(secName)
-			if !ok {
-				continue
-			}
-			hc, err := parseHeaterConfig(secName, sec)
-			if err != nil {
-				return nil, fmt.Errorf("[%s] %v", secName, err)
-			}
-			heaters = append(heaters, hc)
+	for _, sec := range cfg.GetPrefixSections("heater_generic ") {
+		hc, err := parseHeaterConfigFromSection(sec.GetName(), sec)
+		if err != nil {
+			return nil, err
 		}
+		heaters = append(heaters, hc)
 	}
 
 	return heaters, nil
+}
+
+// parseHeaterConfigFromSection extracts heater configuration from a config.Section.
+// This is the new version that uses the config package.
+func parseHeaterConfigFromSection(name string, sec *config.Section) (*heaterConfig, error) {
+	cfg := &heaterConfig{
+		name:           name,
+		control:        "pid",
+		minTemp:        0.0,
+		maxTemp:        250.0,
+		maxPower:       1.0,
+		smoothTime:     1.0,
+		pwmCycleTime:   0.1,
+		minExtrudeTemp: 170.0,
+		maxDelta:       2.0,
+	}
+
+	// Parse required fields
+	heaterPin, err := sec.Get("heater_pin")
+	if err != nil {
+		return nil, err
+	}
+	cfg.heaterPin = heaterPin
+
+	sensorType, err := sec.Get("sensor_type")
+	if err != nil {
+		return nil, err
+	}
+	cfg.sensorType = sensorType
+
+	sensorPin, err := sec.Get("sensor_pin")
+	if err != nil {
+		return nil, err
+	}
+	cfg.sensorPin = sensorPin
+
+	// Parse optional fields
+	cfg.control, _ = sec.Get("control", "pid")
+	cfg.minTemp, _ = sec.GetFloat("min_temp", 0.0)
+	cfg.maxTemp, _ = sec.GetFloat("max_temp", 250.0)
+
+	// PID parameters
+	if cfg.control == "pid" {
+		cfg.pidKp, err = sec.GetFloat("pid_kp")
+		if err != nil {
+			return nil, config.NewConfigError(name, "pid_kp", "pid control requires pid_kp")
+		}
+		cfg.pidKi, err = sec.GetFloat("pid_ki")
+		if err != nil {
+			return nil, config.NewConfigError(name, "pid_ki", "pid control requires pid_ki")
+		}
+		cfg.pidKd, err = sec.GetFloat("pid_kd")
+		if err != nil {
+			return nil, config.NewConfigError(name, "pid_kd", "pid control requires pid_kd")
+		}
+	}
+
+	// Additional optional parameters
+	cfg.maxPower, _ = sec.GetFloat("max_power", 1.0)
+	cfg.smoothTime, _ = sec.GetFloat("smooth_time", 1.0)
+	cfg.pwmCycleTime, _ = sec.GetFloat("pwm_cycle_time", 0.1)
+	cfg.minExtrudeTemp, _ = sec.GetFloat("min_extrude_temp", 170.0)
+	cfg.maxDelta, _ = sec.GetFloat("max_delta", 2.0)
+
+	return cfg, nil
 }

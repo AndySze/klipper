@@ -48,7 +48,7 @@ type Probe struct {
 }
 
 // newProbe creates a new probe from configuration.
-func newProbe(rt *runtime, cfg *config) (*Probe, error) {
+func newProbe(rt *runtime, cfg *configWrapper) (*Probe, error) {
 	sec, ok := cfg.section("probe")
 	if !ok {
 		// Try bltouch section

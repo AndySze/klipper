@@ -32,7 +32,7 @@ type led struct {
 }
 
 // newLED creates a new LED instance from configuration.
-func newLED(rt *runtime, cfg *config, sectionName string) (*led, error) {
+func newLED(rt *runtime, cfg *configWrapper, sectionName string) (*led, error) {
 	sec, ok := cfg.section(sectionName)
 	if !ok {
 		return nil, nil
@@ -179,7 +179,7 @@ type ledManager struct {
 }
 
 // newLEDManager creates a LED manager from configuration.
-func newLEDManager(rt *runtime, cfg *config) (*ledManager, error) {
+func newLEDManager(rt *runtime, cfg *configWrapper) (*ledManager, error) {
 	lm := &ledManager{
 		rt:   rt,
 		leds: make(map[string]*led),

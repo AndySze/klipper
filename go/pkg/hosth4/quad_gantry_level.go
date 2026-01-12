@@ -22,7 +22,7 @@ type quadGantryLevel struct {
 }
 
 // newQuadGantryLevel creates a new quad_gantry_level instance from configuration.
-func newQuadGantryLevel(rt *runtime, cfg *config) (*quadGantryLevel, error) {
+func newQuadGantryLevel(rt *runtime, cfg *configWrapper) (*quadGantryLevel, error) {
 	sec, ok := cfg.section("quad_gantry_level")
 	if !ok {
 		return nil, nil // not configured

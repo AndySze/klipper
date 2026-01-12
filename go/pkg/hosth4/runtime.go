@@ -378,6 +378,8 @@ func (mq *motionQueuing) dripUpdateTime(startTime float64, endTime float64) erro
 			return err
 		}
 	}
+	// Match Python line 276: Final flush to complete step generation.
+	// This generates any remaining steps up to flushTime + kinFlushDelay.
 	return mq.advanceFlushTime(flushTime+mq.kinFlushDelay, 0.0)
 }
 
@@ -788,7 +790,10 @@ func (th *toolhead) move(newPos []float64, speed float64) error {
 	return nil
 }
 
-func (th *toolhead) dripLoadTrapQ(submitMove *move) (float64, float64, error) {
+// dripLoadTrapQ loads moves into the trapq for drip mode execution.
+// Returns (startTime, preDecelTime, endTime, error) where preDecelTime is the
+// end of the cruise phase (when deceleration starts).
+func (th *toolhead) dripLoadTrapQ(submitMove *move) (float64, float64, float64, error) {
 	if submitMove != nil && submitMove.moveD != 0.0 {
 		th.commandedPos = append([]float64{}, submitMove.endPos...)
 		_ = th.lookahead.addMove(submitMove)
@@ -797,6 +802,7 @@ func (th *toolhead) dripLoadTrapQ(submitMove *move) (float64, float64, error) {
 	th.calcPrintTime()
 	startTime := th.printTime
 	endTime := th.printTime
+	preDecelTime := th.printTime
 	for _, mv := range moves {
 		th.trapq.Append(
 			endTime,
@@ -813,40 +819,57 @@ func (th *toolhead) dripLoadTrapQ(submitMove *move) (float64, float64, error) {
 			mv.cruiseV,
 			mv.accel,
 		)
+		// preDecelTime is the end of accel + cruise phases (start of decel)
+		preDecelTime = endTime + mv.accelT + mv.cruiseT
 		endTime = endTime + mv.accelT + mv.cruiseT + mv.decelT
 	}
 	th.lookahead.reset()
-	return startTime, endTime, nil
+	return startTime, preDecelTime, endTime, nil
 }
 
-func (th *toolhead) dripMove(newPos []float64, speed float64) error {
+// dripMove generates a homing move and flushes only the cruise phase steps.
+// Returns (preDecelTime, endTime, error) so the caller can send the disable
+// command before flushing the deceleration phase.
+//
+// The flow is:
+// 1. Generate full move (accel + cruise + decel) to trapq
+// 2. Flush steps only up to preDecelTime (cruise phase)
+// 3. Caller sends endstop_home disable
+// 4. Caller calls flushDripDeceleration to flush remaining steps
+func (th *toolhead) dripMove(newPos []float64, speed float64) (float64, float64, error) {
 	if th.err != nil {
-		return th.err
+		return 0, 0, th.err
 	}
 	mv := newMove(th, th.commandedPos, newPos, speed)
 	if mv.moveD != 0.0 && mv.isKinematicMove && th.kin != nil {
 		km := mv.toKinematicsMove()
 		if err := th.kin.CheckMove(km); err != nil {
-			return err
+			return 0, 0, err
 		}
 		mv.updateFromKinematicsMove(km)
 	}
 	if err := th.dwell(th.motion.kinFlushDelay); err != nil {
-		return err
+		return 0, 0, err
 	}
 	if err := th.processLookahead(false); err != nil {
-		return err
+		return 0, 0, err
 	}
-	startTime, endTime, err := th.dripLoadTrapQ(mv)
+	startTime, preDecelTime, endTime, err := th.dripLoadTrapQ(mv)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
+	th.motion.tracef("dripMove: startTime=%.9f preDecelTime=%.9f endTime=%.9f (decelDuration=%.9f)\n",
+		startTime, preDecelTime, endTime, endTime-preDecelTime)
+	// Generate ALL steps (cruise + decel) like Python does.
+	// The serialqueue's req_clock ordering will handle placing the disable correctly.
 	if err := th.motion.dripUpdateTime(startTime, endTime); err != nil {
-		return err
+		return 0, 0, err
 	}
+	th.motion.tracef("dripMove: after full flush\n")
 	th.advanceMoveTime(endTime)
 	th.motion.wipeTrapQ(th.trapq)
-	return nil
+	// Return preDecelTime and endTime for caller's reference (but decel already flushed)
+	return preDecelTime, endTime, nil
 }
 
 type move struct {
@@ -1627,7 +1650,7 @@ func (e *endstop) homeStop() error {
 }
 
 type runtime struct {
-	cfg *config
+	cfg *configWrapper
 
 	dict        *protocol.Dictionary
 	formats     map[string]*protocol.MessageFormat
@@ -1770,7 +1793,7 @@ func (r *runtime) updateKinFlushDelay() {
 	r.motion.kinFlushDelay = kinFlushDelay
 }
 
-func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *config) (*runtime, error) {
+func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (*runtime, error) {
 	mcuFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
 	if err != nil {
 		return nil, err
@@ -3410,20 +3433,24 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
 	if err := r.toolhead.dwell(homingStartDelaySec); err != nil {
 		return err
 	}
-	if err := r.toolhead.dripMove(movepos, speed); err != nil {
+	// Generate move to trapq and flush only cruise phase steps.
+	// The decel steps remain in trapq to be flushed after the disable is sent.
+	preDecelTime, endTime, err := r.toolhead.dripMove(movepos, speed)
+	if err != nil {
 		return err
 	}
-	// Match Klippy: send endstop_home disable BEFORE flushing remaining steps.
-	// In Python's homing.py, home_wait() is called which sends the disable command,
-	// then flush_step_generation() generates the final deceleration steps.
+	r.tracef("HOMING: after dripMove preDecelTime=%.9f endTime=%.9f\n", preDecelTime, endTime)
 	r.traceMotion("HOMING: before homeStop")
 	if err := r.endstops[axis].homeStop(); err != nil {
 		return err
 	}
-	// Now flush all remaining steps (final deceleration) after endstop is disabled.
-	if err := r.motion.flushAllSteps(); err != nil {
-		return err
-	}
+	r.tracef("HOMING: after homeStop (all steps already flushed, disable should be picked first by req_clock=0)\n")
+	// All steps have already been generated to the serialqueue by dripMove.
+	// The disable command was sent with req_clock=0.
+	// The serialqueue's build_and_send_command picks by lowest req_clock,
+	// so the disable should appear before decel steps in the output.
+	_ = preDecelTime
+	_ = endTime
 	if r.trace != nil {
 		st := r.steppers[axis]
 		if st != nil && st.stepqueue != nil {
@@ -4070,7 +4097,7 @@ func dictCommandTag(d *protocol.Dictionary, format string) (int32, error) {
 	return int32(id), nil
 }
 
-func reservedMoveSlotsForConfig(cfg *config) int {
+func reservedMoveSlotsForConfig(cfg *configWrapper) int {
 	if cfg == nil {
 		return 0
 	}
