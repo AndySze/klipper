@@ -17,13 +17,13 @@ type CompileOptions struct {
 }
 
 // CompileHostH4 executes the H4 host runtime and returns the raw debugoutput
-// msg stream. H4 focuses on cartesian kinematics (G28 homing + bounds checks).
+// msg stream. H4 supports cartesian, corexy, corexz, and delta kinematics.
 //
 // On "expected failure" tests, callers may need to accept a non-nil error while
 // still using any produced output (not implemented yet).
 func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, opts *CompileOptions) ([]byte, error) {
 	base := filepath.Base(cfgPath)
-	// Support known cartesian kinematics test configs
+	// Support known kinematics test configs
 	allowedConfigs := map[string]bool{
 		"example-cartesian.cfg":    true,
 		"gcode_arcs.cfg":           true,
@@ -34,9 +34,10 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"macros.cfg":               true,
 		"bltouch.cfg":              true,
 		"screws_tilt_adjust.cfg":   true,
+		"example-delta.cfg":        true, // Delta kinematics support
 	}
 	if !allowedConfigs[base] {
-		return nil, fmt.Errorf("host-h4: unsupported config %s (only cartesian configs supported)", base)
+		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)
 	}
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
@@ -47,9 +48,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		return nil, fmt.Errorf("missing [printer] section")
 	}
 	kin := strings.TrimSpace(printerSec["kinematics"])
-	// Support cartesian, corexy, and corexz kinematics
-	if kin != "cartesian" && kin != "corexy" && kin != "corexz" {
-		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz kinematics (got %q)", kin)
+	// Support cartesian, corexy, corexz, and delta kinematics
+	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" {
+		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta kinematics (got %q)", kin)
 	}
 
 	rt, err := newRuntime(cfgPath, dict, cfg)
@@ -84,6 +85,12 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	var initLines []string
 	if base == "bltouch.cfg" || base == "screws_tilt_adjust.cfg" {
 		initLines, err = hosth1.CompileBLTouchConnectPhase(cfgPath, dict)
+		if err != nil {
+			return nil, err
+		}
+	} else if kin == "delta" {
+		// Use delta-specific connect-phase compiler
+		initLines, err = hosth1.CompileDeltaConnectPhase(cfgPath, dict)
 		if err != nil {
 			return nil, err
 		}

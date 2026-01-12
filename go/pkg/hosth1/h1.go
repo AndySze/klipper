@@ -1470,3 +1470,146 @@ func bytesToLowerHex(b []byte) string {
 	}
 	return string(out)
 }
+
+// CompileDeltaConnectPhase compiles the connect-phase MCU command stream for
+// delta kinematics configurations (e.g., config/example-delta.cfg).
+//
+// Delta printers use stepper_a/b/c instead of stepper_x/y/z.
+func CompileDeltaConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+	if err != nil {
+		return nil, err
+	}
+	adcMax, err := dictConfigFloat(dict, "ADC_MAX")
+	if err != nil {
+		return nil, err
+	}
+	mcuFreq := clockFreq
+
+	// Extract required pins - delta uses stepper_a/b/c
+	stepperA, err := readStepper(cfg, "stepper_a")
+	if err != nil {
+		return nil, err
+	}
+	stepperB, err := readStepper(cfg, "stepper_b")
+	if err != nil {
+		return nil, err
+	}
+	stepperC, err := readStepper(cfg, "stepper_c")
+	if err != nil {
+		return nil, err
+	}
+	extruder, err := readExtruder(cfg, "extruder")
+	if err != nil {
+		return nil, err
+	}
+	bed, err := readHeater(cfg, "heater_bed")
+	if err != nil {
+		return nil, err
+	}
+
+	// Allocate OIDs matching Python's order for delta config.
+	o := oids{
+		endstopX: 0, trsyncX: 1, stepperX: 2,
+		endstopY: 3, trsyncY: 4, stepperY: 5,
+		endstopZ: 6, trsyncZ: 7, stepperZ: 8,
+		stepperE: 9,
+		adcBed:   10, pwmBed: 11,
+		enableX: 12, enableY: 13, enableZ: 14,
+		adcE: 15, pwmE: 16, enableE: 17,
+		count: 18,
+	}
+
+	// Derived constants (match klippy defaults).
+	const (
+		pwmCycleTime     = 0.100
+		heaterMaxHeatSec = 3.0
+		stepPulseSec     = 0.000002
+		adcSampleTime    = 0.001
+		adcSampleCount   = 8
+		adcReportTime    = 0.300
+		adcRangeChecks   = 4
+		pwmInitDelaySec  = 0.200
+	)
+	cycleTicks := secondsToClock(mcuFreq, pwmCycleTime)
+	mdurTicks := secondsToClock(mcuFreq, heaterMaxHeatSec)
+	stepPulseTicks := secondsToClock(mcuFreq, stepPulseSec)
+	sampleTicks := secondsToClock(mcuFreq, adcSampleTime)
+	reportTicks := secondsToClock(mcuFreq, adcReportTime)
+	pwmInitClock := secondsToClock(mcuFreq, pwmInitDelaySec)
+
+	// ADC min/max for thermistors.
+	bedMin, bedMax, err := thermistorMinMaxTicks(bed, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+	extMin, extMax, err := thermistorMinMaxTicks(extruder.Heater, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build config commands in the same order as the Python reference for delta.
+	// Note: The OID naming follows cartesian convention internally (stepperX = stepper_a, etc.)
+	configCmds := []string{
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", o.adcBed, bed.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.pwmBed, bed.HeaterPin.pin, 0, 0, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmBed, cycleTicks),
+
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopX, stepperA.Endstop.pin, stepperA.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", o.trsyncX),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperX, stepperA.Step.pin, stepperA.Dir.pin, boolToInt(stepperA.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableX, stepperA.Enable.pin, boolToInt(stepperA.Enable.invert), boolToInt(stepperA.Enable.invert), 0),
+
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopY, stepperB.Endstop.pin, stepperB.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", o.trsyncY),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperY, stepperB.Step.pin, stepperB.Dir.pin, boolToInt(stepperB.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableY, stepperB.Enable.pin, boolToInt(stepperB.Enable.invert), boolToInt(stepperB.Enable.invert), 0),
+
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopZ, stepperC.Endstop.pin, stepperC.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", o.trsyncZ),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperZ, stepperC.Step.pin, stepperC.Dir.pin, boolToInt(stepperC.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableZ, stepperC.Enable.pin, boolToInt(stepperC.Enable.invert), boolToInt(stepperC.Enable.invert), 0),
+
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", o.adcE, extruder.Heater.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.pwmE, extruder.Heater.HeaterPin.pin, 0, 0, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmE, cycleTicks),
+
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperE, extruder.Step.pin, extruder.Dir.pin, boolToInt(extruder.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableE, extruder.Enable.pin, boolToInt(extruder.Enable.invert), boolToInt(extruder.Enable.invert), 0),
+	}
+
+	// Prepend allocate_oids and compute finalize_config CRC over config_cmds.
+	withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", o.count)}, configCmds...)
+	crcText := strings.Join(withAllocate, "\n")
+	crc := crc32.ChecksumIEEE([]byte(crcText))
+
+	// Build init commands (same order as the Python reference for this config).
+	initCmds := []string{
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			o.adcBed, querySlotClock(mcuFreq, o.adcBed), sampleTicks, adcSampleCount, reportTicks, bedMin, bedMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmBed, pwmInitClock, 0),
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			o.adcE, querySlotClock(mcuFreq, o.adcE), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmE, pwmInitClock, 0),
+	}
+
+	out := make([]string, 0, 1+len(configCmds)+1+len(initCmds))
+	out = append(out, withAllocate...)
+	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+	out = append(out, initCmds...)
+	return out, nil
+}

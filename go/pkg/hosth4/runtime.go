@@ -1832,17 +1832,39 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		return nil, err
 	}
 
-	sx, err := readStepper(cfg, 'x')
-	if err != nil {
-		return nil, err
-	}
-	sy, err := readStepper(cfg, 'y')
-	if err != nil {
-		return nil, err
-	}
-	sz, err := readStepper(cfg, 'z')
-	if err != nil {
-		return nil, err
+	// Determine kinematics type to select correct stepper names
+	kinType := strings.TrimSpace(printerSec["kinematics"])
+	isDelta := kinType == "delta"
+
+	var sx, sy, sz stepperCfg
+	if isDelta {
+		// Delta uses stepper_a, stepper_b, stepper_c
+		sx, err = readStepperByName(cfg, "stepper_a", 'a')
+		if err != nil {
+			return nil, err
+		}
+		sy, err = readStepperByName(cfg, "stepper_b", 'b')
+		if err != nil {
+			return nil, err
+		}
+		sz, err = readStepperByName(cfg, "stepper_c", 'c')
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Cartesian/CoreXY/CoreXZ use stepper_x, stepper_y, stepper_z
+		sx, err = readStepper(cfg, 'x')
+		if err != nil {
+			return nil, err
+		}
+		sy, err = readStepper(cfg, 'y')
+		if err != nil {
+			return nil, err
+		}
+		sz, err = readStepper(cfg, 'z')
+		if err != nil {
+			return nil, err
+		}
 	}
 	rails := [3]stepperCfg{sx, sy, sz}
 	if sec, ok := cfg.section("bltouch"); ok {
@@ -1992,7 +2014,18 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	stepDistY := rails[1].rotationDistance / float64(rails[1].fullSteps*rails[1].microsteps)
 	stepDistZ := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
 
-	stX, err := newStepper(motion, sq, "stepper_x", 'x', oidStepperX, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	// Stepper names depend on kinematics type
+	var stepperNames [3]string
+	var stepperAxes [3]byte
+	if isDelta {
+		stepperNames = [3]string{"stepper_a", "stepper_b", "stepper_c"}
+		stepperAxes = [3]byte{'a', 'b', 'c'}
+	} else {
+		stepperNames = [3]string{"stepper_x", "stepper_y", "stepper_z"}
+		stepperAxes = [3]byte{'x', 'y', 'z'}
+	}
+
+	stX, err := newStepper(motion, sq, stepperNames[0], stepperAxes[0], oidStepperX, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
 	if err != nil {
 		motion.free()
 		cqMain.Free()
@@ -2000,7 +2033,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		f.Close()
 		return nil, err
 	}
-	stY, err := newStepper(motion, sq, "stepper_y", 'y', oidStepperY, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stY, err := newStepper(motion, sq, stepperNames[1], stepperAxes[1], oidStepperY, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
 	if err != nil {
 		stX.free()
 		motion.free()
@@ -2009,7 +2042,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		f.Close()
 		return nil, err
 	}
-	stZ, err := newStepper(motion, sq, "stepper_z", 'z', oidStepperZ, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stZ, err := newStepper(motion, sq, stepperNames[2], stepperAxes[2], oidStepperZ, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
 	if err != nil {
 		stY.free()
 		stX.free()
@@ -2024,19 +2057,11 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	stY.setTrapQ(th.trapq)
 	stZ.setTrapQ(th.trapq)
 
-	// Get the kinematics type from configuration
-	kinType := "cartesian" // default
-	if printerCfg, ok := cfg.section("printer"); ok {
-		if kt, ok := printerCfg["kinematics"]; ok {
-			kinType = strings.TrimSpace(kt)
-		}
-	}
-
 	// Convert rails to kinematics.Rail slice
 	// (stepDistX, stepDistY, stepDistZ already calculated above)
 	kinRails := []kinematics.Rail{
 		{
-			Name:            "stepper_x",
+			Name:            stepperNames[0],
 			StepDist:        stepDistX,
 			PositionMin:     rails[0].positionMin,
 			PositionMax:     rails[0].positionMax,
@@ -2047,7 +2072,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 			HomingPositive:  rails[0].homingPositiveDir,
 		},
 		{
-			Name:            "stepper_y",
+			Name:            stepperNames[1],
 			StepDist:        stepDistY,
 			PositionMin:     rails[1].positionMin,
 			PositionMax:     rails[1].positionMax,
@@ -2058,7 +2083,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 			HomingPositive:  rails[1].homingPositiveDir,
 		},
 		{
-			Name:            "stepper_z",
+			Name:            stepperNames[2],
 			StepDist:        stepDistZ,
 			PositionMin:     rails[2].positionMin,
 			PositionMax:     rails[2].positionMax,
@@ -2394,9 +2419,9 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	motion.registerEnablePin(enX)
 	motion.registerEnablePin(enY)
 	motion.registerEnablePin(enZ)
-	se.registerStepper("stepper_x", stX, enX)
-	se.registerStepper("stepper_y", stY, enY)
-	se.registerStepper("stepper_z", stZ, enZ)
+	se.registerStepper(stepperNames[0], stX, enX)
+	se.registerStepper(stepperNames[1], stY, enY)
+	se.registerStepper(stepperNames[2], stZ, enZ)
 	if hasExtruder {
 		motion.registerEnablePin(enE)
 	}
@@ -2441,7 +2466,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	if hasExtraStepper {
 		motorOffOrder = append(motorOffOrder, "my_extra_stepper")
 	}
-	motorOffOrder = append(motorOffOrder, "stepper_x", "stepper_y", "stepper_z")
+	motorOffOrder = append(motorOffOrder, stepperNames[0], stepperNames[1], stepperNames[2])
 	if hasExtruder {
 		motorOffOrder = append(motorOffOrder, "extruder")
 	}
@@ -4054,6 +4079,7 @@ func reservedMoveSlotsForConfig(cfg *configWrapper) int {
 	}
 	slots := 0
 	// Stepper enable pins (digital_out) each request a movequeue slot.
+	// Check for cartesian steppers (stepper_x/y/z)
 	if _, ok := cfg.section("stepper_x"); ok {
 		slots++
 	}
@@ -4061,6 +4087,16 @@ func reservedMoveSlotsForConfig(cfg *configWrapper) int {
 		slots++
 	}
 	if _, ok := cfg.section("stepper_z"); ok {
+		slots++
+	}
+	// Check for delta steppers (stepper_a/b/c)
+	if _, ok := cfg.section("stepper_a"); ok {
+		slots++
+	}
+	if _, ok := cfg.section("stepper_b"); ok {
+		slots++
+	}
+	if _, ok := cfg.section("stepper_c"); ok {
 		slots++
 	}
 	if _, ok := cfg.section("extruder"); ok {

@@ -327,6 +327,120 @@ func readStepper(cfg *configWrapper, axis byte) (stepperCfg, error) {
 	}, nil
 }
 
+// readStepperByName reads a stepper configuration from a specific section name.
+// This is used for delta kinematics where steppers are named stepper_a, stepper_b, stepper_c.
+func readStepperByName(cfg *configWrapper, secName string, axis byte) (stepperCfg, error) {
+	sec, err := cfg.GetSection(secName)
+	if err != nil {
+		return stepperCfg{}, fmt.Errorf("missing [%s] section", secName)
+	}
+
+	stepPin, err := getPin(sec, "step_pin", true, false)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+	dirPin, err := getPin(sec, "dir_pin", true, false)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+	enablePin, err := getPin(sec, "enable_pin", true, false)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+	endstopPin, err := getPin(sec, "endstop_pin", true, true)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+
+	microsteps, err := sec.GetInt("microsteps")
+	if err != nil {
+		return stepperCfg{}, err
+	}
+	fullSteps, err := sec.GetInt("full_steps_per_rotation", 200)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+	rotationDistance, err := sec.GetFloat("rotation_distance")
+	if err != nil {
+		return stepperCfg{}, err
+	}
+
+	// For delta, position_min/max may not be specified on individual steppers
+	// Use defaults appropriate for delta
+	positionMin, err := sec.GetFloat("position_min", 0.0)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+
+	// position_max is optional for delta steppers (derived from endstop positions)
+	var positionMax float64
+	if sec.HasOption("position_max") {
+		positionMax, err = sec.GetFloat("position_max")
+		if err != nil {
+			return stepperCfg{}, err
+		}
+	}
+
+	// position_endstop: required for delta towers
+	positionEndstop, err := sec.GetFloat("position_endstop")
+	if err != nil {
+		return stepperCfg{}, err
+	}
+
+	// If position_max not set, use position_endstop as default
+	if !sec.HasOption("position_max") {
+		positionMax = positionEndstop
+	}
+
+	homingSpeed, err := sec.GetFloat("homing_speed", 5.0)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+	secondHomingSpeed, err := sec.GetFloat("second_homing_speed", homingSpeed/2.0)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+	homingRetractSpeed, err := sec.GetFloat("homing_retract_speed", homingSpeed)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+	homingRetractDist, err := sec.GetFloat("homing_retract_dist", 5.0)
+	if err != nil {
+		return stepperCfg{}, err
+	}
+
+	// Delta towers always home positive (toward max endstop)
+	homingPositiveDir := true
+	if sec.HasOption("homing_positive_dir") {
+		v, err := sec.GetBool("homing_positive_dir")
+		if err != nil {
+			return stepperCfg{}, err
+		}
+		homingPositiveDir = v
+	}
+
+	return stepperCfg{
+		axis:                axis,
+		name:                secName,
+		stepPin:             stepPin,
+		dirPin:              dirPin,
+		enablePin:           enablePin,
+		endstopPin:          endstopPin,
+		microsteps:          microsteps,
+		fullSteps:           fullSteps,
+		rotationDistance:    rotationDistance,
+		positionMin:         positionMin,
+		positionMax:         positionMax,
+		positionEndstop:     positionEndstop,
+		homingSpeed:         homingSpeed,
+		secondHomingSpeed:   secondHomingSpeed,
+		homingRetractSpeed:  homingRetractSpeed,
+		homingRetractDist:   homingRetractDist,
+		homingPositiveDir:   homingPositiveDir,
+		homingPositiveKnown: true,
+	}, nil
+}
+
 func readExtruderStepper(cfg *configWrapper) (extruderStepperCfg, error) {
 	secName := "extruder"
 	sec, err := cfg.GetSection(secName)
