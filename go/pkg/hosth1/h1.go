@@ -966,6 +966,7 @@ type oids struct {
 }
 
 type pin struct {
+	chip   string // MCU chip name (default: "mcu")
 	pin    string
 	invert bool
 	pullup int
@@ -1196,7 +1197,7 @@ func parsePin(sec map[string]string, key string, canInvert bool, canPullup bool)
 
 func parsePinDesc(desc string, canInvert bool, canPullup bool) (pin, error) {
 	d := strings.TrimSpace(desc)
-	p := pin{}
+	p := pin{chip: "mcu"} // Default to main MCU
 	if canPullup && (strings.HasPrefix(d, "^") || strings.HasPrefix(d, "~")) {
 		p.pullup = 1
 		if strings.HasPrefix(d, "~") {
@@ -1211,9 +1212,7 @@ func parsePinDesc(desc string, canInvert bool, canPullup bool) (pin, error) {
 	if strings.Contains(d, ":") {
 		parts := strings.SplitN(d, ":", 2)
 		chip := strings.TrimSpace(parts[0])
-		if chip != "mcu" {
-			return pin{}, fmt.Errorf("unsupported pin chip %q in %q", chip, desc)
-		}
+		p.chip = chip
 		d = strings.TrimSpace(parts[1])
 	}
 	if strings.ContainsAny(d, "^~!:") || strings.Join(strings.Fields(d), "") != d {
@@ -3016,4 +3015,245 @@ func CompileWinchConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]stri
 	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
 	out = append(out, initCmds...)
 	return out, nil
+}
+
+// CompileMultiMCUCartesianConnectPhase compiles the connect-phase MCU command
+// streams for cartesian printers with multiple MCUs.
+// Returns a map of MCU name -> commands.
+func CompileMultiMCUCartesianConnectPhase(cfgPath string, dicts map[string]*protocol.Dictionary) (map[string][]string, error) {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse MCU sections
+	mcuSections := ParseMCUSectionsFromConfig(cfg)
+	if len(mcuSections) == 0 {
+		return nil, fmt.Errorf("no MCU sections found")
+	}
+
+	// Build results per MCU
+	results := make(map[string][]string)
+
+	// Get all stepper configurations and group by MCU
+	steppers := []struct {
+		name    string
+		stepper stepper
+	}{}
+
+	for _, sName := range []string{"stepper_x", "stepper_y", "stepper_z"} {
+		if _, ok := cfg.sections[sName]; ok {
+			s, err := readStepper(cfg, sName)
+			if err != nil {
+				return nil, err
+			}
+			steppers = append(steppers, struct {
+				name    string
+				stepper stepper
+			}{sName, s})
+		}
+	}
+
+	// Get extruder and heater configs
+	var extruder *extruder
+	if _, ok := cfg.sections["extruder"]; ok {
+		e, err := readExtruder(cfg, "extruder")
+		if err != nil {
+			return nil, err
+		}
+		extruder = &e
+	}
+
+	var bed *heater
+	if _, ok := cfg.sections["heater_bed"]; ok {
+		h, err := readHeater(cfg, "heater_bed")
+		if err != nil {
+			return nil, err
+		}
+		bed = &h
+	}
+
+	// Process each MCU
+	for mcuName := range mcuSections {
+		dict := dicts[mcuName]
+		if dict == nil {
+			return nil, fmt.Errorf("missing dictionary for MCU %q", mcuName)
+		}
+
+		clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+		if err != nil {
+			return nil, err
+		}
+		adcMax, err := dictConfigFloat(dict, "ADC_MAX")
+		if err != nil {
+			return nil, err
+		}
+		mcuFreq := clockFreq
+
+		// Derived constants
+		const (
+			pwmCycleTime     = 0.100
+			heaterMaxHeatSec = 3.0
+			stepPulseSec     = 0.000002
+			adcSampleTime    = 0.001
+			adcSampleCount   = 8
+			adcReportTime    = 0.300
+			adcRangeChecks   = 4
+			pwmInitDelaySec  = 0.200
+		)
+		cycleTicks := secondsToClock(mcuFreq, pwmCycleTime)
+		mdurTicks := secondsToClock(mcuFreq, heaterMaxHeatSec)
+		stepPulseTicks := secondsToClock(mcuFreq, stepPulseSec)
+		sampleTicks := secondsToClock(mcuFreq, adcSampleTime)
+		reportTicks := secondsToClock(mcuFreq, adcReportTime)
+		pwmInitClock := secondsToClock(mcuFreq, pwmInitDelaySec)
+
+		// Collect components for this MCU
+		var mcuSteppers []struct {
+			name    string
+			stepper stepper
+		}
+		for _, s := range steppers {
+			if s.stepper.Step.chip == mcuName {
+				mcuSteppers = append(mcuSteppers, s)
+			}
+		}
+
+		hasExtruder := extruder != nil && extruder.Step.chip == mcuName
+		hasBed := bed != nil && bed.HeaterPin.chip == mcuName
+
+		// Allocate OIDs for this MCU
+		var configCmds []string
+		var initCmds []string
+		nextOID := 0
+
+		// Process steppers for this MCU (with endstop and trsync)
+		type stepperOIDs struct {
+			endstop, trsync, stepper, enable int
+		}
+		stepperOIDMap := make(map[string]stepperOIDs)
+
+		for _, s := range mcuSteppers {
+			oids := stepperOIDs{
+				endstop: nextOID,
+				trsync:  nextOID + 1,
+				stepper: nextOID + 2,
+			}
+			nextOID += 3
+
+			// Config endstop
+			pullup := 0
+			if s.stepper.Endstop.pullup != 0 {
+				pullup = 1
+			}
+			configCmds = append(configCmds, fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d",
+				oids.endstop, s.stepper.Endstop.pin, pullup))
+
+			// Config trsync
+			configCmds = append(configCmds, fmt.Sprintf("config_trsync oid=%d", oids.trsync))
+
+			// Config stepper
+			configCmds = append(configCmds, fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+				oids.stepper, s.stepper.Step.pin, s.stepper.Dir.pin, 0, stepPulseTicks))
+
+			stepperOIDMap[s.name] = oids
+		}
+
+		// Extruder stepper (if on this MCU)
+		extruderOID := -1
+		if hasExtruder {
+			extruderOID = nextOID
+			nextOID++
+			configCmds = append(configCmds, fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+				extruderOID, extruder.Step.pin, extruder.Dir.pin, 0, stepPulseTicks))
+		}
+
+		// Bed heater (if on this MCU)
+		bedADC, bedPWM := -1, -1
+		if hasBed {
+			bedADC = nextOID
+			nextOID++
+			bedPWM = nextOID
+			nextOID++
+
+			configCmds = append(configCmds, fmt.Sprintf("config_analog_in oid=%d pin=%s", bedADC, bed.SensorPin.pin))
+			configCmds = append(configCmds, fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+				bedPWM, bed.HeaterPin.pin, 0, 0, mdurTicks))
+			configCmds = append(configCmds, fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", bedPWM, cycleTicks))
+
+			bedMin, bedMax, err := thermistorMinMaxTicks(*bed, adcMax, adcSampleCount)
+			if err != nil {
+				return nil, err
+			}
+			initCmds = append(initCmds, fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+				bedADC, querySlotClock(mcuFreq, bedADC), sampleTicks, adcSampleCount, reportTicks, bedMin, bedMax, adcRangeChecks))
+			initCmds = append(initCmds, fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", bedPWM, pwmInitClock, 0))
+		}
+
+		// Enable pins for steppers
+		for _, s := range mcuSteppers {
+			enableOID := nextOID
+			nextOID++
+			oids := stepperOIDMap[s.name]
+			oids.enable = enableOID
+			stepperOIDMap[s.name] = oids
+
+			val := 1
+			if s.stepper.Enable.invert {
+				val = 1
+			}
+			configCmds = append(configCmds, fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+				enableOID, s.stepper.Enable.pin, val, val, 0))
+		}
+
+		// Extruder heater (if on this MCU)
+		extADC, extPWM, extEnable := -1, -1, -1
+		if hasExtruder {
+			extADC = nextOID
+			nextOID++
+			extPWM = nextOID
+			nextOID++
+
+			configCmds = append(configCmds, fmt.Sprintf("config_analog_in oid=%d pin=%s", extADC, extruder.Heater.SensorPin.pin))
+			configCmds = append(configCmds, fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+				extPWM, extruder.Heater.HeaterPin.pin, 0, 0, mdurTicks))
+			configCmds = append(configCmds, fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", extPWM, cycleTicks))
+
+			extMin, extMax, err := thermistorMinMaxTicks(extruder.Heater, adcMax, adcSampleCount)
+			if err != nil {
+				return nil, err
+			}
+			initCmds = append(initCmds, fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+				extADC, querySlotClock(mcuFreq, extADC), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks))
+			initCmds = append(initCmds, fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", extPWM, pwmInitClock, 0))
+
+			// Extruder enable
+			extEnable = nextOID
+			nextOID++
+			val := 1
+			if extruder.Enable.invert {
+				val = 1
+			}
+			configCmds = append(configCmds, fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+				extEnable, extruder.Enable.pin, val, val, 0))
+		}
+
+		// Build final command list with allocate_oids and finalize_config
+		allocateCmd := fmt.Sprintf("allocate_oids count=%d", nextOID)
+		withAllocate := append([]string{allocateCmd}, configCmds...)
+		crcText := strings.Join(withAllocate, "\n")
+		crc := crc32.ChecksumIEEE([]byte(crcText))
+
+		out := make([]string, 0)
+		out = append(out, withAllocate...)
+		out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+		out = append(out, initCmds...)
+
+		results[mcuName] = out
+
+		// Suppress unused variable warnings
+		_, _, _ = cycleTicks, bedADC, extEnable
+	}
+
+	return results, nil
 }

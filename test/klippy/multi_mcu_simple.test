@@ -1,0 +1,6 @@
+# Test multi-MCU config (connect phase only)
+# Main MCU: X, Y, extruder, heaters
+# zboard MCU: Z stepper
+DICTIONARY atmega2560.dict zboard=atmega2560.dict
+CONFIG multi_mcu_simple.cfg
+M105
