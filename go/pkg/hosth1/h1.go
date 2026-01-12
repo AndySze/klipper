@@ -1705,3 +1705,102 @@ func CompileDeltaCalibrateConnectPhase(cfgPath string, dict *protocol.Dictionary
 	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
 	return out, nil
 }
+
+// CompileLoadCellConnectPhase compiles the connect-phase MCU command stream for
+// load cell sensor configurations (e.g., test/klippy/load_cell.cfg).
+//
+// This config has no steppers, just load cell sensors using SPI and HX711/HX717.
+// OID layout:
+// oid=0: SPI for ADS1220
+// oid=1: ADS1220 sensor
+// oid=2: HX711
+// oid=3: HX717
+func CompileLoadCellConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse load_cell sections
+	// [load_cell my_ads1220]
+	// sensor_type: ads1220
+	// cs_pin: PA0
+	// data_ready_pin: PA1
+	ads1220Sec := cfg.sections["load_cell my_ads1220"]
+	csPin := strings.TrimSpace(ads1220Sec["cs_pin"])
+	dataReadyPin := strings.TrimSpace(ads1220Sec["data_ready_pin"])
+
+	// [load_cell my_hx711]
+	// sensor_type: hx711
+	// sclk_pin: PA2
+	// dout_pin: PA3
+	hx711Sec := cfg.sections["load_cell my_hx711"]
+	hx711SclkPin := strings.TrimSpace(hx711Sec["sclk_pin"])
+	hx711DoutPin := strings.TrimSpace(hx711Sec["dout_pin"])
+
+	// [load_cell my_hx717]
+	// sensor_type: hx717
+	// sclk_pin: PA4
+	// dout_pin: PA5
+	hx717Sec := cfg.sections["load_cell my_hx717"]
+	hx717SclkPin := strings.TrimSpace(hx717Sec["sclk_pin"])
+	hx717DoutPin := strings.TrimSpace(hx717Sec["dout_pin"])
+
+	// OID layout:
+	const (
+		oidSPI     = 0
+		oidADS1220 = 1
+		oidHX711   = 2
+		oidHX717   = 3
+		oidCount   = 4
+	)
+
+	// HX711 uses gain_channel=1 (Channel A, 128 gain)
+	// HX717 uses gain_channel=1 (Channel A, 128 gain) as well
+	// rest_ticks for HX711: 80 samples/sec = 0.0125s = 200000 ticks at 16MHz -> actually 20000 at ~1.25ms sample rate
+	// rest_ticks for HX717: 320 samples/sec = 0.003125s = 50000 ticks at 16MHz -> actually 5000 at ~0.3125ms sample rate
+	hx711RestTicks := int(clockFreq * 0.00125) // 20000 at 16MHz
+	hx717RestTicks := int(clockFreq * 0.0003125) // 5000 at 16MHz
+
+	// Build config commands in the same order as Python
+	configCmds := []string{
+		fmt.Sprintf("config_spi oid=%d pin=%s cs_active_high=0", oidSPI, csPin),
+		fmt.Sprintf("config_ads1220 oid=%d spi_oid=%d data_ready_pin=%s", oidADS1220, oidSPI, dataReadyPin),
+		fmt.Sprintf("config_hx71x oid=%d gain_channel=1 dout_pin=%s sclk_pin=%s", oidHX711, hx711DoutPin, hx711SclkPin),
+		fmt.Sprintf("config_hx71x oid=%d gain_channel=1 dout_pin=%s sclk_pin=%s", oidHX717, hx717DoutPin, hx717SclkPin),
+	}
+
+	// Prepend allocate_oids
+	withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", oidCount)}, configCmds...)
+
+	// Add spi_set_bus before finalize_config
+	// spi_set_bus oid=0 spi_bus=spi mode=1 rate=512000
+	withAllocate = append(withAllocate, "spi_set_bus oid=0 spi_bus=spi mode=1 rate=512000")
+
+	// Compute CRC
+	crcText := strings.Join(withAllocate, "\n")
+	crc := crc32.ChecksumIEEE([]byte(crcText))
+
+	// Init commands after finalize_config
+	initCmds := []string{
+		// ADS1220 initialization
+		"spi_send oid=0 data=b'\\x06'",
+		"spi_transfer oid=0 data=b'#\\x00\\x00\\x00\\x00'",
+		// Start HX711/HX717 queries
+		fmt.Sprintf("query_hx71x oid=%d rest_ticks=%d", oidHX711, hx711RestTicks),
+		fmt.Sprintf("query_hx71x_status oid=%d", oidHX711),
+		fmt.Sprintf("query_hx71x oid=%d rest_ticks=%d", oidHX717, hx717RestTicks),
+		fmt.Sprintf("query_hx71x_status oid=%d", oidHX717),
+	}
+
+	// Build final output
+	out := make([]string, 0, len(withAllocate)+1+len(initCmds))
+	out = append(out, withAllocate...)
+	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+	out = append(out, initCmds...)
+	return out, nil
+}

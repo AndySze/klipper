@@ -2909,6 +2909,11 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		if err := r.gm.cmdG1(cmd.Args); err != nil {
 			return err
 		}
+	case "G4":
+		// Dwell (pause)
+		if err := r.cmdG4(cmd.Args); err != nil {
+			return err
+		}
 	case "M104":
 		// Set Extruder Temperature
 		if err := r.cmdM104(cmd.Args); err != nil {
@@ -3605,6 +3610,44 @@ func (r *runtime) homeAxis(axis int) error {
 		}
 	}
 	return r.toolhead.flushStepGeneration()
+}
+
+// cmdG4 implements the G4 (dwell) command
+func (r *runtime) cmdG4(args map[string]string) error {
+	// G4 P<ms> - Dwell for specified milliseconds
+	// G4 S<sec> - Dwell for specified seconds
+	var delay float64
+
+	// Check for P parameter (milliseconds)
+	if pStr, ok := args["P"]; ok && pStr != "" {
+		p, err := strconv.ParseFloat(pStr, 64)
+		if err != nil {
+			return fmt.Errorf("invalid P value: %s", pStr)
+		}
+		delay = p / 1000.0 // Convert ms to seconds
+	}
+
+	// Check for S parameter (seconds) - takes precedence if both specified
+	if sStr, ok := args["S"]; ok && sStr != "" {
+		s, err := strconv.ParseFloat(sStr, 64)
+		if err != nil {
+			return fmt.Errorf("invalid S value: %s", sStr)
+		}
+		delay = s
+	}
+
+	if delay < 0 {
+		delay = 0
+	}
+
+	// For kinematics: none (sensor-only configs), we don't have a toolhead
+	if r.toolhead == nil {
+		// No motion system - just advance print time
+		// This is a no-op in file output mode for sensor-only configs
+		return nil
+	}
+
+	return r.toolhead.dwell(delay)
 }
 
 // Temperature command implementations

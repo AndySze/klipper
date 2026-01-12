@@ -36,6 +36,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"screws_tilt_adjust.cfg":   true,
 		"example-delta.cfg":        true, // Delta kinematics support
 		"delta_calibrate.cfg":      true, // Delta calibration (no heaters)
+		"load_cell.cfg":            true, // Load cell sensors (no kinematics)
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)
@@ -49,9 +50,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		return nil, fmt.Errorf("missing [printer] section")
 	}
 	kin := strings.TrimSpace(printerSec["kinematics"])
-	// Support cartesian, corexy, corexz, and delta kinematics
-	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" {
-		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta kinematics (got %q)", kin)
+	// Support cartesian, corexy, corexz, delta kinematics, and "none" for sensor-only configs
+	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" && kin != "none" {
+		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta/none kinematics (got %q)", kin)
 	}
 
 	rt, err := newRuntime(cfgPath, dict, cfg)
@@ -84,7 +85,13 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	_, hasExtraStepper := cfg.section("extruder_stepper my_extra_stepper")
 
 	var initLines []string
-	if base == "bltouch.cfg" || base == "screws_tilt_adjust.cfg" {
+	if kin == "none" {
+		// Load cell sensors - no steppers, no motion
+		initLines, err = hosth1.CompileLoadCellConnectPhase(cfgPath, dict)
+		if err != nil {
+			return nil, err
+		}
+	} else if base == "bltouch.cfg" || base == "screws_tilt_adjust.cfg" {
 		initLines, err = hosth1.CompileBLTouchConnectPhase(cfgPath, dict)
 		if err != nil {
 			return nil, err
