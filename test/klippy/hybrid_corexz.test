@@ -1,0 +1,14 @@
+# Test hybrid_corexz kinematics (Markforged-style)
+DICTIONARY atmega2560.dict
+CONFIG ../../config/example-hybrid-corexz.cfg
+
+# Home all axes
+G28
+
+# Basic movement
+G1 X10 Y10 Z5 F1200
+G1 X50 Y50 Z10 F3000
+G1 X100 Y100 Z20 F3000
+
+# Return home
+G1 X0 Y0 Z0 F3000

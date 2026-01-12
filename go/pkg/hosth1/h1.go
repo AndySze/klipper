@@ -2712,3 +2712,12 @@ func CompileRotaryDeltaConnectPhase(cfgPath string, dict *protocol.Dictionary) (
 	// The difference is in the kinematics calculation, which happens at runtime.
 	return CompileDeltaCalibrateConnectPhase(cfgPath, dict)
 }
+
+// CompileHybridCoreXZConnectPhase emits the connect-phase MCU commands for
+// example-hybrid-corexz.cfg. Hybrid CoreXZ has the same OID layout as
+// example-cartesian.cfg - the kinematics difference is handled at runtime.
+func CompileHybridCoreXZConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	// Hybrid CoreXZ has the same MCU config structure as cartesian.
+	// The difference is in the kinematics calculation, which happens at runtime.
+	return CompileExampleCartesianConnectPhase(cfgPath, dict)
+}

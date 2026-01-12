@@ -1859,6 +1859,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	isDelta := kinType == "delta"
 	isGenericCartesian := kinType == "generic_cartesian"
 	isHybridCoreXY := kinType == "hybrid_corexy"
+	isHybridCoreXZ := kinType == "hybrid_corexz"
 
 	// For generic_cartesian, use separate initialization path
 	if isGenericCartesian {
@@ -1868,6 +1869,11 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	// For hybrid_corexy, use separate initialization path
 	if isHybridCoreXY {
 		return newHybridCoreXYRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
+	}
+
+	// For hybrid_corexz, use separate initialization path
+	if isHybridCoreXZ {
+		return newHybridCoreXZRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
 	}
 
 	// For polar, use separate initialization path
@@ -6161,6 +6167,357 @@ func newRotaryDeltaRuntime(cfg *configWrapper, dict *protocol.Dictionary, format
 
 	// Initialize heater manager (even without heaters)
 	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
+
+	return rt, nil
+}
+
+// newHybridCoreXZRuntime creates a runtime for hybrid_corexz kinematics.
+// Hybrid CoreXZ has stepper_x using corexz kinematics with stepper_y and stepper_z
+// using cartesian kinematics. This is similar to Markforged kinematic.
+func newHybridCoreXZRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[string]*protocol.MessageFormat, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel float64, queueStepID, setDirID int32) (*runtime, error) {
+	// Read stepper configs
+	sx, err := readStepper(cfg, 'x')
+	if err != nil {
+		return nil, err
+	}
+	sy, err := readStepper(cfg, 'y')
+	if err != nil {
+		return nil, err
+	}
+	sz, err := readStepper(cfg, 'z')
+	if err != nil {
+		return nil, err
+	}
+
+	rails := [3]stepperCfg{sx, sy, sz}
+
+	// Read extruder config
+	extruderCfg, err := readExtruderStepper(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create serial queue output file
+	tmpDir := filepath.Join("out", "go_migration_tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, err
+	}
+	rawPath := filepath.Join(tmpDir, "serial-"+randSuffix()+".bin")
+	f, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	sq, err := chelper.NewSerialQueue(int(f.Fd()), 'f', 0, "serialq mcu")
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	sq.SetClockEst(1e12, chelper.Monotonic(), 0, 0)
+
+	cqMain := chelper.NewCommandQueue()
+	if cqMain == nil {
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc main command queue failed")
+	}
+	cqEnablePins := []*chelper.CommandQueue{}
+
+	reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
+	motion, err := newMotionQueuing(sq, mcuFreq, reservedMoveSlots)
+	if err != nil {
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	numAxes := 4 // X, Y, Z, E
+	th, err := newToolhead(mcuFreq, motion, maxVelocity, maxAccel, numAxes)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	se := newStepperEnable(th)
+
+	// OID layout for hybrid_corexz (same as example-cartesian.cfg):
+	// 0-2: X (endstop, trsync, stepper)
+	// 3-5: Y (endstop, trsync, stepper)
+	// 6-8: Z (endstop, trsync, stepper)
+	// 9: stepper extruder
+	// 10-11: heater_bed (adc, pwm)
+	// 12-14: enable pins (X, Y, Z)
+	// 15-17: extruder (adc, pwm, enable)
+
+	// Calculate step distances
+	stepDistX := rails[0].rotationDistance / float64(rails[0].fullSteps*rails[0].microsteps)
+	stepDistY := rails[1].rotationDistance / float64(rails[1].fullSteps*rails[1].microsteps)
+	stepDistZ := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
+
+	// Create stepper_x with CoreXZ kinematics (type '-')
+	stX, err := newStepper(motion, sq, "stepper_x", 'x', 2, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	// Replace cartesian kinematics with corexz kinematics
+	if stX.sk != nil {
+		stX.sk.Free()
+	}
+	skX, err := chelper.NewCoreXZStepperKinematics('-')
+	if err != nil {
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create CoreXZ kinematics for stepper_x: %w", err)
+	}
+	if err := stX.se.SetStepperKinematics(skX); err != nil {
+		skX.Free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stX.sk = skX
+	stX.setTrapQ(th.trapq)
+
+	// Create stepper_y with Cartesian kinematics
+	stY, err := newStepper(motion, sq, "stepper_y", 'y', 5, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stY.setTrapQ(th.trapq)
+
+	// Create stepper_z with Cartesian kinematics
+	stZ, err := newStepper(motion, sq, "stepper_z", 'z', 8, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stZ.setTrapQ(th.trapq)
+
+	// Create extruder TrapQ and stepper
+	tqExtruder, err := chelper.NewTrapQ()
+	if err != nil {
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create extruder trapq: %w", err)
+	}
+	extStepDist := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
+	stE, err := newStepper(motion, sq, "extruder", 'e', 9, extStepDist, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		tqExtruder.Free()
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stE.setTrapQ(tqExtruder)
+
+	// Set up enable pins
+	cqEnX := chelper.NewCommandQueue()
+	cqEnY := chelper.NewCommandQueue()
+	cqEnZ := chelper.NewCommandQueue()
+	cqEnE := chelper.NewCommandQueue()
+	if cqEnX == nil || cqEnY == nil || cqEnZ == nil || cqEnE == nil {
+		stE.free()
+		tqExtruder.Free()
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc enable command queue failed")
+	}
+	cqEnablePins = append(cqEnablePins, cqEnX, cqEnY, cqEnZ, cqEnE)
+	enX := &stepperEnablePin{out: newDigitalOut(12, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enY := &stepperEnablePin{out: newDigitalOut(13, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enZ := &stepperEnablePin{out: newDigitalOut(14, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enE := &stepperEnablePin{out: newDigitalOut(17, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	motion.registerEnablePin(enX)
+	motion.registerEnablePin(enY)
+	motion.registerEnablePin(enZ)
+	motion.registerEnablePin(enE)
+	se.registerStepper("stepper_x", stX, enX)
+	se.registerStepper("stepper_y", stY, enY)
+	se.registerStepper("stepper_z", stZ, enZ)
+	se.registerStepper("extruder", stE, enE)
+
+	steppers := [3]*stepper{stX, stY, stZ}
+
+	// Create kinematics for bounds checking
+	kinRails := []kinematics.Rail{
+		{
+			Name:            "stepper_x",
+			StepDist:        stepDistX,
+			PositionMin:     rails[0].positionMin,
+			PositionMax:     rails[0].positionMax,
+			HomingSpeed:     rails[0].homingSpeed,
+			PositionEndstop: rails[0].positionEndstop,
+			HomingPositive:  rails[0].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_y",
+			StepDist:        stepDistY,
+			PositionMin:     rails[1].positionMin,
+			PositionMax:     rails[1].positionMax,
+			HomingSpeed:     rails[1].homingSpeed,
+			PositionEndstop: rails[1].positionEndstop,
+			HomingPositive:  rails[1].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_z",
+			StepDist:        stepDistZ,
+			PositionMin:     rails[2].positionMin,
+			PositionMax:     rails[2].positionMax,
+			HomingSpeed:     rails[2].homingSpeed,
+			PositionEndstop: rails[2].positionEndstop,
+			HomingPositive:  rails[2].homingPositiveDir,
+		},
+	}
+	kinCfg := kinematics.Config{
+		Type:         "hybrid_corexz",
+		Rails:        kinRails,
+		MaxZVelocity: maxZVelocity,
+		MaxZAccel:    maxZAccel,
+	}
+	kin, err := kinematics.NewFromConfig(kinCfg)
+	if err != nil {
+		stE.free()
+		tqExtruder.Free()
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		for _, cq := range cqEnablePins {
+			cq.Free()
+		}
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	th.kin = kin
+
+	// Create extruder axis
+	extAxis := newExtruderAxis("extruder", tqExtruder)
+	th.extraAxes = []extraAxis{extAxis}
+
+	// Create MCU for temperature control
+	mcu := &mcu{freq: mcuFreq, clock: 0}
+
+	// Create bed mesh
+	bm, err := newBedMesh(cfg, th)
+	if err != nil {
+		stE.free()
+		tqExtruder.Free()
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		for _, cq := range cqEnablePins {
+			cq.Free()
+		}
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	// G-code arcs resolution
+	mmPerArcSegment, err := readGcodeArcsResolution(cfg)
+	if err != nil {
+		stE.free()
+		tqExtruder.Free()
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		for _, cq := range cqEnablePins {
+			cq.Free()
+		}
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	gm := newGCodeMove(th, mmPerArcSegment)
+
+	// Motor off order
+	motorOffOrder := []string{"extruder", "stepper_z", "stepper_y", "stepper_x"}
+
+	rt := &runtime{
+		cfg:           cfg,
+		dict:          dict,
+		formats:       formats,
+		mcuFreq:       mcuFreq,
+		queueStepID:   queueStepID,
+		setDirID:      setDirID,
+		sq:            sq,
+		cqMain:        cqMain,
+		cqEnablePins:  cqEnablePins,
+		motion:        motion,
+		toolhead:      th,
+		stepperEnable: se,
+		rails:         rails,
+		steppers:      steppers,
+		extruderCfg:   extruderCfg,
+		stepperE:      stE,
+		extruder:      extAxis,
+		gm:            gm,
+		motorOffOrder: motorOffOrder,
+		bedMesh:       bm,
+		mcu:           mcu,
+		rawPath:       rawPath,
+		rawFile:       f,
+	}
+
+	// Initialize heater manager
+	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
+
+	// Load and setup heaters from config
+	heaterConfigs, err := readHeaterConfigs(cfg)
+	if err != nil {
+		rt.tracef("Warning: failed to load heater configs: %v\n", err)
+	} else {
+		for _, hc := range heaterConfigs {
+			if err := rt.setupHeater(hc); err != nil {
+				rt.tracef("Warning: failed to setup heater %s: %v\n", hc.name, err)
+			}
+		}
+	}
 
 	return rt, nil
 }
