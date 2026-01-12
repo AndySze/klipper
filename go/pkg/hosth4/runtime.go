@@ -1722,6 +1722,9 @@ type runtime struct {
 
 	// Virtual SD card with loop support
 	sdcard *VirtualSDCard
+
+	// Generic cartesian kinematics state (for SET_DUAL_CARRIAGE etc.)
+	genericCartesianKin *GenericCartesianKinematics
 }
 
 type pressureAdvanceState struct {
@@ -1843,6 +1846,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	// Determine kinematics type to select correct stepper names
 	kinType := strings.TrimSpace(printerSec["kinematics"])
 	isDelta := kinType == "delta"
+	isGenericCartesian := kinType == "generic_cartesian"
+
+	// For generic_cartesian, use separate initialization path
+	if isGenericCartesian {
+		return newGenericCartesianRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
+	}
 
 	var sx, sy, sz stepperCfg
 	if isDelta {
@@ -2650,6 +2659,616 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 				rt.tracef("Warning: failed to setup heater %s: %v\n", hc.name, err)
 			} else {
 				rt.tracef("Setup heater: %s (sensor=%s, control=%s)\n", hc.name, hc.sensorType, hc.control)
+			}
+		}
+	}
+
+	return rt, nil
+}
+
+// newGenericCartesianRuntime creates a runtime for generic_cartesian kinematics.
+// This handles configs with [carriage NAME], [dual_carriage NAME], and [stepper NAME] sections.
+func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[string]*protocol.MessageFormat, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel float64, queueStepID, setDirID int32) (*runtime, error) {
+	// Load generic cartesian kinematics config
+	gcKin, err := loadGenericCartesianKinematics(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load generic_cartesian kinematics: %w", err)
+	}
+
+	// Get primary carriages for rails (position limits)
+	var carriageX, carriageY, carriageZ *Carriage
+	for _, c := range gcKin.Carriages {
+		switch c.Axis {
+		case 0:
+			carriageX = c
+		case 1:
+			carriageY = c
+		case 2:
+			carriageZ = c
+		}
+	}
+	if carriageX == nil || carriageY == nil || carriageZ == nil {
+		return nil, fmt.Errorf("generic_cartesian requires carriages for X, Y, and Z axes")
+	}
+
+	// Create rails from carriages
+	rails := [3]stepperCfg{
+		{
+			positionMin:      carriageX.PosMin,
+			positionMax:      carriageX.PosMax,
+			positionEndstop:  carriageX.PosEndstop,
+			homingSpeed:      carriageX.HomingSpeed,
+			homingPositiveDir: carriageX.PosEndstop > carriageX.PosMin,
+			endstopPin:       carriageX.EndstopPin,
+		},
+		{
+			positionMin:      carriageY.PosMin,
+			positionMax:      carriageY.PosMax,
+			positionEndstop:  carriageY.PosEndstop,
+			homingSpeed:      carriageY.HomingSpeed,
+			homingPositiveDir: carriageY.PosEndstop > carriageY.PosMin,
+			endstopPin:       carriageY.EndstopPin,
+		},
+		{
+			positionMin:      carriageZ.PosMin,
+			positionMax:      carriageZ.PosMax,
+			positionEndstop:  carriageZ.PosEndstop,
+			homingSpeed:      carriageZ.HomingSpeed,
+			homingPositiveDir: carriageZ.PosEndstop > carriageZ.PosMin,
+			endstopPin:       carriageZ.EndstopPin,
+		},
+	}
+
+	// Sort steppers by section name for consistent OID assignment (matching h1.go)
+	stepperOrder := make([]string, 0, len(gcKin.Steppers))
+	stepperMap := make(map[string]*KinematicStepper)
+	for _, s := range gcKin.Steppers {
+		stepperOrder = append(stepperOrder, s.Name)
+		stepperMap[s.Name] = s
+	}
+	// Sort by section name (stepper NAME -> "stepper NAME")
+	for i := 0; i < len(stepperOrder)-1; i++ {
+		for j := i + 1; j < len(stepperOrder); j++ {
+			if "stepper "+stepperOrder[i] > "stepper "+stepperOrder[j] {
+				stepperOrder[i], stepperOrder[j] = stepperOrder[j], stepperOrder[i]
+			}
+		}
+	}
+
+	// Check for extruder
+	_, hasExtruder := cfg.section("extruder")
+	_, hasExtruder1 := cfg.section("extruder1")
+
+	// Create serial queue output file
+	tmpDir := filepath.Join("out", "go_migration_tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, err
+	}
+	rawPath := filepath.Join(tmpDir, "serial-"+randSuffix()+".bin")
+	f, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	sq, err := chelper.NewSerialQueue(int(f.Fd()), 'f', 0, "serialq mcu")
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	sq.SetClockEst(1e12, chelper.Monotonic(), 0, 0)
+
+	cqMain := chelper.NewCommandQueue()
+	if cqMain == nil {
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc main command queue failed")
+	}
+	cqEnablePins := []*chelper.CommandQueue{}
+
+	// Match Klippy: reserve movequeue slots for any digital_out / pwm objects
+	reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
+	motion, err := newMotionQueuing(sq, mcuFreq, reservedMoveSlots)
+	if err != nil {
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	// Determine number of axes: 4 with extruder
+	numAxes := 3
+	if hasExtruder {
+		numAxes = 4
+	}
+	th, err := newToolhead(mcuFreq, motion, maxVelocity, maxAccel, numAxes)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	se := newStepperEnable(th)
+
+	// Calculate OIDs for generic_cartesian:
+	// - Carriages sorted alphabetically: each gets endstop OID, trsync OID
+	// - Steppers sorted alphabetically: each gets stepper OID
+	// - Enable pins start at OID 23 (if servo present) or lower
+
+	// Count carriages with endstops for OID calculation
+	numCarriageEndstops := 0
+	for _, c := range gcKin.Carriages {
+		if c.EndstopPin.pin != "" {
+			numCarriageEndstops++
+		}
+	}
+	for _, dc := range gcKin.DualCarriages {
+		if dc.EndstopPin.pin != "" {
+			numCarriageEndstops++
+		}
+	}
+	for _, ec := range gcKin.ExtraCarriages {
+		if ec.EndstopPin.pin != "" {
+			numCarriageEndstops++
+		}
+	}
+	stepperOIDBase := numCarriageEndstops * 2 // Each carriage with endstop gets endstop+trsync OIDs
+
+	// Enable pins OID base (after servo=20, heater_bed ADC=21, PWM=22)
+	_, hasServo := cfg.section("servo my_servo")
+	_, hasHeaterBed := cfg.section("heater_bed")
+	enableOIDBase := 0
+	if hasServo {
+		enableOIDBase = 23
+	} else if hasHeaterBed {
+		enableOIDBase = 2 // heater_bed ADC + PWM
+	}
+
+	// Create steppers with generic_cartesian kinematics
+	gcSteppers := make([]*stepper, 0, len(stepperOrder))
+	gcEnablePins := make([]*stepperEnablePin, 0, len(stepperOrder))
+	stepperNames := make([]string, 0, len(stepperOrder))
+
+	for i, name := range stepperOrder {
+		s := stepperMap[name]
+		oid := uint32(stepperOIDBase + i)
+		enableOID := enableOIDBase + i
+
+		// Calculate step distance
+		fullSteps := 200 // Default
+		stepDist := s.RotDist / float64(fullSteps*s.Microsteps)
+
+		st, err := newStepper(motion, sq, "stepper "+name, 'x', oid, stepDist, s.DirPin.invert, queueStepID, setDirID, mcuFreq)
+		if err != nil {
+			for _, prev := range gcSteppers {
+				prev.free()
+			}
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+
+		// Replace default cartesian kinematics with generic_cartesian kinematics
+		if st.sk != nil {
+			st.sk.Free()
+		}
+		sk, err := chelper.NewGenericCartesianStepperKinematics(s.Coeffs[0], s.Coeffs[1], s.Coeffs[2])
+		if err != nil {
+			st.free()
+			for _, prev := range gcSteppers {
+				prev.free()
+			}
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("failed to create generic_cartesian kinematics for stepper %s: %w", name, err)
+		}
+		if err := st.se.SetStepperKinematics(sk); err != nil {
+			sk.Free()
+			st.free()
+			for _, prev := range gcSteppers {
+				prev.free()
+			}
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("failed to set generic_cartesian kinematics for stepper %s: %w", name, err)
+		}
+		st.sk = sk
+		st.setTrapQ(th.trapq)
+
+		gcSteppers = append(gcSteppers, st)
+		stepperNames = append(stepperNames, "stepper "+name)
+
+		// Create enable pin
+		cqEn := chelper.NewCommandQueue()
+		if cqEn == nil {
+			st.free()
+			for _, prev := range gcSteppers {
+				prev.free()
+			}
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("alloc enable command queue failed for stepper %s", name)
+		}
+		cqEnablePins = append(cqEnablePins, cqEn)
+		en := &stepperEnablePin{out: newDigitalOut(uint32(enableOID), s.EnablePin.invert, sq, cqMain, formats, mcuFreq)}
+		motion.registerEnablePin(en)
+		se.registerStepper("stepper "+name, st, en)
+		gcEnablePins = append(gcEnablePins, en)
+	}
+
+	// Convert to fixed-size arrays for runtime struct compatibility
+	// Use first 3 steppers for primary X, Y, Z motion
+	var steppers [3]*stepper
+	if len(gcSteppers) >= 3 {
+		// Find steppers for each axis based on coefficients
+		// Match steppers to axes using their OID order
+		stepperIdx := 0
+		for _, name := range stepperOrder {
+			if stepperIdx >= len(gcSteppers) || stepperIdx >= 3 {
+				break
+			}
+			s := stepperMap[name]
+			if s.Coeffs[0] != 0 && steppers[0] == nil {
+				steppers[0] = gcSteppers[stepperIdx]
+			} else if s.Coeffs[1] != 0 && steppers[1] == nil {
+				steppers[1] = gcSteppers[stepperIdx]
+			} else if s.Coeffs[2] != 0 && steppers[2] == nil {
+				steppers[2] = gcSteppers[stepperIdx]
+			}
+			stepperIdx++
+		}
+	}
+
+	// Create kinematics rails for bounds checking
+	kinRails := []kinematics.Rail{
+		{
+			Name:            "carriage_x",
+			StepDist:        0.0001, // Placeholder
+			PositionMin:     rails[0].positionMin,
+			PositionMax:     rails[0].positionMax,
+			HomingSpeed:     rails[0].homingSpeed,
+			PositionEndstop: rails[0].positionEndstop,
+			HomingPositive:  rails[0].homingPositiveDir,
+		},
+		{
+			Name:            "carriage_y",
+			StepDist:        0.0001,
+			PositionMin:     rails[1].positionMin,
+			PositionMax:     rails[1].positionMax,
+			HomingSpeed:     rails[1].homingSpeed,
+			PositionEndstop: rails[1].positionEndstop,
+			HomingPositive:  rails[1].homingPositiveDir,
+		},
+		{
+			Name:            "carriage_z",
+			StepDist:        0.0001,
+			PositionMin:     rails[2].positionMin,
+			PositionMax:     rails[2].positionMax,
+			HomingSpeed:     rails[2].homingSpeed,
+			PositionEndstop: rails[2].positionEndstop,
+			HomingPositive:  rails[2].homingPositiveDir,
+		},
+	}
+
+	kinCfg := kinematics.Config{
+		Type:         "cartesian", // Use cartesian bounds checking
+		Rails:        kinRails,
+		MaxZVelocity: maxZVelocity,
+		MaxZAccel:    maxZAccel,
+	}
+	kin, err := kinematics.NewFromConfig(kinCfg)
+	if err != nil {
+		for _, st := range gcSteppers {
+			st.free()
+		}
+		motion.free()
+		for _, cq := range cqEnablePins {
+			cq.Free()
+		}
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	th.kin = kin
+
+	// Handle extruders if present
+	var stE *stepper
+	var tqExtruder *chelper.TrapQ
+	var enE *stepperEnablePin
+	var exAxis *extruderAxis
+	var extruderCfg extruderStepperCfg
+
+	if hasExtruder {
+		extCfg, _, err := readExtruderStepperOptional(cfg, "extruder")
+		if err != nil {
+			for _, st := range gcSteppers {
+				st.free()
+			}
+			motion.free()
+			for _, cq := range cqEnablePins {
+				cq.Free()
+			}
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+		extruderCfg = extCfg
+
+		// Extruder OIDs after all kinematics steppers
+		extOIDBase := stepperOIDBase + len(stepperOrder)
+		extEnableOIDBase := enableOIDBase + len(stepperOrder)
+		// Account for ADC and PWM OIDs for extruder
+		extStepperOID := uint32(extOIDBase)
+		extEnableOID := extEnableOIDBase + 2 // +2 for ADC and PWM
+
+		stepDistE := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
+		stE, err = newStepper(motion, sq, "extruder", 'e', extStepperOID, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+		if err != nil {
+			for _, st := range gcSteppers {
+				st.free()
+			}
+			motion.free()
+			for _, cq := range cqEnablePins {
+				cq.Free()
+			}
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+
+		tqExtruder, err = chelper.NewTrapQ()
+		if err != nil {
+			stE.free()
+			for _, st := range gcSteppers {
+				st.free()
+			}
+			motion.free()
+			for _, cq := range cqEnablePins {
+				cq.Free()
+			}
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("failed to create extruder trapq: %w", err)
+		}
+		stE.setTrapQ(tqExtruder)
+
+		exAxis = newExtruderAxis("extruder", tqExtruder)
+
+		cqEnE := chelper.NewCommandQueue()
+		if cqEnE == nil {
+			tqExtruder.Free()
+			stE.free()
+			for _, st := range gcSteppers {
+				st.free()
+			}
+			motion.free()
+			for _, cq := range cqEnablePins {
+				cq.Free()
+			}
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("alloc extruder enable command queue failed")
+		}
+		cqEnablePins = append(cqEnablePins, cqEnE)
+		enE = &stepperEnablePin{out: newDigitalOut(uint32(extEnableOID), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+		motion.registerEnablePin(enE)
+		se.registerStepper("extruder", stE, enE)
+	}
+
+	cqTrigger := chelper.NewCommandQueue()
+	if cqTrigger == nil {
+		if stE != nil {
+			stE.free()
+		}
+		if tqExtruder != nil {
+			tqExtruder.Free()
+		}
+		for _, st := range gcSteppers {
+			st.free()
+		}
+		motion.free()
+		for _, cq := range cqEnablePins {
+			cq.Free()
+		}
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc trigger command queue failed")
+	}
+
+	// Create endstops for primary carriages
+	endstops := [3]*endstop{}
+	// Note: Endstop OIDs are 0, 2, 4 for carriages in sorted order
+	// We need to match the connect-phase compiler's carriage ordering
+
+	// Initialize MCU for temperature control
+	mcu := &mcu{
+		freq:  mcuFreq,
+		clock: 0,
+	}
+
+	// Build motorOffOrder
+	motorOffOrder := append([]string{}, stepperNames...)
+	if hasExtruder {
+		motorOffOrder = append(motorOffOrder, "extruder")
+	}
+	if hasExtruder1 {
+		motorOffOrder = append(motorOffOrder, "extruder1")
+	}
+
+	mmPerArcSegment, err := readGcodeArcsResolution(cfg)
+	if err != nil {
+		if cqTrigger != nil {
+			cqTrigger.Free()
+		}
+		if stE != nil {
+			stE.free()
+		}
+		if tqExtruder != nil {
+			tqExtruder.Free()
+		}
+		for _, st := range gcSteppers {
+			st.free()
+		}
+		motion.free()
+		for _, cq := range cqEnablePins {
+			cq.Free()
+		}
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	gm := newGCodeMove(th, mmPerArcSegment)
+
+	// Create bed_mesh (inactive by default)
+	var bedMesh *bedMesh
+	if _, ok := cfg.section("bed_mesh"); ok {
+		bm, err := newBedMesh(cfg, th)
+		if err != nil {
+			if cqTrigger != nil {
+				cqTrigger.Free()
+			}
+			if stE != nil {
+				stE.free()
+			}
+			if tqExtruder != nil {
+				tqExtruder.Free()
+			}
+			for _, st := range gcSteppers {
+				st.free()
+			}
+			motion.free()
+			for _, cq := range cqEnablePins {
+				cq.Free()
+			}
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+		bedMesh = bm
+		gm.setMoveTransform(bm)
+	}
+
+	rt := &runtime{
+		cfg:             cfg,
+		dict:            dict,
+		formats:         formats,
+		mcuFreq:         mcuFreq,
+		queueStepID:     queueStepID,
+		setDirID:        setDirID,
+		sq:              sq,
+		cqMain:          cqMain,
+		cqTrigger:       cqTrigger,
+		cqEnablePins:    cqEnablePins,
+		motion:          motion,
+		toolhead:        th,
+		stepperEnable:   se,
+		rails:           rails,
+		steppers:        steppers,
+		extruderCfg:     extruderCfg,
+		stepperE:        stE,
+		extruder:        exAxis,
+		endstops:        endstops,
+		gm:              gm,
+		motorOffOrder:   motorOffOrder,
+		bedMesh:         bedMesh,
+		mcu:             mcu,
+		rawPath:         rawPath,
+		rawFile:         f,
+	}
+
+	// Store generic cartesian kinematics state in runtime (for SET_DUAL_CARRIAGE etc.)
+	rt.genericCartesianKin = gcKin
+
+	// Initialize heater manager after runtime is created
+	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
+
+	// Parse input shaper config
+	if sec, ok := cfg.section("input_shaper"); ok {
+		shaperTypeX := inputshaper.ShaperType(sec["shaper_type_x"])
+		shaperTypeY := inputshaper.ShaperType(sec["shaper_type_y"])
+		shaperTypeZ := inputshaper.ShaperType(sec["shaper_type_z"])
+		// Fall back to shaper_type if axis-specific not set
+		if shaperTypeX == "" {
+			shaperTypeX = inputshaper.ShaperType(sec["shaper_type"])
+		}
+		if shaperTypeY == "" {
+			shaperTypeY = inputshaper.ShaperType(sec["shaper_type"])
+		}
+		if shaperTypeZ == "" {
+			shaperTypeZ = inputshaper.ShaperType(sec["shaper_type"])
+		}
+
+		defDamping := inputshaper.DefaultDampingRatio
+		dampingRatio, _ := parseFloat(sec, "damping_ratio_x", &defDamping)
+		defFreq := 0.0
+		freqX, _ := parseFloat(sec, "shaper_freq_x", &defFreq)
+		freqY, _ := parseFloat(sec, "shaper_freq_y", &defFreq)
+		freqZ, _ := parseFloat(sec, "shaper_freq_z", &defFreq)
+
+		is, err := inputshaper.NewInputShaper(shaperTypeX, shaperTypeY, shaperTypeZ, freqX, freqY, freqZ, dampingRatio)
+		if err != nil {
+			rt.tracef("Warning: failed to initialize input shaper: %v\n", err)
+		} else {
+			rt.inputShaper = is
+		}
+	}
+
+	// Setup macros (like homing_override)
+	if hoSec, ok := cfg.section("homing_override"); ok {
+		gcodeStr := hoSec["gcode"]
+		if gcodeStr != "" {
+			lines := strings.Split(gcodeStr, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line != "" && !strings.HasPrefix(line, "#") {
+					rt.homingOverrideGcode = append(rt.homingOverrideGcode, line)
+				}
+			}
+		}
+		if v := hoSec["set_position_x"]; v != "" {
+			f, _ := strconv.ParseFloat(v, 64)
+			rt.homingOverridePos[0] = &f
+		}
+		if v := hoSec["set_position_y"]; v != "" {
+			f, _ := strconv.ParseFloat(v, 64)
+			rt.homingOverridePos[1] = &f
+		}
+		if v := hoSec["set_position_z"]; v != "" {
+			f, _ := strconv.ParseFloat(v, 64)
+			rt.homingOverridePos[2] = &f
+		}
+		rt.homingOverrideAxes = strings.TrimSpace(hoSec["axes"])
+		if rt.homingOverrideAxes == "" {
+			rt.homingOverrideAxes = "xyz"
+		}
+	}
+
+	// Load and setup heaters from config
+	heaterConfigs, err := readHeaterConfigs(cfg)
+	if err != nil {
+		rt.tracef("Warning: failed to load heater configs: %v\n", err)
+	} else {
+		for _, hc := range heaterConfigs {
+			if err := rt.setupHeater(hc); err != nil {
+				rt.tracef("Warning: failed to setup heater %s: %v\n", hc.name, err)
 			}
 		}
 	}

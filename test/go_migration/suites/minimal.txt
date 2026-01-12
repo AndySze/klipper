@@ -53,3 +53,7 @@ test/klippy/load_cell.test
 
 # === Virtual SD card ===
 test/klippy/sdcard_loop.test
+
+# === Generic cartesian kinematics ===
+test/klippy/generic_cartesian.test
+test/klippy/corexyuv.test

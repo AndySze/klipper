@@ -38,6 +38,8 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"delta_calibrate.cfg":      true, // Delta calibration (no heaters)
 		"load_cell.cfg":            true, // Load cell sensors (no kinematics)
 		"sdcard_loop.cfg":          true, // Virtual SD card with looping
+		"generic_cartesian.cfg":    true, // Generic cartesian kinematics
+		"corexyuv.cfg":             true, // CoreXY UV (generic cartesian)
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)
@@ -51,9 +53,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		return nil, fmt.Errorf("missing [printer] section")
 	}
 	kin := strings.TrimSpace(printerSec["kinematics"])
-	// Support cartesian, corexy, corexz, delta kinematics, and "none" for sensor-only configs
-	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" && kin != "none" {
-		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta/none kinematics (got %q)", kin)
+	// Support cartesian, corexy, corexz, delta, generic_cartesian kinematics, and "none" for sensor-only configs
+	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" && kin != "generic_cartesian" && kin != "none" {
+		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta/generic_cartesian/none kinematics (got %q)", kin)
 	}
 
 	rt, err := newRuntime(cfgPath, dict, cfg)
@@ -121,6 +123,12 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	} else if kin == "delta" && !hasBedHeater {
 		// Use delta calibrate connect-phase compiler (no heaters)
 		initLines, err = hosth1.CompileDeltaCalibrateConnectPhase(cfgPath, dict)
+		if err != nil {
+			return nil, err
+		}
+	} else if kin == "generic_cartesian" {
+		// Use generic cartesian connect-phase compiler
+		initLines, err = hosth1.CompileGenericCartesianConnectPhase(cfgPath, dict)
 		if err != nil {
 			return nil, err
 		}

@@ -20,12 +20,18 @@ struct stepper_kinematics *extruder_stepper_alloc(void);
 void extruder_stepper_free(struct stepper_kinematics *sk);
 void extruder_set_pressure_advance(struct stepper_kinematics *sk, double print_time
     , double pressure_advance, double smooth_time);
+
+// kin_generic.c - generic cartesian kinematics
+struct stepper_kinematics *generic_cartesian_stepper_alloc(double a_x, double a_y, double a_z);
+void generic_cartesian_stepper_set_coeffs(struct stepper_kinematics *sk
+    , double a_x, double a_y, double a_z);
 */
 import "C"
 
 import (
 	"fmt"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -151,6 +157,27 @@ func (sq *SerialQueue) GetStats() (SerialStats, error) {
 		}
 	}
 	return s, nil
+}
+
+// WaitDrain waits for the serial queue to finish writing all pending messages.
+// This is used in fileoutput mode to ensure all step commands are written
+// before sending commands that need to appear in a specific order.
+func (sq *SerialQueue) WaitDrain() error {
+	if sq == nil || sq.ptr == nil {
+		return fmt.Errorf("serialqueue is nil")
+	}
+	for {
+		stats, err := sq.GetStats()
+		if err != nil {
+			return err
+		}
+		if stats.ReadyBytes == 0 && stats.UpcomingBytes == 0 {
+			return nil
+		}
+		// Small sleep to avoid busy-waiting
+		// In fileoutput mode, the background thread runs fast so this is typically immediate
+		time.Sleep(100 * time.Microsecond)
+	}
 }
 
 func (sq *SerialQueue) Free() {
@@ -503,4 +530,20 @@ func (sc *Stepcompress) Reset(lastStepClock uint64) error {
 		return fmt.Errorf("stepcompress_reset failed: %d", int32(ret))
 	}
 	return nil
+}
+
+// NewGenericCartesianStepperKinematics creates a stepper kinematics for generic
+// cartesian motion where position = a_x*X + a_y*Y + a_z*Z.
+func NewGenericCartesianStepperKinematics(aX, aY, aZ float64) (*StepperKinematics, error) {
+	sk := C.generic_cartesian_stepper_alloc(C.double(aX), C.double(aY), C.double(aZ))
+	if sk == nil {
+		return nil, fmt.Errorf("generic_cartesian_stepper_alloc failed")
+	}
+	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
+// SetGenericCartesianCoeffs updates the kinematic coefficients for a generic
+// cartesian stepper.
+func (sk *StepperKinematics) SetGenericCartesianCoeffs(aX, aY, aZ float64) {
+	C.generic_cartesian_stepper_set_coeffs(sk.ptr, C.double(aX), C.double(aY), C.double(aZ))
 }

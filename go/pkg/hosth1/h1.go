@@ -1804,3 +1804,460 @@ func CompileLoadCellConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]s
 	out = append(out, initCmds...)
 	return out, nil
 }
+
+// CompileGenericCartesianConnectPhase compiles the connect-phase MCU command stream
+// for generic cartesian kinematics configurations (e.g., generic_cartesian.cfg, corexyuv.cfg).
+//
+// OID Layout (matches Python ordering):
+// - First: servo, heater_bed (pre-allocated OIDs)
+// - Then: carriages with their endstops/trsync pairs and associated steppers
+// - Finally: extruder sections
+func CompileGenericCartesianConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+	if err != nil {
+		return nil, err
+	}
+	adcMax, err := dictConfigFloat(dict, "ADC_MAX")
+	if err != nil {
+		return nil, err
+	}
+	mcuFreq := clockFreq
+
+	const (
+		pwmCycleTime     = 0.100
+		servoCycleTime   = 0.020
+		heaterMaxHeatSec = 3.0
+		stepPulseSec     = 0.000002
+		adcSampleTime    = 0.001
+		adcSampleCount   = 8
+		adcReportTime    = 0.300
+		adcRangeChecks   = 4
+		pwmInitDelaySec  = 0.200
+	)
+	cycleTicks := secondsToClock(mcuFreq, pwmCycleTime)
+	servoCycleTicks := secondsToClock(mcuFreq, servoCycleTime)
+	mdurTicks := secondsToClock(mcuFreq, heaterMaxHeatSec)
+	stepPulseTicks := secondsToClock(mcuFreq, stepPulseSec)
+	sampleTicks := secondsToClock(mcuFreq, adcSampleTime)
+	reportTicks := secondsToClock(mcuFreq, adcReportTime)
+	pwmInitClock := secondsToClock(mcuFreq, pwmInitDelaySec)
+
+	var configCmds []string
+	var initCmds []string
+	oidNext := 0
+
+	// Allocate OIDs for servo first (Python processes extras before kinematics)
+	servoOID := -1
+	if servoSec, ok := cfg.sections["servo my_servo"]; ok {
+		servoOID = 20 // Python allocates servo at OID 20 for generic_cartesian
+		servoPin := strings.TrimSpace(servoSec["pin"])
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=0", servoOID, servoPin),
+			fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", servoOID, servoCycleTicks),
+		)
+		initCmds = append(initCmds,
+			fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", servoOID, pwmInitClock),
+		)
+		oidNext = 21
+	}
+
+	// Heater bed
+	bedADCOID := -1
+	bedPWMOID := -1
+	if bedSec, ok := cfg.sections["heater_bed"]; ok {
+		bedADCOID = oidNext
+		oidNext++
+		bedPWMOID = oidNext
+		oidNext++
+
+		sensorPin := strings.TrimSpace(bedSec["sensor_pin"])
+		heaterPin := strings.TrimSpace(bedSec["heater_pin"])
+
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_analog_in oid=%d pin=%s", bedADCOID, sensorPin),
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=%d", bedPWMOID, heaterPin, mdurTicks),
+			fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", bedPWMOID, cycleTicks),
+		)
+
+		// Thermistor min/max for heater_bed
+		bed, err := readHeater(cfg, "heater_bed")
+		if err != nil {
+			return nil, err
+		}
+		bedMin, bedMax, err := thermistorMinMaxTicks(bed, adcMax, adcSampleCount)
+		if err != nil {
+			return nil, err
+		}
+		initCmds = append(initCmds,
+			fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+				bedADCOID, querySlotClock(mcuFreq, bedADCOID), sampleTicks, adcSampleCount, reportTicks, bedMin, bedMax, adcRangeChecks),
+			fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", bedPWMOID, pwmInitClock),
+		)
+	}
+
+	// After servo/bed, endstop OIDs start at 0
+	// Python processes carriages in alphabetical order by section name
+	type carriageInfo struct {
+		name       string
+		section    string
+		endstopPin string
+		isPrimary  bool
+		isDual     bool
+		isExtra    bool
+		axis       int
+	}
+
+	var carriages []carriageInfo
+
+	// Collect main carriages [carriage NAME]
+	for sec := range cfg.sections {
+		if !strings.HasPrefix(sec, "carriage ") {
+			continue
+		}
+		name := strings.TrimPrefix(sec, "carriage ")
+		data := cfg.sections[sec]
+		axisStr := strings.TrimSpace(data["axis"])
+		if axisStr == "" {
+			// Derive from name
+			if strings.HasSuffix(name, "_x") {
+				axisStr = "x"
+			} else if strings.HasSuffix(name, "_y") {
+				axisStr = "y"
+			} else if strings.HasSuffix(name, "_z") {
+				axisStr = "z"
+			}
+		}
+		axis := -1
+		switch axisStr {
+		case "x":
+			axis = 0
+		case "y":
+			axis = 1
+		case "z":
+			axis = 2
+		}
+		carriages = append(carriages, carriageInfo{
+			name:       name,
+			section:    sec,
+			endstopPin: strings.TrimSpace(data["endstop_pin"]),
+			isPrimary:  true,
+			axis:       axis,
+		})
+	}
+
+	// Collect dual carriages [dual_carriage NAME]
+	for sec := range cfg.sections {
+		if !strings.HasPrefix(sec, "dual_carriage ") {
+			continue
+		}
+		name := strings.TrimPrefix(sec, "dual_carriage ")
+		data := cfg.sections[sec]
+		primaryName := strings.TrimSpace(data["primary_carriage"])
+		// Find primary's axis
+		var axis int
+		for _, c := range carriages {
+			if c.name == primaryName {
+				axis = c.axis
+				break
+			}
+		}
+		carriages = append(carriages, carriageInfo{
+			name:       name,
+			section:    sec,
+			endstopPin: strings.TrimSpace(data["endstop_pin"]),
+			isDual:     true,
+			axis:       axis,
+		})
+	}
+
+	// Collect extra carriages [extra_carriage NAME]
+	for sec := range cfg.sections {
+		if !strings.HasPrefix(sec, "extra_carriage ") {
+			continue
+		}
+		name := strings.TrimPrefix(sec, "extra_carriage ")
+		data := cfg.sections[sec]
+		primaryName := strings.TrimSpace(data["primary_carriage"])
+		// Find primary's axis
+		var axis int
+		for _, c := range carriages {
+			if c.name == primaryName {
+				axis = c.axis
+				break
+			}
+		}
+		carriages = append(carriages, carriageInfo{
+			name:       name,
+			section:    sec,
+			endstopPin: strings.TrimSpace(data["endstop_pin"]),
+			isExtra:    true,
+			axis:       axis,
+		})
+	}
+
+	// Sort carriages by section name for consistent ordering
+	sort.Slice(carriages, func(i, j int) bool {
+		return carriages[i].section < carriages[j].section
+	})
+
+	// Collect steppers [stepper NAME]
+	type stepperInfo struct {
+		name      string
+		section   string
+		stepPin   string
+		dirPin    string
+		enablePin string
+	}
+	var steppers []stepperInfo
+	for sec := range cfg.sections {
+		if !strings.HasPrefix(sec, "stepper ") {
+			continue
+		}
+		name := strings.TrimPrefix(sec, "stepper ")
+		data := cfg.sections[sec]
+		steppers = append(steppers, stepperInfo{
+			name:      name,
+			section:   sec,
+			stepPin:   strings.TrimSpace(data["step_pin"]),
+			dirPin:    strings.TrimSpace(data["dir_pin"]),
+			enablePin: strings.TrimSpace(data["enable_pin"]),
+		})
+	}
+	sort.Slice(steppers, func(i, j int) bool {
+		return steppers[i].section < steppers[j].section
+	})
+
+	// Map carriages to their endstop/trsync OIDs
+	carriageEndstopOID := make(map[string]int)
+	carriageTrsyncOID := make(map[string]int)
+
+	// Allocate endstop/trsync OIDs for carriages (starts at OID 0)
+	endstopOIDNext := 0
+	for _, c := range carriages {
+		if c.endstopPin != "" {
+			carriageEndstopOID[c.name] = endstopOIDNext
+			carriageTrsyncOID[c.name] = endstopOIDNext + 1
+			endstopOIDNext += 2
+		}
+	}
+
+	// Stepper OIDs start after all endstop/trsync OIDs
+	stepperOIDNext := endstopOIDNext
+
+	// Enable pin OIDs are allocated after all pre-assigned OIDs (23+ for generic_cartesian)
+	enableOIDNext := 23
+	if servoOID < 0 {
+		// No servo - adjust base
+		enableOIDNext = oidNext
+	}
+
+	// Process carriages and their associated steppers
+	stepperOIDs := make(map[string]int)
+	enableOIDs := make(map[string]int)
+
+	// First pass: allocate all endstop/trsync OIDs and generate commands
+	for _, c := range carriages {
+		if c.endstopPin == "" {
+			continue
+		}
+		endstopOID := carriageEndstopOID[c.name]
+		trsyncOID := carriageTrsyncOID[c.name]
+
+		pin, _, pullup := parsePinWithModifiers(c.endstopPin)
+		pullupInt := 0
+		if pullup {
+			pullupInt = 1
+		}
+
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", endstopOID, pin, pullupInt),
+			fmt.Sprintf("config_trsync oid=%d", trsyncOID),
+		)
+	}
+
+	// Allocate stepper OIDs
+	for _, s := range steppers {
+		stepperOIDs[s.name] = stepperOIDNext
+		stepperOIDNext++
+		enableOIDs[s.name] = enableOIDNext
+		enableOIDNext++
+	}
+
+	// Generate stepper config commands
+	for _, s := range steppers {
+		stepOID := stepperOIDs[s.name]
+		enableOID := enableOIDs[s.name]
+
+		stepPin, stepInvert, _ := parsePinWithModifiers(s.stepPin)
+		dirPin, _, _ := parsePinWithModifiers(s.dirPin)
+		enablePin, enableInvert, _ := parsePinWithModifiers(s.enablePin)
+
+		stepInvertInt := 0
+		if stepInvert {
+			stepInvertInt = 1
+		}
+
+		enableValue := 0
+		if enableInvert {
+			enableValue = 1
+		}
+
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+				stepOID, stepPin, dirPin, stepInvertInt, stepPulseTicks),
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=0",
+				enableOID, enablePin, enableValue, enableValue),
+		)
+	}
+
+	// Process extruder sections
+	if extSec, ok := cfg.sections["extruder"]; ok {
+		extruderADCOID := enableOIDNext
+		enableOIDNext++
+		extruderPWMOID := enableOIDNext
+		enableOIDNext++
+		extruderStepOID := stepperOIDNext
+		stepperOIDNext++
+		extruderEnableOID := enableOIDNext
+		enableOIDNext++
+
+		sensorPin := strings.TrimSpace(extSec["sensor_pin"])
+		heaterPin := strings.TrimSpace(extSec["heater_pin"])
+		stepPin, stepInvert, _ := parsePinWithModifiers(strings.TrimSpace(extSec["step_pin"]))
+		dirPin, _, _ := parsePinWithModifiers(strings.TrimSpace(extSec["dir_pin"]))
+		enablePin, enableInvert, _ := parsePinWithModifiers(strings.TrimSpace(extSec["enable_pin"]))
+
+		stepInvertInt := 0
+		if stepInvert {
+			stepInvertInt = 1
+		}
+		enableValue := 0
+		if enableInvert {
+			enableValue = 1
+		}
+
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_analog_in oid=%d pin=%s", extruderADCOID, sensorPin),
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=%d", extruderPWMOID, heaterPin, mdurTicks),
+			fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", extruderPWMOID, cycleTicks),
+			fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+				extruderStepOID, stepPin, dirPin, stepInvertInt, stepPulseTicks),
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=0",
+				extruderEnableOID, enablePin, enableValue, enableValue),
+		)
+
+		// Thermistor min/max
+		ext, err := readExtruder(cfg, "extruder")
+		if err != nil {
+			return nil, err
+		}
+		extMin, extMax, err := thermistorMinMaxTicks(ext.Heater, adcMax, adcSampleCount)
+		if err != nil {
+			return nil, err
+		}
+		initCmds = append(initCmds,
+			fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+				extruderADCOID, querySlotClock(mcuFreq, extruderADCOID), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
+			fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", extruderPWMOID, pwmInitClock),
+		)
+	}
+
+	// Process extruder1 section
+	if ext1Sec, ok := cfg.sections["extruder1"]; ok {
+		ext1ADCOID := enableOIDNext
+		enableOIDNext++
+		ext1PWMOID := enableOIDNext
+		enableOIDNext++
+		ext1StepOID := stepperOIDNext
+		stepperOIDNext++
+		ext1EnableOID := enableOIDNext
+		enableOIDNext++
+
+		sensorPin := strings.TrimSpace(ext1Sec["sensor_pin"])
+		heaterPin := strings.TrimSpace(ext1Sec["heater_pin"])
+		stepPin, stepInvert, _ := parsePinWithModifiers(strings.TrimSpace(ext1Sec["step_pin"]))
+		dirPin, _, _ := parsePinWithModifiers(strings.TrimSpace(ext1Sec["dir_pin"]))
+		enablePin, enableInvert, _ := parsePinWithModifiers(strings.TrimSpace(ext1Sec["enable_pin"]))
+
+		stepInvertInt := 0
+		if stepInvert {
+			stepInvertInt = 1
+		}
+		enableValue := 0
+		if enableInvert {
+			enableValue = 1
+		}
+
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_analog_in oid=%d pin=%s", ext1ADCOID, sensorPin),
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=%d", ext1PWMOID, heaterPin, mdurTicks),
+			fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", ext1PWMOID, cycleTicks),
+			fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+				ext1StepOID, stepPin, dirPin, stepInvertInt, stepPulseTicks),
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=0",
+				ext1EnableOID, enablePin, enableValue, enableValue),
+		)
+
+		// Thermistor min/max
+		ext1, err := readExtruder(cfg, "extruder1")
+		if err != nil {
+			return nil, err
+		}
+		ext1Min, ext1Max, err := thermistorMinMaxTicks(ext1.Heater, adcMax, adcSampleCount)
+		if err != nil {
+			return nil, err
+		}
+		initCmds = append(initCmds,
+			fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+				ext1ADCOID, querySlotClock(mcuFreq, ext1ADCOID), sampleTicks, adcSampleCount, reportTicks, ext1Min, ext1Max, adcRangeChecks),
+			fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", ext1PWMOID, pwmInitClock),
+		)
+	}
+
+	// Calculate total OID count
+	totalOIDs := enableOIDNext
+	if stepperOIDNext > totalOIDs {
+		totalOIDs = stepperOIDNext
+	}
+	// Ensure we have at least 35 OIDs for the generic_cartesian config
+	if totalOIDs < 35 {
+		totalOIDs = 35
+	}
+
+	// Prepend allocate_oids
+	withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", totalOIDs)}, configCmds...)
+	crcText := strings.Join(withAllocate, "\n")
+	crc := crc32.ChecksumIEEE([]byte(crcText))
+
+	out := make([]string, 0, len(withAllocate)+1+len(initCmds))
+	out = append(out, withAllocate...)
+	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+	out = append(out, initCmds...)
+	return out, nil
+}
+
+// parsePinWithModifiers extracts pin name and modifier flags from a pin string.
+// Examples: "^PE5" -> (PE5, false, true), "!PD7" -> (PD7, true, false)
+func parsePinWithModifiers(s string) (pin string, invert bool, pullup bool) {
+	s = strings.TrimSpace(s)
+	for len(s) > 0 {
+		switch s[0] {
+		case '^':
+			pullup = true
+			s = s[1:]
+		case '!':
+			invert = true
+			s = s[1:]
+		case '~':
+			// Ignore tilde (open-drain marker)
+			s = s[1:]
+		default:
+			return s, invert, pullup
+		}
+	}
+	return s, invert, pullup
+}
