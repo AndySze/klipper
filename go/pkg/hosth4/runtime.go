@@ -1186,8 +1186,9 @@ type stepper struct {
 	stepDist  float64
 	invertDir bool
 
-	motion *motionQueuing
-	sq     *chelper.SerialQueue
+	mcuName string // MCU this stepper belongs to (for multi-MCU routing)
+	motion  *motionQueuing
+	sq      *chelper.SerialQueue
 
 	se        *chelper.SyncEmitter
 	stepqueue *chelper.Stepcompress
@@ -1209,6 +1210,7 @@ func newStepper(
 	queueStepTag int32,
 	setDirTag int32,
 	mcuFreq float64,
+	mcuName string, // MCU name for multi-MCU routing (use "mcu" for single-MCU)
 ) (*stepper, error) {
 	se, err := motion.allocSyncEmitter(seName)
 	if err != nil {
@@ -1243,6 +1245,7 @@ func newStepper(
 		oid:       oid,
 		stepDist:  stepDist,
 		invertDir: invertDir,
+		mcuName:   mcuName,
 		motion:    motion,
 		sq:        sq,
 		se:        se,
@@ -1321,6 +1324,7 @@ func (s *stepper) checkActive(_ float64, maxStepGenTime float64) {
 type digitalOut struct {
 	oid            uint32
 	invert         bool
+	mcuName        string // MCU this output belongs to (for multi-MCU routing)
 	sq             *chelper.SerialQueue
 	cq             *chelper.CommandQueue
 	formats        map[string]*protocol.MessageFormat
@@ -1329,8 +1333,8 @@ type digitalOut struct {
 	reqClockOffset uint64
 }
 
-func newDigitalOut(oid uint32, invert bool, sq *chelper.SerialQueue, cq *chelper.CommandQueue, formats map[string]*protocol.MessageFormat, mcuFreq float64) *digitalOut {
-	return &digitalOut{oid: oid, invert: invert, sq: sq, cq: cq, formats: formats, mcuFreq: mcuFreq}
+func newDigitalOut(oid uint32, invert bool, sq *chelper.SerialQueue, cq *chelper.CommandQueue, formats map[string]*protocol.MessageFormat, mcuFreq float64, mcuName string) *digitalOut {
+	return &digitalOut{oid: oid, invert: invert, mcuName: mcuName, sq: sq, cq: cq, formats: formats, mcuFreq: mcuFreq}
 }
 
 func (d *digitalOut) setDigital(printTime float64, value bool) error {
@@ -2089,7 +2093,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		stepperAxes = [3]byte{'x', 'y', 'z'}
 	}
 
-	stX, err := newStepper(motion, sq, stepperNames[0], stepperAxes[0], oidStepperX, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stX, err := newStepper(motion, sq, stepperNames[0], stepperAxes[0], oidStepperX, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		motion.free()
 		cqMain.Free()
@@ -2097,7 +2101,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		f.Close()
 		return nil, err
 	}
-	stY, err := newStepper(motion, sq, stepperNames[1], stepperAxes[1], oidStepperY, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stY, err := newStepper(motion, sq, stepperNames[1], stepperAxes[1], oidStepperY, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stX.free()
 		motion.free()
@@ -2106,7 +2110,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		f.Close()
 		return nil, err
 	}
-	stZ, err := newStepper(motion, sq, stepperNames[2], stepperAxes[2], oidStepperZ, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stZ, err := newStepper(motion, sq, stepperNames[2], stepperAxes[2], oidStepperZ, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stY.free()
 		stX.free()
@@ -2375,7 +2379,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 
 		if hasExtraStepper {
 			stepDistExtra := extraStepperCfg.rotationDistance / float64(extraStepperCfg.fullSteps*extraStepperCfg.microsteps)
-			extraStepper, err = newStepper(motion, sq, "my_extra_stepper", 'e', 0, stepDistExtra, extraStepperCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+			extraStepper, err = newStepper(motion, sq, "my_extra_stepper", 'e', 0, stepDistExtra, extraStepperCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 			if err != nil {
 				stZ.free()
 				stY.free()
@@ -2403,7 +2407,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 				return nil, fmt.Errorf("alloc extra stepper enable command queue failed")
 			}
 			cqEnablePins = append(cqEnablePins, cqEnExtra)
-			extraStepperEn = &stepperEnablePin{out: newDigitalOut(11, extraStepperCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+			extraStepperEn = &stepperEnablePin{out: newDigitalOut(11, extraStepperCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 			motion.registerEnablePin(extraStepperEn)
 			se.registerStepper("my_extra_stepper", extraStepper, extraStepperEn)
 		}
@@ -2416,7 +2420,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		}
 
 		// Create extruder stepper
-		stE, err = newStepper(motion, sq, "extruder", 'e', oidStepperE, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+		stE, err = newStepper(motion, sq, "extruder", 'e', oidStepperE, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 		if err != nil {
 			stZ.free()
 			stY.free()
@@ -2446,7 +2450,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 			return nil, fmt.Errorf("alloc extruder enable command queue failed")
 		}
 		cqEnablePins = append(cqEnablePins, cqEnE)
-		enE = &stepperEnablePin{out: newDigitalOut(uint32(oidEnableE), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+		enE = &stepperEnablePin{out: newDigitalOut(uint32(oidEnableE), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 	}
 
 	// Create enable pins for X/Y/Z
@@ -2477,9 +2481,9 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		return nil, fmt.Errorf("alloc enable command queue failed")
 	}
 	cqEnablePins = append(cqEnablePins, cqEnX, cqEnY, cqEnZ)
-	enX := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableX), rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enY := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableY), rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enZ := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableZ), rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enX := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableX), rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enY := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableY), rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enZ := &stepperEnablePin{out: newDigitalOut(uint32(oidEnableZ), rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 	motion.registerEnablePin(enX)
 	motion.registerEnablePin(enY)
 	motion.registerEnablePin(enZ)
@@ -2639,7 +2643,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	rt.endstops[2] = &endstop{oid: oidEndstopZ, stepperOID: oidStepperZ, tr: trZ, rt: rt, mcuFreq: mcuFreq}
 
 	if _, ok := cfg.section("bltouch"); ok {
-		pwm := newDigitalOut(12, false, sq, cqMain, formats, mcuFreq)
+		pwm := newDigitalOut(12, false, sq, cqMain, formats, mcuFreq, "mcu")
 		rt.bltouch = newBLTouchController(rt, pwm, rt.endstops[2])
 	}
 
@@ -2886,7 +2890,7 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 		fullSteps := 200 // Default
 		stepDist := s.RotDist / float64(fullSteps*s.Microsteps)
 
-		st, err := newStepper(motion, sq, "stepper "+name, 'x', oid, stepDist, s.DirPin.invert, queueStepID, setDirID, mcuFreq)
+		st, err := newStepper(motion, sq, "stepper "+name, 'x', oid, stepDist, s.DirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 		if err != nil {
 			for _, prev := range gcSteppers {
 				prev.free()
@@ -2946,7 +2950,7 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 			return nil, fmt.Errorf("alloc enable command queue failed for stepper %s", name)
 		}
 		cqEnablePins = append(cqEnablePins, cqEn)
-		en := &stepperEnablePin{out: newDigitalOut(uint32(enableOID), s.EnablePin.invert, sq, cqMain, formats, mcuFreq)}
+		en := &stepperEnablePin{out: newDigitalOut(uint32(enableOID), s.EnablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 		motion.registerEnablePin(en)
 		se.registerStepper("stepper "+name, st, en)
 		gcEnablePins = append(gcEnablePins, en)
@@ -3060,7 +3064,7 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 		extEnableOID := extEnableOIDBase + 2 // +2 for ADC and PWM
 
 		stepDistE := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
-		stE, err = newStepper(motion, sq, "extruder", 'e', extStepperOID, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+		stE, err = newStepper(motion, sq, "extruder", 'e', extStepperOID, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 		if err != nil {
 			for _, st := range gcSteppers {
 				st.free()
@@ -3111,7 +3115,7 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 			return nil, fmt.Errorf("alloc extruder enable command queue failed")
 		}
 		cqEnablePins = append(cqEnablePins, cqEnE)
-		enE = &stepperEnablePin{out: newDigitalOut(uint32(extEnableOID), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+		enE = &stepperEnablePin{out: newDigitalOut(uint32(extEnableOID), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 		motion.registerEnablePin(enE)
 		se.registerStepper("extruder", stE, enE)
 	}
@@ -3452,7 +3456,7 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	stepDistZ := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
 
 	// Create stepper_x with CoreXY kinematics (type '-')
-	stX, err := newStepper(motion, sq, "stepper_x", 'x', 2, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stX, err := newStepper(motion, sq, "stepper_x", 'x', 2, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		motion.free()
 		cqMain.Free()
@@ -3486,7 +3490,7 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	stX.setTrapQ(th.trapq)
 
 	// Create stepper_y with Cartesian kinematics
-	stY, err := newStepper(motion, sq, "stepper_y", 'y', 5, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stY, err := newStepper(motion, sq, "stepper_y", 'y', 5, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stX.free()
 		motion.free()
@@ -3498,7 +3502,7 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	stY.setTrapQ(th.trapq)
 
 	// Create stepper_z with Cartesian kinematics
-	stZ, err := newStepper(motion, sq, "stepper_z", 'z', 8, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stZ, err := newStepper(motion, sq, "stepper_z", 'z', 8, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stY.free()
 		stX.free()
@@ -3511,7 +3515,7 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	stZ.setTrapQ(th.trapq)
 
 	// Create dual_carriage with CoreXY kinematics (type '+')
-	stDC, err := newStepper(motion, sq, "dual_carriage", 'x', 11, dcStepDist, dcDirPin.invert, queueStepID, setDirID, mcuFreq)
+	stDC, err := newStepper(motion, sq, "dual_carriage", 'x', 11, dcStepDist, dcDirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stZ.free()
 		stY.free()
@@ -3557,10 +3561,10 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	steppers := [3]*stepper{stX, stY, stZ}
 
 	// Create enable pins
-	enX := &stepperEnablePin{out: newDigitalOut(16, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enY := &stepperEnablePin{out: newDigitalOut(17, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enZ := &stepperEnablePin{out: newDigitalOut(18, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enDC := &stepperEnablePin{out: newDigitalOut(19, dcEnablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enX := &stepperEnablePin{out: newDigitalOut(16, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enY := &stepperEnablePin{out: newDigitalOut(17, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enZ := &stepperEnablePin{out: newDigitalOut(18, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enDC := &stepperEnablePin{out: newDigitalOut(19, dcEnablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 
 	motion.registerEnablePin(enX)
 	motion.registerEnablePin(enY)
@@ -3586,7 +3590,7 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 		return nil, err
 	}
 	stepDistE := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
-	stE, err := newStepper(motion, sq, "extruder", 'e', 12, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stE, err := newStepper(motion, sq, "extruder", 'e', 12, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		tqExtruder.Free()
 		stDC.free()
@@ -3600,7 +3604,7 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 		return nil, err
 	}
 	stE.setTrapQ(tqExtruder)
-	enE := &stepperEnablePin{out: newDigitalOut(22, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enE := &stepperEnablePin{out: newDigitalOut(22, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 	motion.registerEnablePin(enE)
 	se.registerStepper("extruder", stE, enE)
 
@@ -3624,7 +3628,7 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 			return nil, err
 		}
 		stepDistE1 := extruder1Cfg.rotationDistance / float64(extruder1Cfg.fullSteps*extruder1Cfg.microsteps)
-		stE1, err = newStepper(motion, sq, "extruder1", 'e', 13, stepDistE1, extruder1Cfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+		stE1, err = newStepper(motion, sq, "extruder1", 'e', 13, stepDistE1, extruder1Cfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 		if err != nil {
 			tqExtruder1.Free()
 			stE.free()
@@ -3640,7 +3644,7 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 			return nil, err
 		}
 		stE1.setTrapQ(tqExtruder1)
-		enE1 = &stepperEnablePin{out: newDigitalOut(25, extruder1Cfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+		enE1 = &stepperEnablePin{out: newDigitalOut(25, extruder1Cfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 		motion.registerEnablePin(enE1)
 		se.registerStepper("extruder1", stE1, enE1)
 	}
@@ -5536,7 +5540,7 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 	// 14-16: extruder (adc, pwm, enable)
 
 	// Create stepper_bed with polar kinematics (type 'a' for angle)
-	stBed, err := newStepper(motion, sq, "stepper_bed", 'a', 0, bedStepDist, bedDirPin.invert, queueStepID, setDirID, mcuFreq)
+	stBed, err := newStepper(motion, sq, "stepper_bed", 'a', 0, bedStepDist, bedDirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		motion.free()
 		cqMain.Free()
@@ -5571,7 +5575,7 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 
 	// Create stepper_arm with polar kinematics (type 'r' for radius)
 	armStepDist := armCfg.rotationDistance / float64(armCfg.fullSteps*armCfg.microsteps)
-	stArm, err := newStepper(motion, sq, "stepper_arm", 'r', 3, armStepDist, armCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stArm, err := newStepper(motion, sq, "stepper_arm", 'r', 3, armStepDist, armCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stBed.free()
 		motion.free()
@@ -5609,7 +5613,7 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 
 	// Create stepper_z with cartesian kinematics
 	zStepDist := zCfg.rotationDistance / float64(zCfg.fullSteps*zCfg.microsteps)
-	stZ, err := newStepper(motion, sq, "stepper_z", 'z', 6, zStepDist, zCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stZ, err := newStepper(motion, sq, "stepper_z", 'z', 6, zStepDist, zCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stArm.free()
 		stBed.free()
@@ -5626,9 +5630,9 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 	steppers := [3]*stepper{stBed, stArm, stZ}
 
 	// Create enable pins
-	enBed := &stepperEnablePin{out: newDigitalOut(11, bedEnablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enArm := &stepperEnablePin{out: newDigitalOut(12, armCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enZ := &stepperEnablePin{out: newDigitalOut(13, zCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enBed := &stepperEnablePin{out: newDigitalOut(11, bedEnablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enArm := &stepperEnablePin{out: newDigitalOut(12, armCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enZ := &stepperEnablePin{out: newDigitalOut(13, zCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 
 	motion.registerEnablePin(enBed)
 	motion.registerEnablePin(enArm)
@@ -5651,7 +5655,7 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 		return nil, err
 	}
 	stepDistE := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
-	stE, err := newStepper(motion, sq, "extruder", 'e', 7, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stE, err := newStepper(motion, sq, "extruder", 'e', 7, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		tqExtruder.Free()
 		stZ.free()
@@ -5664,7 +5668,7 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 		return nil, err
 	}
 	stE.setTrapQ(tqExtruder)
-	enE := &stepperEnablePin{out: newDigitalOut(16, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enE := &stepperEnablePin{out: newDigitalOut(16, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 	motion.registerEnablePin(enE)
 	se.registerStepper("extruder", stE, enE)
 
@@ -5952,7 +5956,7 @@ func newRotaryDeltaRuntime(cfg *configWrapper, dict *protocol.Dictionary, format
 	stepDistC := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
 
 	// Create stepper_a with rotary delta kinematics
-	stA, err := newStepper(motion, sq, "stepper_a", 'a', 2, stepDistA, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stA, err := newStepper(motion, sq, "stepper_a", 'a', 2, stepDistA, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		motion.free()
 		cqMain.Free()
@@ -5986,7 +5990,7 @@ func newRotaryDeltaRuntime(cfg *configWrapper, dict *protocol.Dictionary, format
 	stA.setTrapQ(th.trapq)
 
 	// Create stepper_b with rotary delta kinematics
-	stB, err := newStepper(motion, sq, "stepper_b", 'b', 5, stepDistB, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stB, err := newStepper(motion, sq, "stepper_b", 'b', 5, stepDistB, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stA.free()
 		motion.free()
@@ -6022,7 +6026,7 @@ func newRotaryDeltaRuntime(cfg *configWrapper, dict *protocol.Dictionary, format
 	stB.setTrapQ(th.trapq)
 
 	// Create stepper_c with rotary delta kinematics
-	stC, err := newStepper(motion, sq, "stepper_c", 'c', 8, stepDistC, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stC, err := newStepper(motion, sq, "stepper_c", 'c', 8, stepDistC, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stB.free()
 		stA.free()
@@ -6063,9 +6067,9 @@ func newRotaryDeltaRuntime(cfg *configWrapper, dict *protocol.Dictionary, format
 	steppers := [3]*stepper{stA, stB, stC}
 
 	// Create enable pins
-	enA := &stepperEnablePin{out: newDigitalOut(9, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enB := &stepperEnablePin{out: newDigitalOut(10, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enC := &stepperEnablePin{out: newDigitalOut(11, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enA := &stepperEnablePin{out: newDigitalOut(9, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enB := &stepperEnablePin{out: newDigitalOut(10, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enC := &stepperEnablePin{out: newDigitalOut(11, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 
 	motion.registerEnablePin(enA)
 	motion.registerEnablePin(enB)
@@ -6271,7 +6275,7 @@ func newHybridCoreXZRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	stepDistZ := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
 
 	// Create stepper_x with CoreXZ kinematics (type '-')
-	stX, err := newStepper(motion, sq, "stepper_x", 'x', 2, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stX, err := newStepper(motion, sq, "stepper_x", 'x', 2, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		motion.free()
 		cqMain.Free()
@@ -6305,7 +6309,7 @@ func newHybridCoreXZRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	stX.setTrapQ(th.trapq)
 
 	// Create stepper_y with Cartesian kinematics
-	stY, err := newStepper(motion, sq, "stepper_y", 'y', 5, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stY, err := newStepper(motion, sq, "stepper_y", 'y', 5, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stX.free()
 		motion.free()
@@ -6317,7 +6321,7 @@ func newHybridCoreXZRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	stY.setTrapQ(th.trapq)
 
 	// Create stepper_z with Cartesian kinematics
-	stZ, err := newStepper(motion, sq, "stepper_z", 'z', 8, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stZ, err := newStepper(motion, sq, "stepper_z", 'z', 8, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stY.free()
 		stX.free()
@@ -6342,7 +6346,7 @@ func newHybridCoreXZRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 		return nil, fmt.Errorf("failed to create extruder trapq: %w", err)
 	}
 	extStepDist := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
-	stE, err := newStepper(motion, sq, "extruder", 'e', 9, extStepDist, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stE, err := newStepper(motion, sq, "extruder", 'e', 9, extStepDist, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		tqExtruder.Free()
 		stZ.free()
@@ -6374,10 +6378,10 @@ func newHybridCoreXZRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 		return nil, fmt.Errorf("alloc enable command queue failed")
 	}
 	cqEnablePins = append(cqEnablePins, cqEnX, cqEnY, cqEnZ, cqEnE)
-	enX := &stepperEnablePin{out: newDigitalOut(12, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enY := &stepperEnablePin{out: newDigitalOut(13, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enZ := &stepperEnablePin{out: newDigitalOut(14, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enE := &stepperEnablePin{out: newDigitalOut(17, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enX := &stepperEnablePin{out: newDigitalOut(12, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enY := &stepperEnablePin{out: newDigitalOut(13, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enZ := &stepperEnablePin{out: newDigitalOut(14, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enE := &stepperEnablePin{out: newDigitalOut(17, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 	motion.registerEnablePin(enX)
 	motion.registerEnablePin(enY)
 	motion.registerEnablePin(enZ)
@@ -6647,7 +6651,7 @@ func newDeltesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats 
 	stepDistY := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
 
 	// Create stepper_left with Deltesian kinematics
-	stLeft, err := newStepper(motion, sq, "stepper_left", 'l', 2, stepDistLeft, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stLeft, err := newStepper(motion, sq, "stepper_left", 'l', 2, stepDistLeft, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		motion.free()
 		cqMain.Free()
@@ -6681,7 +6685,7 @@ func newDeltesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats 
 	stLeft.setTrapQ(th.trapq)
 
 	// Create stepper_right with Deltesian kinematics
-	stRight, err := newStepper(motion, sq, "stepper_right", 'r', 5, stepDistRight, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stRight, err := newStepper(motion, sq, "stepper_right", 'r', 5, stepDistRight, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stLeft.free()
 		motion.free()
@@ -6718,7 +6722,7 @@ func newDeltesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats 
 	stRight.setTrapQ(th.trapq)
 
 	// Create stepper_y with Cartesian Y kinematics
-	stY, err := newStepper(motion, sq, "stepper_y", 'y', 8, stepDistY, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stY, err := newStepper(motion, sq, "stepper_y", 'y', 8, stepDistY, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		stRight.free()
 		stLeft.free()
@@ -6743,7 +6747,7 @@ func newDeltesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats 
 		return nil, fmt.Errorf("failed to create extruder trapq: %w", err)
 	}
 	extStepDist := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
-	stE, err := newStepper(motion, sq, "extruder", 'e', 9, extStepDist, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stE, err := newStepper(motion, sq, "extruder", 'e', 9, extStepDist, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		tqExtruder.Free()
 		stY.free()
@@ -6775,10 +6779,10 @@ func newDeltesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats 
 		return nil, fmt.Errorf("alloc enable command queue failed")
 	}
 	cqEnablePins = append(cqEnablePins, cqEnLeft, cqEnRight, cqEnY, cqEnE)
-	enLeft := &stepperEnablePin{out: newDigitalOut(12, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enRight := &stepperEnablePin{out: newDigitalOut(13, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enY := &stepperEnablePin{out: newDigitalOut(14, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq)}
-	enE := &stepperEnablePin{out: newDigitalOut(17, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enLeft := &stepperEnablePin{out: newDigitalOut(12, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enRight := &stepperEnablePin{out: newDigitalOut(13, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enY := &stepperEnablePin{out: newDigitalOut(14, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enE := &stepperEnablePin{out: newDigitalOut(17, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 	motion.registerEnablePin(enLeft)
 	motion.registerEnablePin(enRight)
 	motion.registerEnablePin(enY)
@@ -7060,7 +7064,7 @@ func newWinchRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 	var winchSteppers []*stepper
 	for i, ws := range winchStepperInfos {
 		stepperOID := uint32(i)
-		st, err := newStepper(motion, sq, ws.name, byte('a'+i), stepperOID, ws.stepDist, ws.dirPin.invert, queueStepID, setDirID, mcuFreq)
+		st, err := newStepper(motion, sq, ws.name, byte('a'+i), stepperOID, ws.stepDist, ws.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 		if err != nil {
 			// Clean up previously created steppers
 			for _, s := range winchSteppers {
@@ -7108,7 +7112,7 @@ func newWinchRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 	// Create extruder stepper
 	extruderOID := uint32(numSteppers)
 	extStepDist := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
-	stE, err := newStepper(motion, sq, "extruder", 'e', extruderOID, extStepDist, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	stE, err := newStepper(motion, sq, "extruder", 'e', extruderOID, extStepDist, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
 	if err != nil {
 		for _, s := range winchSteppers {
 			s.free()
@@ -7143,7 +7147,7 @@ func newWinchRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 	enableBase := numSteppers + 1 + 2 // After extruder stepper + heater_bed ADC/PWM
 	motorOffOrder := make([]string, 0, numSteppers+1)
 	for i, ws := range winchStepperInfos {
-		enPin := &stepperEnablePin{out: newDigitalOut(uint32(enableBase+i), ws.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+		enPin := &stepperEnablePin{out: newDigitalOut(uint32(enableBase+i), ws.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 		motion.registerEnablePin(enPin)
 		se.registerStepper(ws.name, winchSteppers[i], enPin)
 		motorOffOrder = append(motorOffOrder, ws.name)
@@ -7152,7 +7156,7 @@ func newWinchRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 
 	// Create extruder enable pin
 	extEnableOID := enableBase + numSteppers + 3 // After winch enables + ext ADC + ext PWM
-	enE := &stepperEnablePin{out: newDigitalOut(uint32(extEnableOID), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enE := &stepperEnablePin{out: newDigitalOut(uint32(extEnableOID), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
 	motion.registerEnablePin(enE)
 	se.registerStepper("extruder", stE, enE)
 
