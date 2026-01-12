@@ -4,7 +4,7 @@
 # hybrid_corexz, winch kinematics and are verified to pass against Python Klipper
 # golden output.
 #
-# Test count: 34 tests
+# Test count: 35 tests
 # Pass rate: 100%
 
 # === Basic commands and motion ===
@@ -74,3 +74,6 @@ test/klippy/deltesian.test
 
 # === Winch (cable robot) kinematics ===
 test/klippy/winch.test
+
+# === Multi-MCU support ===
+test/klippy/multi_mcu_simple.test

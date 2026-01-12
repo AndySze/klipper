@@ -163,7 +163,7 @@ func writeActual(path string, srcTest string, mode string, sections []mcuSection
 		switch mode {
 		case "stub":
 			// Keep the section empty on purpose; it's a placeholder contract.
-		case "roundtrip", "copy-expected", "parsedump", "encode-raw", "host-h1", "host-h2", "host-h3", "host-h4":
+		case "roundtrip", "copy-expected", "parsedump", "encode-raw", "host-h1", "host-h1-multi", "host-h2", "host-h3", "host-h4":
 			for _, ln := range sec.lines {
 				ln = strings.TrimSpace(ln)
 				if ln == "" {
@@ -2081,7 +2081,7 @@ func main() {
 		suite   = flag.String("suite", "../test/go_migration/suites/minimal.txt", "suite file")
 		outdir  = flag.String("outdir", "../test/go_migration/golden", "golden directory")
 		only    = flag.String("only", "", "only generate for a single test (path or stem)")
-		mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw|host-h1|host-h2|host-h3|host-h4|auto")
+		mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw|host-h1|host-h1-multi|host-h2|host-h3|host-h4|auto")
 		dictdir = flag.String("dictdir", "../dict", "dictionary directory")
 		trace   = flag.Bool("trace", false, "write host trace logs (host-h4 only)")
 	)
@@ -2126,6 +2126,8 @@ func main() {
 				modeForStem = "host-h1"
 			case "macros":
 				modeForStem = "host-h4"
+			case "multi_mcu_simple":
+				modeForStem = "host-h1-multi"
 			}
 
 			args := []string{
@@ -2168,6 +2170,8 @@ func main() {
 				modeForTest = "host-h3"
 			case "linuxtest":
 				modeForTest = "host-h1"
+			case "multi_mcu_simple":
+				modeForTest = "host-h1-multi"
 			default:
 				modeForTest = "host-h4"
 			}
@@ -2352,6 +2356,74 @@ func main() {
 				sections[i].lines = lines
 			}
 			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				os.Exit(2)
+			}
+		case "host-h1-multi":
+			// Multi-MCU connect-phase compiler
+			srcTest, cfgRel, err := parseExpectedHeader(expected)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				os.Exit(2)
+			}
+			sections, err := parseExpectedSections(expected)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				os.Exit(2)
+			}
+
+			testPath := filepath.Clean(filepath.Join("..", srcTest))
+			cfgPath := filepath.Clean(filepath.Join(filepath.Dir(testPath), cfgRel))
+
+			// Load all MCU dictionaries
+			dicts := make(map[string]*protocol.Dictionary)
+			dictNames := make(map[string]string) // MCU name -> dict filename
+			for _, sec := range sections {
+				dictPath := filepath.Join(*dictdir, sec.dict)
+				dict, err := protocol.LoadDictionary(dictPath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: load dict %s: %v\n", dictPath, err)
+					os.Exit(2)
+				}
+				dicts[sec.name] = dict
+				dictNames[sec.name] = sec.dict
+			}
+
+			// Compile multi-MCU config
+			compiled, err := hosth1.CompileMultiMCUCartesianConnectPhase(cfgPath, dicts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: compile multi-MCU H1: %v\n", err)
+				os.Exit(2)
+			}
+
+			// Build output sections
+			var outSections []mcuSection
+			for mcuName, commands := range compiled {
+				dict := dicts[mcuName]
+				dictName := dictNames[mcuName]
+
+				raw, err := protocol.EncodeDebugOutputFromText(dict, commands)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: encode raw for %s: %v\n", mcuName, err)
+					os.Exit(2)
+				}
+				rawPath := filepath.Join(caseDir, fmt.Sprintf("raw-host-h1-multi-%s.bin", mcuName))
+				if err := os.WriteFile(rawPath, raw, 0o644); err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: write raw %s: %v\n", rawPath, err)
+					os.Exit(2)
+				}
+				lines, err := protocol.DecodeDebugOutput(dict, raw)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: decode raw %s: %v\n", rawPath, err)
+					os.Exit(2)
+				}
+				outSections = append(outSections, mcuSection{
+					name:  mcuName,
+					dict:  dictName,
+					lines: lines,
+				})
+			}
+			if err := writeActual(actual, testRel, modeForTest, outSections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
