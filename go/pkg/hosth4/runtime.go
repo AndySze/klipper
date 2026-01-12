@@ -1894,6 +1894,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		return newDeltesianRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
 	}
 
+	// For winch, use separate initialization path
+	isWinch := kinType == "winch"
+	if isWinch {
+		return newWinchRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
+	}
+
 	var sx, sy, sz stepperCfg
 	if isDelta {
 		// Delta uses stepper_a, stepper_b, stepper_c
@@ -6927,4 +6933,298 @@ func newDeltesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats 
 	}
 
 	return rtDeltesian, nil
+}
+
+// newWinchRuntime creates a runtime for winch (cable robot) kinematics.
+// Winch uses stepper_a through stepper_d (or more), each with anchor_x, anchor_y, anchor_z.
+// Homing is not implemented for winch - the toolhead position is assumed to start at 0,0,0.
+func newWinchRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[string]*protocol.MessageFormat, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel float64, queueStepID, setDirID int32) (*runtime, error) {
+	// Find all stepper sections (stepper_a through stepper_z)
+	type winchStepperInfo struct {
+		name      string
+		sec       map[string]string
+		anchorX   float64
+		anchorY   float64
+		anchorZ   float64
+		dirPin    pin
+		enablePin pin
+		stepDist  float64
+	}
+	var winchStepperInfos []winchStepperInfo
+	for i := 0; i < 26; i++ {
+		name := "stepper_" + string('a'+byte(i))
+		sec, ok := cfg.section(name)
+		if !ok && i >= 3 {
+			break
+		}
+		if !ok {
+			return nil, fmt.Errorf("missing required [%s] section for winch kinematics", name)
+		}
+
+		// Parse anchor coordinates
+		anchorX, _ := strconv.ParseFloat(sec["anchor_x"], 64)
+		anchorY, _ := strconv.ParseFloat(sec["anchor_y"], 64)
+		anchorZ, _ := strconv.ParseFloat(sec["anchor_z"], 64)
+
+		// Parse stepper config (we don't need endstop for winch - homing not implemented)
+		_, err := parsePin(sec, "step_pin", true, false)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		dirPin, err := parsePin(sec, "dir_pin", true, false)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		enablePin, err := parsePin(sec, "enable_pin", true, false)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+
+		microsteps := 16
+		if v := sec["microsteps"]; v != "" {
+			microsteps, _ = strconv.Atoi(v)
+		}
+		rotDist := 40.0
+		if v := sec["rotation_distance"]; v != "" {
+			rotDist, _ = strconv.ParseFloat(v, 64)
+		}
+		stepDist := rotDist / float64(200*microsteps)
+
+		ws := winchStepperInfo{
+			name:      name,
+			sec:       sec,
+			anchorX:   anchorX,
+			anchorY:   anchorY,
+			anchorZ:   anchorZ,
+			dirPin:    dirPin,
+			enablePin: enablePin,
+			stepDist:  stepDist,
+		}
+		winchStepperInfos = append(winchStepperInfos, ws)
+	}
+	numSteppers := len(winchStepperInfos)
+
+	// Read extruder config
+	extruderCfg, err := readExtruderStepper(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create serial queue output file
+	tmpDir := filepath.Join("out", "go_migration_tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, err
+	}
+	rawPath := filepath.Join(tmpDir, "serial-"+randSuffix()+".bin")
+	f, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	sq, err := chelper.NewSerialQueue(int(f.Fd()), 'f', 0, "serialq mcu")
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	sq.SetClockEst(1e12, chelper.Monotonic(), 0, 0)
+
+	cqMain := chelper.NewCommandQueue()
+	if cqMain == nil {
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc main command queue failed")
+	}
+	cqEnablePins := []*chelper.CommandQueue{}
+
+	reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
+	motion, err := newMotionQueuing(sq, mcuFreq, reservedMoveSlots)
+	if err != nil {
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	// Winch has 4 axes for toolhead (X, Y, Z position mapping to cable lengths + E)
+	numAxes := 4
+	th, err := newToolhead(mcuFreq, motion, maxVelocity, maxAccel, numAxes)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	// Create winch steppers - each cable stepper maps 3D position to cable length
+	var winchSteppers []*stepper
+	for i, ws := range winchStepperInfos {
+		stepperOID := uint32(i)
+		st, err := newStepper(motion, sq, ws.name, byte('a'+i), stepperOID, ws.stepDist, ws.dirPin.invert, queueStepID, setDirID, mcuFreq)
+		if err != nil {
+			// Clean up previously created steppers
+			for _, s := range winchSteppers {
+				s.free()
+			}
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+		// Replace cartesian kinematics with winch kinematics
+		if st.sk != nil {
+			st.sk.Free()
+		}
+		sk, err := chelper.NewWinchStepperKinematics(ws.anchorX, ws.anchorY, ws.anchorZ)
+		if err != nil {
+			st.free()
+			for _, s := range winchSteppers {
+				s.free()
+			}
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("failed to create winch kinematics for %s: %w", ws.name, err)
+		}
+		if err := st.se.SetStepperKinematics(sk); err != nil {
+			sk.Free()
+			st.free()
+			for _, s := range winchSteppers {
+				s.free()
+			}
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+		st.sk = sk
+		st.setTrapQ(th.trapq)
+		winchSteppers = append(winchSteppers, st)
+	}
+
+	// Create extruder stepper
+	extruderOID := uint32(numSteppers)
+	extStepDist := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
+	stE, err := newStepper(motion, sq, "extruder", 'e', extruderOID, extStepDist, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		for _, s := range winchSteppers {
+			s.free()
+		}
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	// Create extruder trapq
+	extTrapQ, err := chelper.NewTrapQ()
+	if err != nil {
+		stE.free()
+		for _, s := range winchSteppers {
+			s.free()
+		}
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stE.setTrapQ(extTrapQ)
+
+	// Create stepper enable manager
+	se := newStepperEnable(th)
+
+	// Create enable pins
+	// OID layout: 0..n-1 steppers, n extruder, n+1 bed ADC, n+2 bed PWM, n+3..2n+2 enables, 2n+3 ext ADC, 2n+4 ext PWM, 2n+5 ext enable
+	enableBase := numSteppers + 1 + 2 // After extruder stepper + heater_bed ADC/PWM
+	motorOffOrder := make([]string, 0, numSteppers+1)
+	for i, ws := range winchStepperInfos {
+		enPin := &stepperEnablePin{out: newDigitalOut(uint32(enableBase+i), ws.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+		motion.registerEnablePin(enPin)
+		se.registerStepper(ws.name, winchSteppers[i], enPin)
+		motorOffOrder = append(motorOffOrder, ws.name)
+	}
+	motorOffOrder = append(motorOffOrder, "extruder")
+
+	// Create extruder enable pin
+	extEnableOID := enableBase + numSteppers + 3 // After winch enables + ext ADC + ext PWM
+	enE := &stepperEnablePin{out: newDigitalOut(uint32(extEnableOID), extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	motion.registerEnablePin(enE)
+	se.registerStepper("extruder", stE, enE)
+
+	extAxis := newExtruderAxis("extruder", extTrapQ)
+
+	mcu := &mcu{freq: mcuFreq, clock: 0}
+
+	// Set up GCodeMove and BedMesh
+	gm := newGCodeMove(th, 0.5)
+	bm, err := newBedMesh(cfg, th)
+	if err != nil {
+		extTrapQ.Free()
+		stE.free()
+		for _, s := range winchSteppers {
+			s.free()
+		}
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	// Use 3 steppers for rails/steppers array (compatibility with runtime struct)
+	var dummySteppers [3]*stepper
+	if len(winchSteppers) >= 3 {
+		dummySteppers = [3]*stepper{winchSteppers[0], winchSteppers[1], winchSteppers[2]}
+	}
+
+	// Use dummy rails for position limits (winch doesn't have traditional X/Y/Z bounds)
+	dummyRails := [3]stepperCfg{}
+
+	rtWinch := &runtime{
+		cfg:           cfg,
+		dict:          dict,
+		formats:       formats,
+		mcuFreq:       mcuFreq,
+		queueStepID:   queueStepID,
+		setDirID:      setDirID,
+		sq:            sq,
+		cqMain:        cqMain,
+		cqEnablePins:  cqEnablePins,
+		motion:        motion,
+		toolhead:      th,
+		stepperEnable: se,
+		rails:         dummyRails,
+		steppers:      dummySteppers,
+		extruderCfg:   extruderCfg,
+		stepperE:      stE,
+		extruder:      extAxis,
+		gm:            gm,
+		motorOffOrder: motorOffOrder,
+		bedMesh:       bm,
+		mcu:           mcu,
+		rawPath:       rawPath,
+		rawFile:       f,
+	}
+
+	// Initialize heater manager
+	rtWinch.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rtWinch))
+
+	// Load and setup heaters from config
+	winchHeaterConfigs, err := readHeaterConfigs(cfg)
+	if err != nil {
+		rtWinch.tracef("Warning: failed to load heater configs: %v\n", err)
+	} else {
+		for _, hc := range winchHeaterConfigs {
+			if err := rtWinch.setupHeater(hc); err != nil {
+				rtWinch.tracef("Warning: failed to setup heater %s: %v\n", hc.name, err)
+			}
+		}
+	}
+
+	return rtWinch, nil
 }

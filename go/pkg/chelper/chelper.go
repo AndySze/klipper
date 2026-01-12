@@ -41,6 +41,9 @@ struct stepper_kinematics *rotary_delta_stepper_alloc(double shoulder_radius
 
 // kin_deltesian.c - deltesian kinematics
 struct stepper_kinematics *deltesian_stepper_alloc(double arm2, double arm_x);
+
+// kin_winch.c - winch (cable robot) kinematics
+struct stepper_kinematics *winch_stepper_alloc(double anchor_x, double anchor_y, double anchor_z);
 */
 import "C"
 
@@ -616,6 +619,17 @@ func NewDeltesianStepperKinematics(arm2, armX float64) (*StepperKinematics, erro
 	sk := C.deltesian_stepper_alloc(C.double(arm2), C.double(armX))
 	if sk == nil {
 		return nil, fmt.Errorf("deltesian_stepper_alloc failed")
+	}
+	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
+// NewWinchStepperKinematics creates a winch (cable robot) stepper kinematics.
+// Parameters:
+//   - anchorX, anchorY, anchorZ: 3D position of the anchor point for this cable
+func NewWinchStepperKinematics(anchorX, anchorY, anchorZ float64) (*StepperKinematics, error) {
+	sk := C.winch_stepper_alloc(C.double(anchorX), C.double(anchorY), C.double(anchorZ))
+	if sk == nil {
+		return nil, fmt.Errorf("winch_stepper_alloc failed")
 	}
 	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
 }

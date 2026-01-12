@@ -1,0 +1,5 @@
+# Test winch (cable robot) kinematics (connect phase only)
+# Winch kinematics does not support homing, so we only test the connect phase.
+DICTIONARY atmega2560.dict
+CONFIG ../../config/example-winch.cfg
+M105
