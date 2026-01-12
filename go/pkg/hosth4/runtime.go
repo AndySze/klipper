@@ -1730,6 +1730,9 @@ type runtime struct {
 	dualCarriage       *stepper
 	dualCarriageActive int // 0 = primary (stepper_x), 1 = secondary (dual_carriage)
 
+	// Polar kinematics flag
+	isPolar bool
+
 	// Multiple extruder support
 	stepperE1     *stepper
 	extruder1     *extruderAxis
@@ -1865,6 +1868,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	// For hybrid_corexy, use separate initialization path
 	if isHybridCoreXY {
 		return newHybridCoreXYRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
+	}
+
+	// For polar, use separate initialization path
+	isPolar := kinType == "polar"
+	if isPolar {
+		return newPolarRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
 	}
 
 	var sx, sy, sz stepperCfg
@@ -5382,4 +5391,386 @@ func reservedMoveSlotsForConfig(cfg *configWrapper) int {
 		}
 	}
 	return slots
+}
+
+// newPolarRuntime creates a runtime for polar kinematics.
+// Polar printers have a rotating bed (stepper_bed), a linear arm (stepper_arm), and a Z axis.
+func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[string]*protocol.MessageFormat, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel float64, queueStepID, setDirID int32) (*runtime, error) {
+	// Read stepper_bed config (no endstop - rotating bed)
+	bedSec, ok := cfg.section("stepper_bed")
+	if !ok {
+		return nil, fmt.Errorf("missing [stepper_bed] section for polar kinematics")
+	}
+	_, err := parsePin(bedSec, "step_pin", true, false) // step pin is parsed but used via MCU config
+	if err != nil {
+		return nil, fmt.Errorf("stepper_bed: %w", err)
+	}
+	bedDirPin, err := parsePin(bedSec, "dir_pin", true, false)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_bed: %w", err)
+	}
+	bedEnablePin, err := parsePin(bedSec, "enable_pin", true, false)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_bed: %w", err)
+	}
+	// gear_ratio for polar bed (e.g., 80:16)
+	bedMicrosteps := 16
+	if v := bedSec["microsteps"]; v != "" {
+		bedMicrosteps, _ = strconv.Atoi(v)
+	}
+	// For polar bed, full rotation = 360 degrees
+	// With gear_ratio 80:16 (5:1), motor does 5 full rotations per bed rotation
+	// rotation_distance is effectively 360 degrees
+	bedRotDist := 360.0 // One full rotation in degrees
+	bedGearRatio := 1.0
+	if v := bedSec["gear_ratio"]; v != "" {
+		// Parse gear_ratio like "80:16"
+		parts := strings.Split(v, ":")
+		if len(parts) == 2 {
+			n1, _ := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+			n2, _ := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			if n2 != 0 {
+				bedGearRatio = n1 / n2
+			}
+		}
+	}
+	bedStepDist := bedRotDist / (float64(200*bedMicrosteps) * bedGearRatio)
+
+	// Read stepper_arm config (with endstop - linear arm)
+	armCfg, err := readStepperByName(cfg, "stepper_arm", 'r')
+	if err != nil {
+		return nil, err
+	}
+
+	// Read stepper_z config
+	zCfg, err := readStepperByName(cfg, "stepper_z", 'z')
+	if err != nil {
+		return nil, err
+	}
+
+	// Read extruder config
+	extruderCfg, err := readExtruderStepper(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create serial queue output file
+	tmpDir := filepath.Join("out", "go_migration_tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, err
+	}
+	rawPath := filepath.Join(tmpDir, "serial-"+randSuffix()+".bin")
+	f, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	sq, err := chelper.NewSerialQueue(int(f.Fd()), 'f', 0, "serialq mcu")
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	sq.SetClockEst(1e12, chelper.Monotonic(), 0, 0)
+
+	cqMain := chelper.NewCommandQueue()
+	if cqMain == nil {
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc main command queue failed")
+	}
+	cqEnablePins := []*chelper.CommandQueue{}
+
+	reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
+	motion, err := newMotionQueuing(sq, mcuFreq, reservedMoveSlots)
+	if err != nil {
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	numAxes := 4 // bed (angle), arm (radius), Z, E
+	th, err := newToolhead(mcuFreq, motion, maxVelocity, maxAccel, numAxes)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	se := newStepperEnable(th)
+
+	// OID layout for polar:
+	// 0: stepper_bed (step)
+	// 1-3: stepper_arm (endstop, trsync, step)
+	// 4-6: stepper_z (endstop, trsync, step)
+	// 7: extruder step
+	// 8-9: heater_bed (adc, pwm)
+	// 10: fan pwm
+	// 11-13: enable pins (bed, arm, z)
+	// 14-16: extruder (adc, pwm, enable)
+
+	// Create stepper_bed with polar kinematics (type 'a' for angle)
+	stBed, err := newStepper(motion, sq, "stepper_bed", 'a', 0, bedStepDist, bedDirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	// Replace cartesian kinematics with polar kinematics
+	if stBed.sk != nil {
+		stBed.sk.Free()
+	}
+	skBed, err := chelper.NewPolarStepperKinematics('a')
+	if err != nil {
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create polar kinematics for stepper_bed: %w", err)
+	}
+	if err := stBed.se.SetStepperKinematics(skBed); err != nil {
+		skBed.Free()
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stBed.sk = skBed
+	stBed.setTrapQ(th.trapq)
+
+	// Create stepper_arm with polar kinematics (type 'r' for radius)
+	armStepDist := armCfg.rotationDistance / float64(armCfg.fullSteps*armCfg.microsteps)
+	stArm, err := newStepper(motion, sq, "stepper_arm", 'r', 3, armStepDist, armCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	// Replace cartesian kinematics with polar kinematics
+	if stArm.sk != nil {
+		stArm.sk.Free()
+	}
+	skArm, err := chelper.NewPolarStepperKinematics('r')
+	if err != nil {
+		stArm.free()
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("failed to create polar kinematics for stepper_arm: %w", err)
+	}
+	if err := stArm.se.SetStepperKinematics(skArm); err != nil {
+		skArm.Free()
+		stArm.free()
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stArm.sk = skArm
+	stArm.setTrapQ(th.trapq)
+
+	// Create stepper_z with cartesian kinematics
+	zStepDist := zCfg.rotationDistance / float64(zCfg.fullSteps*zCfg.microsteps)
+	stZ, err := newStepper(motion, sq, "stepper_z", 'z', 6, zStepDist, zCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		stArm.free()
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stZ.setTrapQ(th.trapq)
+
+	// Use steppers array with 3 elements for compatibility
+	// Note: polar has bed (angle), arm (radius), z - different from X/Y/Z
+	steppers := [3]*stepper{stBed, stArm, stZ}
+
+	// Create enable pins
+	enBed := &stepperEnablePin{out: newDigitalOut(11, bedEnablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enArm := &stepperEnablePin{out: newDigitalOut(12, armCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	enZ := &stepperEnablePin{out: newDigitalOut(13, zCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+
+	motion.registerEnablePin(enBed)
+	motion.registerEnablePin(enArm)
+	motion.registerEnablePin(enZ)
+
+	se.registerStepper("stepper_bed", stBed, enBed)
+	se.registerStepper("stepper_arm", stArm, enArm)
+	se.registerStepper("stepper_z", stZ, enZ)
+
+	// Create extruder
+	tqExtruder, err := chelper.NewTrapQ()
+	if err != nil {
+		stZ.free()
+		stArm.free()
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stepDistE := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
+	stE, err := newStepper(motion, sq, "extruder", 'e', 7, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq)
+	if err != nil {
+		tqExtruder.Free()
+		stZ.free()
+		stArm.free()
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stE.setTrapQ(tqExtruder)
+	enE := &stepperEnablePin{out: newDigitalOut(16, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq)}
+	motion.registerEnablePin(enE)
+	se.registerStepper("extruder", stE, enE)
+
+	// Create kinematics for bounds checking
+	// Note: polar doesn't have traditional X/Y bounds - use arm (radius) range
+	kinRails := []kinematics.Rail{
+		{
+			Name:            "stepper_arm",
+			StepDist:        armStepDist,
+			PositionMin:     0,                  // Radius min (center)
+			PositionMax:     armCfg.positionMax, // Radius max
+			HomingSpeed:     armCfg.homingSpeed,
+			PositionEndstop: armCfg.positionEndstop,
+			HomingPositive:  armCfg.homingPositiveDir,
+		},
+		{
+			Name:            "stepper_z",
+			StepDist:        zStepDist,
+			PositionMin:     zCfg.positionMin,
+			PositionMax:     zCfg.positionMax,
+			HomingSpeed:     zCfg.homingSpeed,
+			PositionEndstop: zCfg.positionEndstop,
+			HomingPositive:  zCfg.homingPositiveDir,
+		},
+	}
+
+	kinCfg := kinematics.Config{
+		Type:         "polar",
+		Rails:        kinRails,
+		MaxZVelocity: maxZVelocity,
+		MaxZAccel:    maxZAccel,
+	}
+	_, err = kinematics.NewFromConfig(kinCfg)
+	if err != nil {
+		stE.free()
+		tqExtruder.Free()
+		stZ.free()
+		stArm.free()
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	extAxis := newExtruderAxis("extruder", tqExtruder)
+
+	mcu := &mcu{freq: mcuFreq, clock: 0}
+
+	bm, err := newBedMesh(cfg, th)
+	if err != nil {
+		stE.free()
+		tqExtruder.Free()
+		stZ.free()
+		stArm.free()
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	motorOffOrder := []string{"stepper_bed", "stepper_arm", "stepper_z", "extruder"}
+
+	// G-code arcs resolution
+	mmPerArcSegment, err := readGcodeArcsResolution(cfg)
+	if err != nil {
+		stE.free()
+		tqExtruder.Free()
+		stZ.free()
+		stArm.free()
+		stBed.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	gm := newGCodeMove(th, mmPerArcSegment)
+
+	// Use dummy rails for runtime struct (polar doesn't have X/Y/Z rails)
+	dummyRails := [3]stepperCfg{
+		{positionMin: 0, positionMax: armCfg.positionMax},               // Use arm range as X
+		{positionMin: -armCfg.positionMax, positionMax: armCfg.positionMax}, // Y is symmetric
+		zCfg,
+	}
+
+	rt := &runtime{
+		cfg:           cfg,
+		dict:          dict,
+		formats:       formats,
+		mcuFreq:       mcuFreq,
+		queueStepID:   queueStepID,
+		setDirID:      setDirID,
+		sq:            sq,
+		cqMain:        cqMain,
+		cqEnablePins:  cqEnablePins,
+		motion:        motion,
+		toolhead:      th,
+		stepperEnable: se,
+		rails:         dummyRails,
+		steppers:      steppers,
+		extruderCfg:   extruderCfg,
+		stepperE:      stE,
+		extruder:      extAxis,
+		gm:            gm,
+		motorOffOrder: motorOffOrder,
+		bedMesh:       bm,
+		mcu:           mcu,
+		rawPath:       rawPath,
+		rawFile:       f,
+		isPolar:       true, // Flag for polar-specific behavior
+	}
+
+	// Initialize heater manager
+	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
+
+	// Load and setup heaters from config
+	heaterConfigs, err := readHeaterConfigs(cfg)
+	if err != nil {
+		rt.tracef("Warning: failed to load heater configs: %v\n", err)
+	} else {
+		for _, hc := range heaterConfigs {
+			if err := rt.setupHeater(hc); err != nil {
+				rt.tracef("Warning: failed to setup heater %s: %v\n", hc.name, err)
+			}
+		}
+	}
+
+	return rt, nil
 }

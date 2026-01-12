@@ -28,6 +28,9 @@ void generic_cartesian_stepper_set_coeffs(struct stepper_kinematics *sk
 
 // kin_corexy.c - corexy kinematics
 struct stepper_kinematics *corexy_stepper_alloc(char type);
+
+// kin_polar.c - polar kinematics
+struct stepper_kinematics *polar_stepper_alloc(char type);
 */
 import "C"
 
@@ -557,6 +560,16 @@ func NewCoreXYStepperKinematics(stepperType byte) (*StepperKinematics, error) {
 	sk := C.corexy_stepper_alloc(C.char(stepperType))
 	if sk == nil {
 		return nil, fmt.Errorf("corexy_stepper_alloc failed")
+	}
+	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
+// NewPolarStepperKinematics creates a polar stepper kinematics.
+// stepperType should be 'r' for radius (stepper_arm) or 'a' for angle (stepper_bed).
+func NewPolarStepperKinematics(stepperType byte) (*StepperKinematics, error) {
+	sk := C.polar_stepper_alloc(C.char(stepperType))
+	if sk == nil {
+		return nil, fmt.Errorf("polar_stepper_alloc failed")
 	}
 	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
 }

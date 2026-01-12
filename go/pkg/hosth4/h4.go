@@ -41,6 +41,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"generic_cartesian.cfg":            true, // Generic cartesian kinematics
 		"corexyuv.cfg":                     true, // CoreXY UV (generic cartesian)
 		"hybrid_corexy_dual_carriage.cfg":  true, // Hybrid CoreXY with dual carriage
+		"example-polar.cfg":                true, // Polar kinematics
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)
@@ -54,9 +55,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		return nil, fmt.Errorf("missing [printer] section")
 	}
 	kin := strings.TrimSpace(printerSec["kinematics"])
-	// Support cartesian, corexy, corexz, delta, generic_cartesian, hybrid_corexy kinematics, and "none" for sensor-only configs
-	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" && kin != "generic_cartesian" && kin != "hybrid_corexy" && kin != "none" {
-		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta/generic_cartesian/hybrid_corexy/none kinematics (got %q)", kin)
+	// Support cartesian, corexy, corexz, delta, generic_cartesian, hybrid_corexy, polar kinematics, and "none" for sensor-only configs
+	if kin != "cartesian" && kin != "corexy" && kin != "corexz" && kin != "delta" && kin != "generic_cartesian" && kin != "hybrid_corexy" && kin != "polar" && kin != "none" {
+		return nil, fmt.Errorf("host-h4 only supports cartesian/corexy/corexz/delta/generic_cartesian/hybrid_corexy/polar/none kinematics (got %q)", kin)
 	}
 
 	rt, err := newRuntime(cfgPath, dict, cfg)
@@ -136,6 +137,12 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	} else if kin == "hybrid_corexy" {
 		// Use hybrid corexy connect-phase compiler
 		initLines, err = hosth1.CompileHybridCoreXYConnectPhase(cfgPath, dict)
+		if err != nil {
+			return nil, err
+		}
+	} else if kin == "polar" {
+		// Use polar connect-phase compiler
+		initLines, err = hosth1.CompilePolarConnectPhase(cfgPath, dict)
 		if err != nil {
 			return nil, err
 		}

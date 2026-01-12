@@ -19,9 +19,13 @@ func NewFromConfig(cfg Config) (Kinematics, error) {
 	// Normalize the kinematic type
 	kinType := strings.ToLower(strings.TrimSpace(cfg.Type))
 
-	// Validate rails configuration
-	if len(cfg.Rails) < 3 {
-		return nil, fmt.Errorf("kinematics requires at least 3 rails, got %d", len(cfg.Rails))
+	// Polar requires at least 2 rails (arm, z), others require 3
+	minRails := 3
+	if kinType == "polar" {
+		minRails = 2
+	}
+	if len(cfg.Rails) < minRails {
+		return nil, fmt.Errorf("kinematics %s requires at least %d rails, got %d", kinType, minRails, len(cfg.Rails))
 	}
 
 	// Create the appropriate kinematics instance
@@ -34,6 +38,9 @@ func NewFromConfig(cfg Config) (Kinematics, error) {
 
 	case "corexz":
 		return NewCoreXZKinematics(cfg.Rails, cfg.MaxZVelocity, cfg.MaxZAccel), nil
+
+	case "polar":
+		return NewPolarKinematics(cfg.Rails, cfg.MaxZVelocity, cfg.MaxZAccel), nil
 
 	default:
 		return nil, fmt.Errorf("unsupported kinematics type: %s", cfg.Type)
@@ -187,7 +194,7 @@ func LoadFromPrinterConfig(printerCfg map[string]map[string]string) (Kinematics,
 func IsSupported(kinType string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(kinType))
 	switch normalized {
-	case "cartesian", "corexy", "corexz", "delta":
+	case "cartesian", "corexy", "corexz", "delta", "polar":
 		return true
 	default:
 		return false
@@ -196,5 +203,5 @@ func IsSupported(kinType string) bool {
 
 // SupportedTypes returns a list of supported kinematic types.
 func SupportedTypes() []string {
-	return []string{"cartesian", "corexy", "corexz", "delta"}
+	return []string{"cartesian", "corexy", "corexz", "delta", "polar"}
 }

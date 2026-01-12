@@ -2482,3 +2482,223 @@ func CompileHybridCoreXYConnectPhase(cfgPath string, dict *protocol.Dictionary) 
 	out = append(out, initCmds...)
 	return out, nil
 }
+
+// CompilePolarConnectPhase generates connect-phase commands for polar kinematics.
+// Polar printers have a rotating bed (stepper_bed), a linear arm (stepper_arm), and a Z axis.
+func CompilePolarConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+	if err != nil {
+		return nil, err
+	}
+	mcuFreq := clockFreq
+	adcMax, err := dictConfigFloat(dict, "ADC_MAX")
+	if err != nil {
+		return nil, err
+	}
+
+	stepPulseTicks := 32 // 2us at 16MHz
+
+	// OID layout for polar:
+	// 0: stepper_bed step
+	// 1: stepper_arm endstop
+	// 2: stepper_arm trsync
+	// 3: stepper_arm step
+	// 4: stepper_z endstop
+	// 5: stepper_z trsync
+	// 6: stepper_z step
+	// 7: extruder step
+	// 8: heater_bed ADC
+	// 9: heater_bed PWM
+	// 10: fan PWM
+	// 11: stepper_bed enable
+	// 12: stepper_arm enable
+	// 13: stepper_z enable
+	// 14: extruder ADC
+	// 15: extruder PWM
+	// 16: extruder enable
+	type polarOIDs struct {
+		stepperBed int
+		endstopArm int
+		trsyncArm  int
+		stepperArm int
+		endstopZ   int
+		trsyncZ    int
+		stepperZ   int
+		stepperE   int
+		adcBed     int
+		pwmBed     int
+		pwmFan     int
+		enableBed  int
+		enableArm  int
+		enableZ    int
+		adcE       int
+		pwmE       int
+		enableE    int
+		count      int
+	}
+	o := polarOIDs{
+		stepperBed: 0,
+		endstopArm: 1,
+		trsyncArm:  2,
+		stepperArm: 3,
+		endstopZ:   4,
+		trsyncZ:    5,
+		stepperZ:   6,
+		stepperE:   7,
+		adcBed:     8,
+		pwmBed:     9,
+		pwmFan:     10,
+		enableBed:  11,
+		enableArm:  12,
+		enableZ:    13,
+		adcE:       14,
+		pwmE:       15,
+		enableE:    16,
+		count:      17,
+	}
+
+	// Parse stepper_bed (rotating bed, no endstop)
+	bedSec, ok := cfg.sections["stepper_bed"]
+	if !ok {
+		return nil, fmt.Errorf("missing [stepper_bed] section")
+	}
+	bedStep, err := parsePin(bedSec, "step_pin", true, false)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_bed step_pin: %w", err)
+	}
+	bedDir, err := parsePin(bedSec, "dir_pin", true, false)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_bed dir_pin: %w", err)
+	}
+	bedEnable, err := parsePin(bedSec, "enable_pin", true, false)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_bed enable_pin: %w", err)
+	}
+
+	// Parse stepper_arm (linear arm with endstop)
+	stepperArm, err := readStepper(cfg, "stepper_arm")
+	if err != nil {
+		return nil, fmt.Errorf("stepper_arm: %w", err)
+	}
+
+	// Parse stepper_z
+	stepperZ, err := readStepper(cfg, "stepper_z")
+	if err != nil {
+		return nil, fmt.Errorf("stepper_z: %w", err)
+	}
+
+	// Parse extruder
+	extruder, err := readExtruder(cfg, "extruder")
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse heater_bed
+	bed, err := readHeater(cfg, "heater_bed")
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse fan
+	fanSec, ok := cfg.sections["fan"]
+	if !ok {
+		return nil, fmt.Errorf("missing [fan] section")
+	}
+	fanPin, err := parsePin(fanSec, "pin", true, false)
+	if err != nil {
+		return nil, fmt.Errorf("fan pin: %w", err)
+	}
+
+	// Temperature thresholds (from sensor types)
+	adcSampleCount := 8
+	bedMin, bedMax, err := thermistorMinMaxTicks(bed, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+	extMin, extMax, err := thermistorMinMaxTicks(extruder.Heater, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+
+	// PWM cycle settings
+	mdurTicks := 3000 * int(mcuFreq)    // max_duration=3s for heaters
+	cycleTicks := int(mcuFreq / 10)     // 0.1s cycle for heaters
+	fanCycleTicks := int(mcuFreq / 100) // 0.01s cycle for fan
+
+	// ADC query settings
+	sampleTicks := 16000
+	reportTicks := int(0.3 * mcuFreq) // ~0.3s
+	adcRangeChecks := 4
+	pwmInitClock := int(0.2 * mcuFreq)
+
+	configCmds := []string{
+		// heater_bed
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", o.adcBed, bed.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.pwmBed, bed.HeaterPin.pin, 0, 0, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmBed, cycleTicks),
+
+		// fan
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.pwmFan, fanPin.pin, 0, 0, 0),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmFan, fanCycleTicks),
+
+		// stepper_bed (no endstop)
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperBed, bedStep.pin, bedDir.pin, boolToInt(bedStep.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableBed, bedEnable.pin, boolToInt(bedEnable.invert), boolToInt(bedEnable.invert), 0),
+
+		// stepper_arm (with endstop and trsync)
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopArm, stepperArm.Endstop.pin, stepperArm.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", o.trsyncArm),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperArm, stepperArm.Step.pin, stepperArm.Dir.pin, boolToInt(stepperArm.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableArm, stepperArm.Enable.pin, boolToInt(stepperArm.Enable.invert), boolToInt(stepperArm.Enable.invert), 0),
+
+		// stepper_z (with endstop and trsync)
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopZ, stepperZ.Endstop.pin, stepperZ.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", o.trsyncZ),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperZ, stepperZ.Step.pin, stepperZ.Dir.pin, boolToInt(stepperZ.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableZ, stepperZ.Enable.pin, boolToInt(stepperZ.Enable.invert), boolToInt(stepperZ.Enable.invert), 0),
+
+		// extruder
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", o.adcE, extruder.Heater.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.pwmE, extruder.Heater.HeaterPin.pin, 0, 0, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmE, cycleTicks),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperE, extruder.Step.pin, extruder.Dir.pin, boolToInt(extruder.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableE, extruder.Enable.pin, boolToInt(extruder.Enable.invert), boolToInt(extruder.Enable.invert), 0),
+	}
+
+	// Prepend allocate_oids and compute CRC
+	withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", o.count)}, configCmds...)
+	crcText := strings.Join(withAllocate, "\n")
+	crc := crc32.ChecksumIEEE([]byte(crcText))
+
+	// Build init commands
+	initCmds := []string{
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			o.adcBed, querySlotClock(mcuFreq, o.adcBed), sampleTicks, adcSampleCount, reportTicks, bedMin, bedMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmBed, pwmInitClock, 0),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmFan, pwmInitClock, 0),
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			o.adcE, querySlotClock(mcuFreq, o.adcE), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmE, pwmInitClock, 0),
+	}
+
+	out := make([]string, 0, 1+len(configCmds)+1+len(initCmds))
+	out = append(out, withAllocate...)
+	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+	out = append(out, initCmds...)
+	return out, nil
+}
