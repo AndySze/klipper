@@ -1,6 +1,10 @@
 package config
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -471,5 +475,163 @@ position_max: 200
 	// Check new section added
 	if !baseCfg.HasSection("stepper_y") {
 		t.Error("expected [stepper_y] section after merge")
+	}
+}
+
+func TestLoadWithInclude(t *testing.T) {
+	// Create temp directory
+	dir := t.TempDir()
+
+	// Create main config
+	mainContent := `
+[printer]
+kinematics: cartesian
+
+[include stepper.cfg]
+
+[fan]
+pin: PA0
+`
+	mainPath := filepath.Join(dir, "printer.cfg")
+	if err := os.WriteFile(mainPath, []byte(mainContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create included config
+	stepperContent := `
+[stepper_x]
+step_pin: PA1
+dir_pin: PA2
+
+[stepper_y]
+step_pin: PA3
+dir_pin: PA4
+`
+	stepperPath := filepath.Join(dir, "stepper.cfg")
+	if err := os.WriteFile(stepperPath, []byte(stepperContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load config
+	cfg, err := Load(mainPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	// Verify all sections exist
+	expected := []string{"printer", "stepper_x", "stepper_y", "fan"}
+	for _, name := range expected {
+		if !cfg.HasSection(name) {
+			t.Errorf("expected [%s] section", name)
+		}
+	}
+
+	// Verify included option
+	stepperX, _ := cfg.GetSection("stepper_x")
+	pin, _ := stepperX.Get("step_pin")
+	if pin != "PA1" {
+		t.Errorf("expected 'PA1', got '%s'", pin)
+	}
+}
+
+func TestLoadWithGlobInclude(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create conf subdirectory for included configs
+	confDir := filepath.Join(dir, "conf.d")
+	if err := os.Mkdir(confDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create main config with glob pattern pointing to subdirectory
+	mainContent := `
+[printer]
+kinematics: cartesian
+
+[include conf.d/*.cfg]
+`
+	mainPath := filepath.Join(dir, "printer.cfg")
+	if err := os.WriteFile(mainPath, []byte(mainContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create multiple included configs in subdirectory
+	for _, name := range []string{"a", "b"} {
+		content := fmt.Sprintf("[section_%s]\nvalue: %s\n", name, name)
+		path := filepath.Join(confDir, name+".cfg")
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg, err := Load(mainPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	// Verify sections from glob includes (sorted alphabetically)
+	if !cfg.HasSection("section_a") {
+		t.Error("expected [section_a] from a.cfg")
+	}
+	if !cfg.HasSection("section_b") {
+		t.Error("expected [section_b] from b.cfg")
+	}
+}
+
+func TestLoadRecursiveIncludeError(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create circular include
+	mainContent := `
+[printer]
+kinematics: cartesian
+
+[include other.cfg]
+`
+	mainPath := filepath.Join(dir, "printer.cfg")
+	if err := os.WriteFile(mainPath, []byte(mainContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	otherContent := `
+[stepper]
+step_pin: PA0
+
+[include printer.cfg]
+`
+	otherPath := filepath.Join(dir, "other.cfg")
+	if err := os.WriteFile(otherPath, []byte(otherContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(mainPath)
+	if err == nil {
+		t.Error("expected error for recursive include")
+	}
+	if !strings.Contains(err.Error(), "recursive include") {
+		t.Errorf("expected 'recursive include' error, got: %v", err)
+	}
+}
+
+func TestLoadMissingIncludeError(t *testing.T) {
+	dir := t.TempDir()
+
+	mainContent := `
+[printer]
+kinematics: cartesian
+
+[include nonexistent.cfg]
+`
+	mainPath := filepath.Join(dir, "printer.cfg")
+	if err := os.WriteFile(mainPath, []byte(mainContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(mainPath)
+	if err == nil {
+		t.Error("expected error for missing include")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("expected 'does not exist' error, got: %v", err)
 	}
 }

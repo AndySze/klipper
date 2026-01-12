@@ -30,18 +30,37 @@ func New() *Config {
 }
 
 // Load reads a configuration file and returns a Config.
+// Supports [include path] directives for including other config files.
 func Load(path string) (*Config, error) {
+	c := New()
+	visited := make(map[string]bool)
+	if err := c.parseFile(path, visited); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// parseFile parses a config file and handles include directives.
+func (c *Config) parseFile(path string, visited map[string]bool) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return nil, fmt.Errorf("config: invalid path %s: %w", path, err)
+		return fmt.Errorf("config: invalid path %s: %w", path, err)
 	}
+
+	// Check for recursive includes
+	if visited[abs] {
+		return fmt.Errorf("config: recursive include: %s", path)
+	}
+	visited[abs] = true
+	defer func() { visited[abs] = false }()
+
 	f, err := os.Open(abs)
 	if err != nil {
-		return nil, fmt.Errorf("config: unable to open %s: %w", path, err)
+		return fmt.Errorf("config: unable to open %s: %w", path, err)
 	}
 	defer f.Close()
 
-	c := New()
+	dir := filepath.Dir(abs)
 	var currentSection string
 	var currentOptions map[string]string
 
@@ -70,10 +89,38 @@ func Load(path string) (*Config, error) {
 			if currentSection != "" {
 				c.addSection(currentSection, currentOptions)
 			}
-			currentSection = strings.TrimSpace(line[1 : len(line)-1])
-			if currentSection == "" {
-				return nil, fmt.Errorf("config: empty section header at line %d", lineNum)
+
+			header := strings.TrimSpace(line[1 : len(line)-1])
+			if header == "" {
+				return fmt.Errorf("config: empty section header at line %d in %s", lineNum, path)
 			}
+
+			// Handle include directive
+			if strings.HasPrefix(header, "include ") {
+				spec := strings.TrimSpace(header[8:])
+				if spec == "" {
+					return fmt.Errorf("config: empty include at line %d in %s", lineNum, path)
+				}
+				glob := filepath.Join(dir, spec)
+				matches, err := filepath.Glob(glob)
+				if err != nil {
+					return fmt.Errorf("config: invalid include pattern %q: %w", spec, err)
+				}
+				sort.Strings(matches)
+				if len(matches) == 0 && !hasGlobMeta(glob) {
+					return fmt.Errorf("config: include file does not exist: %s", glob)
+				}
+				for _, m := range matches {
+					if err := c.parseFile(m, visited); err != nil {
+						return err
+					}
+				}
+				currentSection = ""
+				currentOptions = nil
+				continue
+			}
+
+			currentSection = header
 			currentOptions = make(map[string]string)
 			continue
 		}
@@ -107,10 +154,15 @@ func Load(path string) (*Config, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("config: error reading %s: %w", path, err)
+		return fmt.Errorf("config: error reading %s: %w", path, err)
 	}
 
-	return c, nil
+	return nil
+}
+
+// hasGlobMeta returns true if the path contains glob metacharacters.
+func hasGlobMeta(path string) bool {
+	return strings.ContainsAny(path, "*?[")
 }
 
 // LoadString parses a configuration from a string.
