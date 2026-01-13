@@ -2018,6 +2018,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		hasExtraStepperSection = true
 	}
 	_, hasBLTouch := cfg.section("bltouch")
+	_, hasFan := cfg.section("fan")
 
 	// Detect filament sensors (buttons) - only relevant to the
 	// extruder_stepper connect-phase compiler.
@@ -2199,12 +2200,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	var exAxis *extruderAxis
 
 	// Determine enable pin OIDs based on config type
-	// With extruder + buttons: enable_x=13, enable_y=14, enable_z=15, enable_e=18
-	// With extruder (no buttons): enable_x=12, enable_y=13, enable_z=14, enable_e=17
+	// With extruder + buttons/bltouch/fan: enable_x=13, enable_y=14, enable_z=15, enable_e=18
+	// With extruder (no buttons/bltouch/fan): enable_x=12, enable_y=13, enable_z=14, enable_e=17
 	// Without extruder: enable_x=9, enable_y=10, enable_z=11
 	var oidEnableX, oidEnableY, oidEnableZ, oidEnableE int
 	if hasExtruder {
-		if hasButtons || hasBLTouch {
+		if hasButtons || hasBLTouch || hasFan {
 			oidEnableX = 13
 			oidEnableY = 14
 			oidEnableZ = 15

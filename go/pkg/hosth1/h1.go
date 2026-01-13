@@ -56,8 +56,20 @@ func CompileExampleCartesianConnectPhase(cfgPath string, dict *protocol.Dictiona
 		return nil, err
 	}
 
-	// Allocate OIDs in the same stable numbering as the Python reference for
-	// this config. (See expected output for commands.test.)
+	// Check if [fan] section exists
+	fanSec, hasFan := cfg.sections["fan"]
+	var fanPin pin
+	if hasFan {
+		fanPin, err = parsePin(fanSec, "pin", true, false)
+		if err != nil {
+			return nil, fmt.Errorf("fan pin: %w", err)
+		}
+	}
+
+	// Allocate OIDs in the same stable numbering as the Python reference.
+	// When [fan] is present, insert pwmFan at OID 12 and shift enable/adc/pwm OIDs by 1.
+	// Without fan: count=18, enableX=12, enableY=13, enableZ=14, adcE=15, pwmE=16, enableE=17
+	// With fan:    count=19, pwmFan=12, enableX=13, enableY=14, enableZ=15, adcE=16, pwmE=17, enableE=18
 	o := oids{
 		endstopX: 0, trsyncX: 1, stepperX: 2,
 		endstopY: 3, trsyncY: 4, stepperY: 5,
@@ -68,10 +80,22 @@ func CompileExampleCartesianConnectPhase(cfgPath string, dict *protocol.Dictiona
 		adcE: 15, pwmE: 16, enableE: 17,
 		count: 18,
 	}
+	pwmFan := -1
+	if hasFan {
+		pwmFan = 12
+		o.enableX = 13
+		o.enableY = 14
+		o.enableZ = 15
+		o.adcE = 16
+		o.pwmE = 17
+		o.enableE = 18
+		o.count = 19
+	}
 
 	// Derived constants (match klippy defaults).
 	const (
 		pwmCycleTime     = 0.100
+		fanCycleTime     = 0.010 // 10ms for fan PWM
 		heaterMaxHeatSec = 3.0
 		stepPulseSec     = 0.000002
 		adcSampleTime    = 0.001
@@ -81,6 +105,7 @@ func CompileExampleCartesianConnectPhase(cfgPath string, dict *protocol.Dictiona
 		pwmInitDelaySec  = 0.200
 	)
 	cycleTicks := secondsToClock(mcuFreq, pwmCycleTime)
+	fanCycleTicks := secondsToClock(mcuFreq, fanCycleTime)
 	mdurTicks := secondsToClock(mcuFreq, heaterMaxHeatSec)
 	stepPulseTicks := secondsToClock(mcuFreq, stepPulseSec)
 	sampleTicks := secondsToClock(mcuFreq, adcSampleTime)
@@ -103,7 +128,18 @@ func CompileExampleCartesianConnectPhase(cfgPath string, dict *protocol.Dictiona
 		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
 			o.pwmBed, bed.HeaterPin.pin, 0, 0, mdurTicks),
 		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmBed, cycleTicks),
+	}
 
+	// Add fan config if present (comes after bed heater PWM)
+	if hasFan {
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+				pwmFan, fanPin.pin, 0, 0, 0),
+			fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", pwmFan, fanCycleTicks),
+		)
+	}
+
+	configCmds = append(configCmds,
 		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopX, stepperX.Endstop.pin, stepperX.Endstop.pullup),
 		fmt.Sprintf("config_trsync oid=%d", o.trsyncX),
 		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
@@ -134,7 +170,7 @@ func CompileExampleCartesianConnectPhase(cfgPath string, dict *protocol.Dictiona
 			o.stepperE, extruder.Step.pin, extruder.Dir.pin, boolToInt(extruder.Step.invert), stepPulseTicks),
 		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
 			o.enableE, extruder.Enable.pin, boolToInt(extruder.Enable.invert), boolToInt(extruder.Enable.invert), 0),
-	}
+	)
 
 	// Prepend allocate_oids and compute finalize_config CRC over config_cmds.
 	withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", o.count)}, configCmds...)
@@ -146,10 +182,20 @@ func CompileExampleCartesianConnectPhase(cfgPath string, dict *protocol.Dictiona
 		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
 			o.adcBed, querySlotClock(mcuFreq, o.adcBed), sampleTicks, adcSampleCount, reportTicks, bedMin, bedMax, adcRangeChecks),
 		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmBed, pwmInitClock, 0),
+	}
+
+	// Add fan init command after bed heater
+	if hasFan {
+		initCmds = append(initCmds,
+			fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", pwmFan, pwmInitClock, 0),
+		)
+	}
+
+	initCmds = append(initCmds,
 		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
 			o.adcE, querySlotClock(mcuFreq, o.adcE), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
 		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmE, pwmInitClock, 0),
-	}
+	)
 
 	out := make([]string, 0, 1+len(configCmds)+1+len(initCmds))
 	out = append(out, withAllocate...)
