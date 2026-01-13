@@ -25,7 +25,18 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	base := filepath.Base(cfgPath)
 	// Support known kinematics test configs
 	allowedConfigs := map[string]bool{
+		// Example kinematic configs
 		"example-cartesian.cfg":            true,
+		"example-corexy.cfg":               true,
+		"example-corexz.cfg":               true,
+		"example-delta.cfg":                true,
+		"example-deltesian.cfg":            true,
+		"example-hybrid-corexy.cfg":        true,
+		"example-hybrid-corexz.cfg":        true,
+		"example-polar.cfg":                true,
+		"example-rotary-delta.cfg":         true,
+		"example-winch.cfg":                true,
+		// Test configs
 		"gcode_arcs.cfg":                   true,
 		"extruders.cfg":                    true,
 		"pressure_advance.cfg":             true,
@@ -34,18 +45,13 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"macros.cfg":                       true,
 		"bltouch.cfg":                      true,
 		"screws_tilt_adjust.cfg":           true,
-		"example-delta.cfg":                true, // Delta kinematics support
-		"delta_calibrate.cfg":              true, // Delta calibration (no heaters)
-		"load_cell.cfg":                    true, // Load cell sensors (no kinematics)
-		"sdcard_loop.cfg":                  true, // Virtual SD card with looping
-		"generic_cartesian.cfg":            true, // Generic cartesian kinematics
-		"corexyuv.cfg":                     true, // CoreXY UV (generic cartesian)
-		"hybrid_corexy_dual_carriage.cfg":  true, // Hybrid CoreXY with dual carriage
-		"example-hybrid-corexz.cfg":        true, // Hybrid CoreXZ kinematics
-		"example-deltesian.cfg":            true, // Deltesian kinematics
-		"example-polar.cfg":                true, // Polar kinematics
-		"rotary_delta_calibrate.cfg":       true, // Rotary delta calibration
-		"example-winch.cfg":                true, // Winch (cable robot) kinematics
+		"delta_calibrate.cfg":              true,
+		"load_cell.cfg":                    true,
+		"sdcard_loop.cfg":                  true,
+		"generic_cartesian.cfg":            true,
+		"corexyuv.cfg":                     true,
+		"hybrid_corexy_dual_carriage.cfg":  true,
+		"rotary_delta_calibrate.cfg":       true,
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)

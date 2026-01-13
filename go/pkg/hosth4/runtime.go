@@ -1744,6 +1744,9 @@ type runtime struct {
 	// Multiple extruder support
 	stepperE1     *stepper
 	extruder1     *extruderAxis
+
+	// Fan control
+	fanManager *fanManager
 }
 
 type pressureAdvanceState struct {
@@ -2603,6 +2606,13 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 
 	// Initialize heater manager after runtime is created
 	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
+
+	// Initialize fan manager if [fan] section exists
+	if fm, err := newFanManager(rt, cfg); err != nil {
+		return nil, fmt.Errorf("initialize fan manager: %w", err)
+	} else if fm != nil {
+		rt.fanManager = fm
+	}
 
 	// Initialize bed_screws if [bed_screws] section exists
 	if _, hasBedScrews := cfg.section("bed_screws"); hasBedScrews {
@@ -4208,6 +4218,26 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		if err := r.cmdM190(cmd.Args); err != nil {
 			return err
 		}
+	case "M106":
+		// Set Fan Speed
+		if err := r.cmdM106(cmd.Args); err != nil {
+			return err
+		}
+	case "M107":
+		// Turn Off Fan
+		if err := r.cmdM107(cmd.Args); err != nil {
+			return err
+		}
+	case "M400":
+		// Wait for moves to complete
+		if err := r.cmdM400(cmd.Args); err != nil {
+			return err
+		}
+	case "GET_POSITION":
+		// Report current position
+		if err := r.cmdGetPosition(cmd.Args); err != nil {
+			return err
+		}
 	case "SET_EXTRUDER_ROTATION_DISTANCE":
 		// Set extruder rotation distance
 		if err := r.cmdSetExtruderRotationDistance(cmd.Args); err != nil {
@@ -5089,6 +5119,60 @@ func (r *runtime) cmdM190(args map[string]string) error {
 
 	// Wait for temperature to reach target
 	return r.waitTemperature("heater_bed", temp)
+}
+
+func (r *runtime) cmdM106(args map[string]string) error {
+	// M106 - Set Fan Speed
+	// Usage: M106 [S<0-255>]
+	if r.fanManager == nil {
+		// No fan configured, ignore silently
+		r.tracef("M106: no fan configured (ignored)\n")
+		return nil
+	}
+	printTime := r.toolhead.printTime
+	return r.fanManager.cmdM106(args, printTime)
+}
+
+func (r *runtime) cmdM107(args map[string]string) error {
+	// M107 - Turn Off Fan
+	if r.fanManager == nil {
+		// No fan configured, ignore silently
+		r.tracef("M107: no fan configured (ignored)\n")
+		return nil
+	}
+	printTime := r.toolhead.printTime
+	return r.fanManager.cmdM107(printTime)
+}
+
+func (r *runtime) cmdM400(args map[string]string) error {
+	// M400 - Wait for current moves to finish
+	// This is essentially a sync/wait command.
+	r.tracef("M400: waiting for moves to complete\n")
+	// Flush any pending lookahead and step generation
+	if r.toolhead != nil {
+		if err := r.toolhead.flushLookahead(false); err != nil {
+			return err
+		}
+		if err := r.toolhead.flushStepGeneration(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *runtime) cmdGetPosition(args map[string]string) error {
+	// GET_POSITION - Report the current position
+	// Returns the current position in various coordinate systems.
+	// For golden testing, we just trace the position.
+	pos := r.toolhead.commandedPos
+	if len(pos) >= 4 {
+		r.tracef("GET_POSITION: toolhead X=%.6f Y=%.6f Z=%.6f E=%.6f\n",
+			pos[0], pos[1], pos[2], pos[3])
+	} else if len(pos) == 3 {
+		r.tracef("GET_POSITION: toolhead X=%.6f Y=%.6f Z=%.6f\n",
+			pos[0], pos[1], pos[2])
+	}
+	return nil
 }
 
 func (r *runtime) cmdSetExtruderRotationDistance(args map[string]string) error {

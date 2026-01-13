@@ -1,0 +1,4 @@
+# Test example-rotary-delta.cfg with move.gcode
+DICTIONARY atmega2560.dict
+CONFIG ../../config/example-rotary-delta.cfg
+GCODE move.gcode

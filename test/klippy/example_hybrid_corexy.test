@@ -1,0 +1,4 @@
+# Test example-hybrid-corexy.cfg with move.gcode
+DICTIONARY atmega2560.dict
+CONFIG ../../config/example-hybrid-corexy.cfg
+GCODE move.gcode

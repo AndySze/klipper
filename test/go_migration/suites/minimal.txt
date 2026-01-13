@@ -1,11 +1,11 @@
 # Go Migration Test Suite
 #
 # Tests cover cartesian, corexy, corexz, delta, deltesian, polar, rotary_delta,
-# hybrid_corexz, winch kinematics and are verified to pass against Python Klipper
-# golden output.
+# hybrid_corexy, hybrid_corexz, winch kinematics and are verified to pass against
+# Python Klipper golden output.
 #
-# Test count: 37 tests
-# Pass rate: 97% (out_of_bounds known issue)
+# Test count: 41 tests
+# Pass rate: 95% (out_of_bounds, sdcard_loop known issues)
 
 # === Basic commands and motion ===
 test/klippy/commands.test
@@ -79,3 +79,10 @@ test/klippy/winch.test
 test/klippy/multi_mcu_simple.test
 test/klippy/multi_mcu_extruder.test
 test/klippy/multi_mcu_dual_z.test
+
+# === Example kinematic configs (printers.test subset) ===
+# Note: These use move.gcode which requires M106, M107, M400, GET_POSITION
+test/klippy/example_corexy.test
+test/klippy/example_corexz.test
+test/klippy/example_hybrid_corexy.test
+test/klippy/example_rotary_delta.test

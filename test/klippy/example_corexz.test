@@ -1,0 +1,4 @@
+# Test example-corexz.cfg with move.gcode
+DICTIONARY atmega2560.dict
+CONFIG ../../config/example-corexz.cfg
+GCODE move.gcode
