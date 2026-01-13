@@ -1,0 +1,4 @@
+# Test generic-einsy-rambo.cfg (Einsy Rambo board - Prusa MK3)
+DICTIONARY atmega2560.dict
+CONFIG ../../config/generic-einsy-rambo.cfg
+GCODE move.gcode

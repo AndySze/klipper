@@ -67,6 +67,10 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"printer-anycubic-kobra-go-2022.cfg":       true, // hc32f460
 		// PRU (BeagleBone) architecture test
 		"arch_pru.cfg": true, // pru
+		// Additional printer configs from printers.test
+		"generic-ramps.cfg":       true, // atmega2560 cartesian
+		"generic-einsy-rambo.cfg": true, // atmega2560 cartesian
+		"generic-rumba.cfg":       true, // atmega2560 cartesian
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)

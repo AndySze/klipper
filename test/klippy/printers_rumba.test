@@ -1,0 +1,4 @@
+# Test generic-rumba.cfg (RUMBA board)
+DICTIONARY atmega2560.dict
+CONFIG ../../config/generic-rumba.cfg
+GCODE move.gcode

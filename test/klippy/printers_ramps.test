@@ -1,0 +1,4 @@
+# Test generic-ramps.cfg (popular cartesian board)
+DICTIONARY atmega2560.dict
+CONFIG ../../config/generic-ramps.cfg
+GCODE move.gcode
