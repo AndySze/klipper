@@ -2256,46 +2256,50 @@ func main() {
 
 		// Process each config case (single iteration for single-config, multiple for multi-config)
 		for _, cc := range configCases {
-		caseDir := cc.caseDir
-		expected := filepath.Join(caseDir, "expected.txt")
-		actual := filepath.Join(caseDir, "actual.txt")
+			caseDir := cc.caseDir
+			expected := filepath.Join(caseDir, "expected.txt")
+			actual := filepath.Join(caseDir, "actual.txt")
 
-		if _, err := os.Stat(expected); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				fmt.Fprintf(os.Stderr, "ERROR: missing expected: %s\n", expected)
-				os.Exit(2)
-			}
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			os.Exit(2)
-		}
-
-		modeForTest := *mode
-		if modeForTest == "auto" {
-			switch stem {
-			case "manual_stepper":
-				modeForTest = "host-h3"
-			case "linuxtest":
-				modeForTest = "host-h1"
-			case "multi_mcu_simple":
-				modeForTest = "host-h1-multi"
-			default:
-				modeForTest = "host-h4"
-			}
-		}
-
-		switch modeForTest {
-		case "copy-expected":
-			if err := copyFile(actual, expected); err != nil {
+			if _, err := os.Stat(expected); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					// For multi-config tests, skip configs without expected.txt
+					if isMultiConfig {
+						continue
+					}
+					fmt.Fprintf(os.Stderr, "ERROR: missing expected: %s\n", expected)
+					os.Exit(2)
+				}
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
-		case "stub":
-			sections, err := parseExpectedSections(expected)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-				os.Exit(2)
+
+			modeForTest := *mode
+			if modeForTest == "auto" {
+				switch stem {
+				case "manual_stepper":
+					modeForTest = "host-h3"
+				case "linuxtest":
+					modeForTest = "host-h1"
+				case "multi_mcu_simple":
+					modeForTest = "host-h1-multi"
+				default:
+					modeForTest = "host-h4"
+				}
 			}
-			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
+
+			switch modeForTest {
+			case "copy-expected":
+				if err := copyFile(actual, expected); err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+					os.Exit(2)
+				}
+			case "stub":
+				sections, err := parseExpectedSections(expected)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+					os.Exit(2)
+				}
+				if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}
