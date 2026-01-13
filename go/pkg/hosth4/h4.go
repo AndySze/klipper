@@ -71,6 +71,16 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"generic-ramps.cfg":       true, // atmega2560 cartesian
 		"generic-einsy-rambo.cfg": true, // atmega2560 cartesian
 		"generic-rumba.cfg":       true, // atmega2560 cartesian
+		"generic-gt2560.cfg":      true, // atmega2560 cartesian
+		"generic-mini-rambo.cfg":  true, // atmega2560 cartesian
+		"generic-rambo.cfg":       true, // atmega2560 cartesian
+		"generic-fysetc-f6.cfg":   true, // atmega2560 cartesian
+		// Real printer configs (ATC Semitec 104GT-2, Honeywell sensors)
+		"printer-lulzbot-mini2-2018.cfg":      true, // ATC Semitec + Honeywell
+		"printer-lulzbot-taz6-2017.cfg":       true, // ATC Semitec + Honeywell
+		"printer-lulzbot-taz6-dual-v3-2017.cfg": true, // ATC Semitec + Honeywell
+		"printer-creality-cr5pro-ht-2022.cfg": true, // EPCOS + ATC Semitec
+		"printer-anycubic-4maxpro-2.0-2021.cfg": true, // ATC Semitec + EPCOS
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)

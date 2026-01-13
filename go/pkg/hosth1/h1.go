@@ -1348,6 +1348,66 @@ func thermistorEPCOS100K() *thermistor {
 	return t
 }
 
+func thermistorGeneric3950() *thermistor {
+	t := &thermistor{pullup: 4700.0, inlineResistor: 0.0}
+	// [thermistor Generic 3950] from klippy/extras/temperature_sensors.cfg
+	t.setupCoefficients(25, 100000, 150, 1770, 250, 230)
+	return t
+}
+
+func thermistorATCSemitec104GT2() *thermistor {
+	t := &thermistor{pullup: 4700.0, inlineResistor: 0.0}
+	// [thermistor ATC Semitec 104GT-2] from klippy/extras/temperature_sensors.cfg
+	t.setupCoefficients(20, 126800, 150, 1360, 300, 80.65)
+	return t
+}
+
+func thermistorATCSemitec104NT4() *thermistor {
+	t := &thermistor{pullup: 4700.0, inlineResistor: 0.0}
+	// [thermistor ATC Semitec 104NT-4-R025H42G] from klippy/extras/temperature_sensors.cfg
+	t.setupCoefficients(25, 100000, 160, 1074, 300, 82.78)
+	return t
+}
+
+func thermistorHoneywell100K() *thermistor {
+	t := &thermistor{pullup: 4700.0, inlineResistor: 0.0}
+	// [thermistor Honeywell 100K 135-104LAG-J01] from klippy/extras/temperature_sensors.cfg
+	// Uses beta=3974
+	t.setupBeta(25, 100000, 3974)
+	return t
+}
+
+func thermistorNTC100KMGB() *thermistor {
+	t := &thermistor{pullup: 4700.0, inlineResistor: 0.0}
+	// [thermistor NTC 100K MGB18-104F39050L32] from klippy/extras/temperature_sensors.cfg
+	// Uses beta=4100
+	t.setupBeta(25, 100000, 4100)
+	return t
+}
+
+func thermistorSliceEngineering450() *thermistor {
+	t := &thermistor{pullup: 4700.0, inlineResistor: 0.0}
+	// [thermistor SliceEngineering 450] from klippy/extras/temperature_sensors.cfg
+	t.setupCoefficients(25, 500000, 200, 3734, 400, 240)
+	return t
+}
+
+func thermistorTDKNTCG104() *thermistor {
+	t := &thermistor{pullup: 4700.0, inlineResistor: 0.0}
+	// [thermistor TDK NTCG104LH104JT1] from klippy/extras/temperature_sensors.cfg
+	t.setupCoefficients(25, 100000, 50, 31230, 125, 2066)
+	return t
+}
+
+func (t *thermistor) setupBeta(t0, r0, beta float64) {
+	// Simple beta parameter setup for thermistors defined with only beta
+	invT0 := 1.0 / (t0 - kelvinToCelsius)
+	lnR0 := math.Log(r0)
+	t.c1 = invT0 - lnR0/beta
+	t.c2 = 1.0 / beta
+	t.c3 = 0.0
+}
+
 func (t *thermistor) setupCoefficients(t1, r1, t2, r2, t3, r3 float64) {
 	invT1 := 1.0 / (t1 - kelvinToCelsius)
 	invT2 := 1.0 / (t2 - kelvinToCelsius)
@@ -1400,10 +1460,27 @@ func (t *thermistor) calcADC(temp float64) float64 {
 }
 
 func thermistorMinMaxTicks(h heater, adcMax float64, sampleCount int) (int, int, error) {
-	if h.SensorType != "EPCOS 100K B57560G104F" {
-		return 0, 0, fmt.Errorf("unsupported sensor_type %q (H1 only supports EPCOS 100K B57560G104F)", h.SensorType)
+	var th *thermistor
+	switch h.SensorType {
+	case "EPCOS 100K B57560G104F":
+		th = thermistorEPCOS100K()
+	case "Generic 3950":
+		th = thermistorGeneric3950()
+	case "ATC Semitec 104GT-2":
+		th = thermistorATCSemitec104GT2()
+	case "ATC Semitec 104NT-4-R025H42G":
+		th = thermistorATCSemitec104NT4()
+	case "Honeywell 100K 135-104LAG-J01":
+		th = thermistorHoneywell100K()
+	case "NTC 100K MGB18-104F39050L32":
+		th = thermistorNTC100KMGB()
+	case "SliceEngineering 450":
+		th = thermistorSliceEngineering450()
+	case "TDK NTCG104LH104JT1":
+		th = thermistorTDKNTCG104()
+	default:
+		return 0, 0, fmt.Errorf("unsupported sensor_type %q", h.SensorType)
 	}
-	th := thermistorEPCOS100K()
 	a := []float64{th.calcADC(h.MinTemp), th.calcADC(h.MaxTemp)}
 	sort.Float64s(a)
 	minADC, maxADC := a[0], a[1]
