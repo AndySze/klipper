@@ -53,6 +53,84 @@ func readSuite(path string) ([]string, error) {
 	return out, nil
 }
 
+// testFileSpec holds parsed information from a .test file
+type testFileSpec struct {
+	configs    []string          // list of CONFIG paths (relative to test file)
+	dictMap    map[string]string // mcu name -> dict filename
+	gcodeRel   string            // GCODE file path (optional)
+	shouldFail bool
+}
+
+var (
+	configRe = regexp.MustCompile(`^CONFIG\s+(\S+)\s*$`)
+	dictRe   = regexp.MustCompile(`^DICTIONARY\s+(.+)$`)
+	gcodeRe  = regexp.MustCompile(`^GCODE\s+(\S+)\s*$`)
+)
+
+// parseTestFile parses a Klipper regression .test file and returns its spec.
+// Supports multiple CONFIG entries for multi-config tests.
+func parseTestFile(path string) (*testFileSpec, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	spec := &testFileSpec{
+		dictMap: make(map[string]string),
+	}
+
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		// Strip comments
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		if line == "" {
+			continue
+		}
+
+		if m := configRe.FindStringSubmatch(line); m != nil {
+			spec.configs = append(spec.configs, m[1])
+			continue
+		}
+		if m := dictRe.FindStringSubmatch(line); m != nil {
+			parts := strings.Fields(m[1])
+			if len(parts) > 0 {
+				spec.dictMap["mcu"] = parts[0]
+				for _, extra := range parts[1:] {
+					if idx := strings.Index(extra, "="); idx > 0 {
+						mcuName := strings.TrimSpace(extra[:idx])
+						dictName := strings.TrimSpace(extra[idx+1:])
+						spec.dictMap[mcuName] = dictName
+					}
+				}
+			}
+			continue
+		}
+		if m := gcodeRe.FindStringSubmatch(line); m != nil {
+			spec.gcodeRel = m[1]
+			continue
+		}
+		if line == "SHOULD_FAIL" {
+			spec.shouldFail = true
+			continue
+		}
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(spec.dictMap) == 0 {
+		return nil, fmt.Errorf("missing DICTIONARY in %s", path)
+	}
+	if len(spec.configs) == 0 {
+		return nil, fmt.Errorf("missing CONFIG in %s", path)
+	}
+	return spec, nil
+}
+
 func parseExpectedSections(path string) ([]mcuSection, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -2099,6 +2177,32 @@ func main() {
 			continue
 		}
 
+		// Parse the test file to check for multi-config tests
+		testPath := filepath.Clean(filepath.Join("..", testRel))
+		testSpec, err := parseTestFile(testPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: parse test file %s: %v\n", testPath, err)
+			os.Exit(2)
+		}
+		isMultiConfig := len(testSpec.configs) > 1
+
+		// Build list of (configRel, caseDir) pairs to process
+		type configCase struct {
+			configRel string
+			caseDir   string
+		}
+		var configCases []configCase
+		if isMultiConfig {
+			for _, cfgRel := range testSpec.configs {
+				cfgStem := strings.TrimSuffix(filepath.Base(cfgRel), filepath.Ext(cfgRel))
+				caseDir := filepath.Join(*outdir, stem, cfgStem)
+				configCases = append(configCases, configCase{cfgRel, caseDir})
+			}
+		} else {
+			caseDir := filepath.Join(*outdir, stem)
+			configCases = append(configCases, configCase{testSpec.configs[0], caseDir})
+		}
+
 		// In auto mode, run each test in a fresh subprocess to avoid any
 		// cross-test state leakage from the underlying C helper libraries.
 		if *mode == "auto" && *only == "" {
@@ -2150,7 +2254,9 @@ func main() {
 			continue
 		}
 
-		caseDir := filepath.Join(*outdir, stem)
+		// Process each config case (single iteration for single-config, multiple for multi-config)
+		for _, cc := range configCases {
+		caseDir := cc.caseDir
 		expected := filepath.Join(caseDir, "expected.txt")
 		actual := filepath.Join(caseDir, "actual.txt")
 
@@ -2669,5 +2775,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "ERROR: unknown mode: %s\n", modeForTest)
 			os.Exit(2)
 		}
+		} // end for configCases
 	}
 }

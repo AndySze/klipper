@@ -72,13 +72,14 @@ _MCU_HDR_RE = re.compile(r"^##\s+MCU:\s+(.+?)\s+\(dict:\s+(.+?)\)\s*$")
 _CLOCK_TOKEN_RE = re.compile(r"\b([A-Za-z_]*clock)=(\d+)\b")
 
 
-def parse_test_single_config_and_dict(
+def parse_test_configs_and_dict(
     test_path: Path,
-) -> tuple[str, dict[str, str]]:
-    """Return (config_path, dictionaries) where dictionaries maps mcu->dict.
+) -> tuple[list[str], dict[str, str]]:
+    """Return (config_paths, dictionaries) where dictionaries maps mcu->dict.
 
     The main MCU is stored under key 'mcu'. Additional MCUs are stored under
-    their MCU name.
+    their MCU name. Multiple CONFIG entries are supported for multi-config
+    tests.
     """
     config_values: list[str] = []
     dict_map: dict[str, str] = {}
@@ -107,17 +108,12 @@ def parse_test_single_config_and_dict(
         raise Fatal(f"missing DICTIONARY in {test_path}")
     if not config_values:
         raise Fatal(f"missing CONFIG in {test_path}")
-    if len(config_values) != 1:
-        raise Fatal(
-            f"{test_path} has {len(config_values)} CONFIG entries; "
-            "use single-CONFIG tests for golden generation"
-        )
-    return config_values[0], dict_map
+    return config_values, dict_map
 
 
 def parse_test_file(test_path: Path) -> dict[str, object]:
-    """Parse a Klipper regression .test file (single-CONFIG only)."""
-    config_rel, dict_map = parse_test_single_config_and_dict(test_path)
+    """Parse a Klipper regression .test file (supports multiple CONFIGs)."""
+    config_rels, dict_map = parse_test_configs_and_dict(test_path)
     should_fail = False
     gcode_rel: str | None = None
     inline_gcode: list[str] = []
@@ -143,7 +139,7 @@ def parse_test_file(test_path: Path) -> dict[str, object]:
         )
 
     return {
-        "config_rel": config_rel,
+        "config_rels": config_rels,  # list of configs
         "dict_map": dict_map,
         "should_fail": should_fail,
         "gcode_rel": gcode_rel,
@@ -294,25 +290,21 @@ def ensure_dict_bundle(dictdir: Path, required: set[str]) -> None:
     )
 
 
-def gen_one(
+def _gen_single_config(
     python: str,
     dictdir: Path,
     test_rel: str,
-    outdir: Path,
+    test_path: Path,
+    config_rel: str,
+    dict_map: dict[str, str],
+    should_fail: bool,
+    gcode_rel: str | None,
+    inline_gcode: list[str],
+    case_dir: Path,
     keep_work: bool,
 ) -> None:
+    """Generate golden output for a single config within a test file."""
     root = repo_root()
-    test_path = (root / test_rel).resolve()
-    if not test_path.exists():
-        raise Fatal(f"missing test: {test_rel}")
-    spec = parse_test_file(test_path)
-    config_rel = str(spec["config_rel"])
-    dict_map = spec["dict_map"]
-    should_fail = bool(spec["should_fail"])
-    gcode_rel = spec["gcode_rel"]
-    inline_gcode = spec["inline_gcode"]
-
-    case_dir = outdir / test_path.stem
     work_dir = case_dir / "work"
     case_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -381,7 +373,7 @@ def gen_one(
         raise Fatal(f"{test_rel} expected failure but klippy returned 0")
     if not should_fail and proc.returncode != 0:
         raise Fatal(
-            f"{test_rel} failed (rc={proc.returncode}); "
+            f"{test_rel} [{config_rel}] failed (rc={proc.returncode}); "
             f"see {work_dir}/run.stderr"
         )
 
@@ -470,6 +462,53 @@ def gen_one(
         work_dir.rmdir()
 
 
+def gen_one(
+    python: str,
+    dictdir: Path,
+    test_rel: str,
+    outdir: Path,
+    keep_work: bool,
+) -> None:
+    """Generate golden outputs for a test file (supports multiple CONFIGs)."""
+    root = repo_root()
+    test_path = (root / test_rel).resolve()
+    if not test_path.exists():
+        raise Fatal(f"missing test: {test_rel}")
+    spec = parse_test_file(test_path)
+    config_rels = list(spec["config_rels"])  # type: ignore[arg-type]
+    dict_map = spec["dict_map"]  # type: ignore[assignment]
+    should_fail = bool(spec["should_fail"])
+    gcode_rel = spec["gcode_rel"]  # type: ignore[assignment]
+    inline_gcode = list(spec["inline_gcode"])  # type: ignore[arg-type]
+
+    is_multi = len(config_rels) > 1
+
+    for config_rel in config_rels:
+        # For multi-config tests, use nested directory structure:
+        #   golden/<test_stem>/<config_stem>/
+        # For single-config tests, use flat structure:
+        #   golden/<test_stem>/
+        if is_multi:
+            config_stem = Path(config_rel).stem
+            case_dir = outdir / test_path.stem / config_stem
+        else:
+            case_dir = outdir / test_path.stem
+
+        _gen_single_config(
+            python=python,
+            dictdir=dictdir,
+            test_rel=test_rel,
+            test_path=test_path,
+            config_rel=config_rel,
+            dict_map=dict_map,
+            should_fail=should_fail,
+            gcode_rel=gcode_rel,
+            inline_gcode=inline_gcode,
+            case_dir=case_dir,
+            keep_work=keep_work,
+        )
+
+
 def cmd_gen(args: argparse.Namespace) -> None:
     root = repo_root()
     suite_path = (root / args.suite).resolve()
@@ -491,6 +530,68 @@ def cmd_gen(args: argparse.Namespace) -> None:
         gen_one(args.python, dictdir, t, outdir, keep_work=args.keep_work)
 
 
+def _compare_case_dir(
+    case_dir: Path,
+    mode: str,
+    fail_missing: bool,
+) -> bool:
+    """Compare expected vs actual for a single case directory.
+
+    Returns True if comparison failed, False if passed or skipped.
+    """
+    expected = case_dir / "expected.txt"
+    actual = case_dir / "actual.txt"
+    if not expected.exists():
+        raise Fatal(f"missing expected output: {expected}")
+    if not actual.exists():
+        if fail_missing:
+            raise Fatal(f"missing actual output: {actual}")
+        return False  # skipped
+    exp_sections = parse_mcu_sections(expected.read_text(encoding="utf-8"))
+    act_sections = parse_mcu_sections(actual.read_text(encoding="utf-8"))
+    if exp_sections.keys() != act_sections.keys():
+        sys.stdout.write(f"--- {expected}\n+++ {actual}\n")
+        sys.stdout.write(
+            "ERROR: MCU section mismatch\n"
+            f"expected: {sorted(exp_sections.keys())}\n"
+            f"actual:   {sorted(act_sections.keys())}\n"
+        )
+        return True
+    any_diff = False
+    for mcu_name in sorted(exp_sections.keys()):
+        exp_lines = [
+            ln + "\n"
+            for ln in exp_sections[mcu_name]["lines"]  # type: ignore[index]
+        ]
+        act_lines = [
+            ln + "\n"
+            for ln in act_sections[mcu_name]["lines"]  # type: ignore[index]
+        ]
+        exp_norm = normalize_mcu_lines(
+            [ln.rstrip("\n") for ln in exp_lines],
+            mode,
+        )
+        act_norm = normalize_mcu_lines(
+            [ln.rstrip("\n") for ln in act_lines],
+            mode,
+        )
+        exp_lines = [ln + "\n" for ln in exp_norm]
+        act_lines = [ln + "\n" for ln in act_norm]
+        if exp_lines == act_lines:
+            continue
+        any_diff = True
+        fromfile = f"{expected} (MCU {mcu_name})"
+        tofile = f"{actual} (MCU {mcu_name})"
+        diff = difflib.unified_diff(
+            exp_lines,
+            act_lines,
+            fromfile=fromfile,
+            tofile=tofile,
+        )
+        sys.stdout.writelines(diff)
+    return any_diff
+
+
 def cmd_compare(args: argparse.Namespace) -> None:
     root = repo_root()
     suite_path = (root / args.suite).resolve()
@@ -499,64 +600,32 @@ def cmd_compare(args: argparse.Namespace) -> None:
     tests = read_suite_file(suite_path)
     any_failed = False
     for test_rel in tests:
+        test_path = (root / test_rel).resolve()
         stem = Path(test_rel).stem
         if args.only and args.only != test_rel and args.only != stem:
             continue
-        case_dir = outdir / Path(test_rel).stem
-        expected = case_dir / "expected.txt"
-        actual = case_dir / "actual.txt"
-        if not expected.exists():
-            raise Fatal(f"missing expected output: {expected}")
-        if not actual.exists():
-            if args.fail_missing:
-                raise Fatal(f"missing actual output: {actual}")
-            continue
-        exp_sections = parse_mcu_sections(expected.read_text(encoding="utf-8"))
-        act_sections = parse_mcu_sections(actual.read_text(encoding="utf-8"))
-        if exp_sections.keys() != act_sections.keys():
-            any_failed = True
-            sys.stdout.write(f"--- {expected}\n+++ {actual}\n")
-            sys.stdout.write(
-                "ERROR: MCU section mismatch\n"
-                f"expected: {sorted(exp_sections.keys())}\n"
-                f"actual:   {sorted(act_sections.keys())}\n"
-            )
-            continue
-        for mcu_name in sorted(exp_sections.keys()):
-            exp_lines = [
-                l + "\n"
-                for l in exp_sections[mcu_name][  # type: ignore[index]
-                    "lines"
-                ]
-            ]
-            act_lines = [
-                l + "\n"
-                for l in act_sections[mcu_name][  # type: ignore[index]
-                    "lines"
-                ]
-            ]
-            exp_norm = normalize_mcu_lines(
-                [l.rstrip("\n") for l in exp_lines],
-                args.mode,
-            )
-            act_norm = normalize_mcu_lines(
-                [l.rstrip("\n") for l in act_lines],
-                args.mode,
-            )
-            exp_lines = [l + "\n" for l in exp_norm]
-            act_lines = [l + "\n" for l in act_norm]
-            if exp_lines == act_lines:
-                continue
-            any_failed = True
-            fromfile = f"{expected} (MCU {mcu_name})"
-            tofile = f"{actual} (MCU {mcu_name})"
-            diff = difflib.unified_diff(
-                exp_lines,
-                act_lines,
-                fromfile=fromfile,
-                tofile=tofile,
-            )
-            sys.stdout.writelines(diff)
+
+        # Parse test file to determine if it's multi-config
+        spec = parse_test_file(test_path)
+        config_rels = list(spec["config_rels"])  # type: ignore[arg-type]
+        is_multi = len(config_rels) > 1
+
+        if is_multi:
+            # Multi-config test: check each nested config directory
+            for config_rel in config_rels:
+                config_stem = Path(config_rel).stem
+                case_dir = outdir / stem / config_stem
+                if not case_dir.exists():
+                    # Config not generated yet, skip
+                    continue
+                if _compare_case_dir(case_dir, args.mode, args.fail_missing):
+                    any_failed = True
+        else:
+            # Single-config test: use flat directory structure
+            case_dir = outdir / stem
+            if _compare_case_dir(case_dir, args.mode, args.fail_missing):
+                any_failed = True
+
     if any_failed:
         raise Fatal("compare failed (diffs above)")
 
