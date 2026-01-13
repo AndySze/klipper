@@ -1,0 +1,6 @@
+# Test multi-MCU config with extruder on secondary MCU
+# Main MCU: X, Y, Z, heater_bed
+# toolhead MCU: Extruder stepper and heater
+DICTIONARY atmega2560.dict toolhead=atmega2560.dict
+CONFIG multi_mcu_extruder.cfg
+M105

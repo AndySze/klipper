@@ -1,0 +1,6 @@
+# Test multi-MCU config with dual Z on secondary MCU
+# Main MCU: X, Y, extruder, heater_bed
+# zboard MCU: Z and Z1 steppers
+DICTIONARY atmega2560.dict zboard=atmega2560.dict
+CONFIG multi_mcu_dual_z.cfg
+M105

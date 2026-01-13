@@ -3053,7 +3053,8 @@ func CompileMultiMCUCartesianConnectPhase(cfgPath string, dicts map[string]*prot
 		stepper stepper
 	}{}
 
-	for _, sName := range []string{"stepper_x", "stepper_y", "stepper_z"} {
+	// Include stepper_z1 for dual-Z setups
+	for _, sName := range []string{"stepper_x", "stepper_y", "stepper_z", "stepper_z1"} {
 		if _, ok := cfg.sections[sName]; ok {
 			s, err := readStepper(cfg, sName)
 			if err != nil {
@@ -3136,19 +3137,29 @@ func CompileMultiMCUCartesianConnectPhase(cfgPath string, dicts map[string]*prot
 
 		// Phase 1: Allocate OIDs following Klipper's order
 		// First: all stepper cores (endstop, trsync, stepper) for all steppers including extruder
+		// Note: Secondary steppers (like stepper_z1) don't have endstops
 		nextOID := 0
 		type stepperOIDs struct {
 			endstop, trsync, stepper, enable int
+			hasEndstop                       bool
 		}
 		stepperOIDMap := make(map[string]stepperOIDs)
 
 		for _, s := range mcuSteppers {
-			oids := stepperOIDs{
-				endstop: nextOID,
-				trsync:  nextOID + 1,
-				stepper: nextOID + 2,
+			hasEndstop := s.stepper.Endstop.pin != ""
+			oids := stepperOIDs{hasEndstop: hasEndstop}
+			if hasEndstop {
+				oids.endstop = nextOID
+				oids.trsync = nextOID + 1
+				oids.stepper = nextOID + 2
+				nextOID += 3
+			} else {
+				// Secondary stepper (like stepper_z1) - only stepper, no endstop/trsync
+				oids.endstop = -1
+				oids.trsync = -1
+				oids.stepper = nextOID
+				nextOID++
 			}
-			nextOID += 3
 			stepperOIDMap[s.name] = oids
 		}
 
@@ -3212,16 +3223,16 @@ func CompileMultiMCUCartesianConnectPhase(cfgPath string, dicts map[string]*prot
 		for _, s := range mcuSteppers {
 			oids := stepperOIDMap[s.name]
 
-			// Config endstop
-			pullup := 0
-			if s.stepper.Endstop.pullup != 0 {
-				pullup = 1
+			// Config endstop and trsync only if this stepper has an endstop
+			if oids.hasEndstop {
+				pullup := 0
+				if s.stepper.Endstop.pullup != 0 {
+					pullup = 1
+				}
+				configCmds = append(configCmds, fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d",
+					oids.endstop, s.stepper.Endstop.pin, pullup))
+				configCmds = append(configCmds, fmt.Sprintf("config_trsync oid=%d", oids.trsync))
 			}
-			configCmds = append(configCmds, fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d",
-				oids.endstop, s.stepper.Endstop.pin, pullup))
-
-			// Config trsync
-			configCmds = append(configCmds, fmt.Sprintf("config_trsync oid=%d", oids.trsync))
 
 			// Config stepper
 			configCmds = append(configCmds, fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",

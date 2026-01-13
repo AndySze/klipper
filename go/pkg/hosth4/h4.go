@@ -284,11 +284,16 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 
 // CompileHostH4Multi executes the H4 host runtime with multi-MCU support.
 // Returns a map of MCU name to raw debugoutput bytes.
-// Supports multi_mcu_simple.cfg for cartesian with Z on secondary MCU.
+// Supports cartesian printers with components on secondary MCUs.
 func CompileHostH4Multi(cfgPath string, testPath string, dicts map[string]*protocol.Dictionary, opts *CompileOptions) (map[string][]byte, error) {
 	base := filepath.Base(cfgPath)
-	if base != "multi_mcu_simple.cfg" {
-		return nil, fmt.Errorf("host-h4-multi: only multi_mcu_simple.cfg is supported (got %s)", base)
+	allowedMultiMCUConfigs := map[string]bool{
+		"multi_mcu_simple.cfg":   true, // Z on secondary MCU
+		"multi_mcu_extruder.cfg": true, // Extruder on secondary MCU
+		"multi_mcu_dual_z.cfg":   true, // Dual Z on secondary MCU
+	}
+	if !allowedMultiMCUConfigs[base] {
+		return nil, fmt.Errorf("host-h4-multi: unsupported config %s", base)
 	}
 
 	cfg, err := loadConfig(cfgPath)

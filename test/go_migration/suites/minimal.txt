@@ -4,8 +4,8 @@
 # hybrid_corexz, winch kinematics and are verified to pass against Python Klipper
 # golden output.
 #
-# Test count: 35 tests
-# Pass rate: 100%
+# Test count: 37 tests
+# Pass rate: 97% (out_of_bounds known issue)
 
 # === Basic commands and motion ===
 test/klippy/commands.test
@@ -77,3 +77,5 @@ test/klippy/winch.test
 
 # === Multi-MCU support ===
 test/klippy/multi_mcu_simple.test
+test/klippy/multi_mcu_extruder.test
+test/klippy/multi_mcu_dual_z.test
