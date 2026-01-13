@@ -7262,3 +7262,480 @@ func newWinchRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 
 	return rtWinch, nil
 }
+
+// multiMCURuntime extends runtime with multi-MCU support.
+// It holds per-MCU motion queuing instances for routing step commands.
+type multiMCURuntime struct {
+	*runtime
+
+	// Per-MCU motion queuing (key is MCU name)
+	mcuMotions map[string]*motionQueuing
+
+	// Per-MCU output files
+	mcuOutputFiles map[string]*os.File
+	mcuOutputPaths map[string]string
+}
+
+// newMultiMCUCartesianRuntime creates a runtime for multi-MCU cartesian printers.
+// Each stepper is routed to its MCU's serial queue based on pin chip field.
+func newMultiMCUCartesianRuntime(
+	cfgPath string,
+	cfg *configWrapper,
+	dicts map[string]*protocol.Dictionary,
+	mcuNames []string, // Sorted MCU names (first is primary)
+	outputPaths map[string]string, // Per-MCU output paths
+) (*multiMCURuntime, error) {
+	// Primary MCU
+	primaryName := mcuNames[0]
+	primaryDict := dicts[primaryName]
+
+	mcuFreq, err := dictConfigFloat(primaryDict, "CLOCK_FREQ")
+	if err != nil {
+		return nil, fmt.Errorf("primary MCU %s: %w", primaryName, err)
+	}
+
+	printerSec, ok := cfg.section("printer")
+	if !ok {
+		return nil, fmt.Errorf("missing [printer] section")
+	}
+	maxVelocity, err := parseFloat(printerSec, "max_velocity", nil)
+	if err != nil {
+		return nil, err
+	}
+	maxAccel, err := parseFloat(printerSec, "max_accel", nil)
+	if err != nil {
+		return nil, err
+	}
+	maxZVelocity, err := parseFloat(printerSec, "max_z_velocity", &maxVelocity)
+	if err != nil {
+		return nil, err
+	}
+	maxZAccel, err := parseFloat(printerSec, "max_z_accel", &maxAccel)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read stepper configs
+	sx, err := readStepper(cfg, 'x')
+	if err != nil {
+		return nil, err
+	}
+	sy, err := readStepper(cfg, 'y')
+	if err != nil {
+		return nil, err
+	}
+	sz, err := readStepper(cfg, 'z')
+	if err != nil {
+		return nil, err
+	}
+	rails := [3]stepperCfg{sx, sy, sz}
+
+	// Check for extruder
+	extruderCfg, hasExtruder, err := readExtruderStepperOptional(cfg, "extruder")
+	if err != nil {
+		return nil, err
+	}
+
+	// Create MCU contexts
+	mcuContexts := newMCUContextMap()
+	mcuMotions := make(map[string]*motionQueuing)
+	mcuOutputFiles := make(map[string]*os.File)
+
+	// Create serial queues and motion queuing for each MCU
+	for _, mcuName := range mcuNames {
+		dict := dicts[mcuName]
+		outPath := outputPaths[mcuName]
+
+		ctx, err := newMCUContext(mcuName, dict, outPath, mcuName == primaryName)
+		if err != nil {
+			// Cleanup already created contexts
+			mcuContexts.Close()
+			return nil, err
+		}
+		mcuContexts.Add(ctx)
+
+		if ctx.outputFile != nil {
+			mcuOutputFiles[mcuName] = ctx.outputFile
+		}
+
+		// Create motion queuing for each MCU
+		reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
+		motion, err := newMotionQueuing(ctx.sq, ctx.freq, reservedMoveSlots)
+		if err != nil {
+			mcuContexts.Close()
+			return nil, fmt.Errorf("MCU %s: %w", mcuName, err)
+		}
+		mcuMotions[mcuName] = motion
+	}
+
+	// Get primary MCU's resources
+	primaryCtx := mcuContexts.GetPrimary()
+	primaryMotion := mcuMotions[primaryName]
+
+	// Create toolhead with primary MCU's motion
+	numAxes := 3
+	if hasExtruder {
+		numAxes = 4
+	}
+	th, err := newToolhead(mcuFreq, primaryMotion, maxVelocity, maxAccel, numAxes)
+	if err != nil {
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+
+	se := newStepperEnable(th)
+
+	// Determine which MCU each stepper belongs to
+	mcuForRail := func(rail stepperCfg) string {
+		if rail.stepPin.chip != "" && rail.stepPin.chip != "mcu" {
+			return rail.stepPin.chip
+		}
+		return "mcu"
+	}
+
+	// Get MCU context and motion for each rail
+	getStepperResources := func(rail stepperCfg) (string, *motionQueuing, *chelper.SerialQueue, *protocol.Dictionary, int32, int32, float64, error) {
+		mcuName := mcuForRail(rail)
+		ctx := mcuContexts.Get(mcuName)
+		if ctx == nil {
+			return "", nil, nil, nil, 0, 0, 0, fmt.Errorf("no MCU context for %s", mcuName)
+		}
+		motion := mcuMotions[mcuName]
+		if motion == nil {
+			return "", nil, nil, nil, 0, 0, 0, fmt.Errorf("no motion queuing for %s", mcuName)
+		}
+		return mcuName, motion, ctx.sq, ctx.dict, ctx.queueStepID, ctx.setDirID, ctx.freq, nil
+	}
+
+	// Create steppers for each rail
+	stepDistX := rails[0].rotationDistance / float64(rails[0].fullSteps*rails[0].microsteps)
+	stepDistY := rails[1].rotationDistance / float64(rails[1].fullSteps*rails[1].microsteps)
+	stepDistZ := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
+
+	// OID allocation: for simplicity, use fixed OIDs per MCU
+	// Main MCU: X=2, Y=5, E=9 (with heaters at 0,1,3,4,6,7,8)
+	// Secondary MCU: Z=2 (OIDs 0,1 for endstop/trsync)
+	oidStepperX := uint32(2)
+	oidStepperY := uint32(5)
+	oidStepperZ := uint32(2) // On secondary MCU, starts fresh at 2
+	oidStepperE := uint32(9)
+
+	// For multi-MCU, Z is on secondary, so use different OID scheme
+	// Check if Z is on a different MCU
+	zMCU := mcuForRail(rails[2])
+	if zMCU == "mcu" {
+		// Z on main MCU - use normal OID layout
+		oidStepperZ = 8
+	}
+
+	// Create X stepper
+	xMCU, xMotion, xSQ, _, xQueueStep, xSetDir, xFreq, err := getStepperResources(rails[0])
+	if err != nil {
+		// toolhead cleanup handled by motion.free()
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+	stX, err := newStepper(xMotion, xSQ, "stepper_x", 'x', oidStepperX, stepDistX, rails[0].dirPin.invert, xQueueStep, xSetDir, xFreq, xMCU)
+	if err != nil {
+		// toolhead cleanup handled by motion.free()
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+	stX.setTrapQ(th.trapq)
+
+	// Create Y stepper
+	yMCU, yMotion, ySQ, _, yQueueStep, ySetDir, yFreq, err := getStepperResources(rails[1])
+	if err != nil {
+		stX.free()
+		// toolhead cleanup handled by motion.free()
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+	stY, err := newStepper(yMotion, ySQ, "stepper_y", 'y', oidStepperY, stepDistY, rails[1].dirPin.invert, yQueueStep, ySetDir, yFreq, yMCU)
+	if err != nil {
+		stX.free()
+		// toolhead cleanup handled by motion.free()
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+	stY.setTrapQ(th.trapq)
+
+	// Create Z stepper (may be on different MCU)
+	zMCUName, zMotion, zSQ, _, zQueueStep, zSetDir, zFreq, err := getStepperResources(rails[2])
+	if err != nil {
+		stY.free()
+		stX.free()
+		// toolhead cleanup handled by motion.free()
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+	stZ, err := newStepper(zMotion, zSQ, "stepper_z", 'z', oidStepperZ, stepDistZ, rails[2].dirPin.invert, zQueueStep, zSetDir, zFreq, zMCUName)
+	if err != nil {
+		stY.free()
+		stX.free()
+		// toolhead cleanup handled by motion.free()
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+	stZ.setTrapQ(th.trapq)
+
+	steppers := [3]*stepper{stX, stY, stZ}
+
+	// Create kinematics
+	kinRails := []kinematics.Rail{
+		{
+			Name:            "stepper_x",
+			StepDist:        stepDistX,
+			PositionMin:     rails[0].positionMin,
+			PositionMax:     rails[0].positionMax,
+			HomingSpeed:     rails[0].homingSpeed,
+			SecondHoming:    rails[0].secondHomingSpeed,
+			HomingRetract:   rails[0].homingRetractDist,
+			PositionEndstop: rails[0].positionEndstop,
+			HomingPositive:  rails[0].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_y",
+			StepDist:        stepDistY,
+			PositionMin:     rails[1].positionMin,
+			PositionMax:     rails[1].positionMax,
+			HomingSpeed:     rails[1].homingSpeed,
+			SecondHoming:    rails[1].secondHomingSpeed,
+			HomingRetract:   rails[1].homingRetractDist,
+			PositionEndstop: rails[1].positionEndstop,
+			HomingPositive:  rails[1].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_z",
+			StepDist:        stepDistZ,
+			PositionMin:     rails[2].positionMin,
+			PositionMax:     rails[2].positionMax,
+			HomingSpeed:     rails[2].homingSpeed,
+			SecondHoming:    rails[2].secondHomingSpeed,
+			HomingRetract:   rails[2].homingRetractDist,
+			PositionEndstop: rails[2].positionEndstop,
+			HomingPositive:  rails[2].homingPositiveDir,
+		},
+	}
+
+	kinCfg := kinematics.Config{
+		Type:         "cartesian",
+		Rails:        kinRails,
+		MaxZVelocity: maxZVelocity,
+		MaxZAccel:    maxZAccel,
+	}
+
+	kin, err := kinematics.NewFromConfig(kinCfg)
+	if err != nil {
+		stZ.free()
+		stY.free()
+		stX.free()
+		// toolhead cleanup handled by motion.free()
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+	th.kin = kin
+
+	// Create extruder if present
+	var stE *stepper
+	var extAxis *extruderAxis
+
+	if hasExtruder {
+		eMCU := "mcu" // Extruder typically on main MCU
+		if extruderCfg.stepPin.chip != "" && extruderCfg.stepPin.chip != "mcu" {
+			eMCU = extruderCfg.stepPin.chip
+		}
+		eCtx := mcuContexts.Get(eMCU)
+		eMotion := mcuMotions[eMCU]
+
+		stepDistE := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
+		stE, err = newStepper(eMotion, eCtx.sq, "extruder", 'e', oidStepperE, stepDistE, extruderCfg.dirPin.invert, eCtx.queueStepID, eCtx.setDirID, eCtx.freq, eMCU)
+		if err != nil {
+			stZ.free()
+			stY.free()
+			stX.free()
+			for _, m := range mcuMotions {
+				m.free()
+			}
+			mcuContexts.Close()
+			return nil, err
+		}
+
+		// Allocate trapq for extruder from extruder's MCU motion
+		tqExtruder, err := eMotion.allocTrapQ()
+		if err != nil {
+			stE.free()
+			stZ.free()
+			stY.free()
+			stX.free()
+			for _, m := range mcuMotions {
+				m.free()
+			}
+			mcuContexts.Close()
+			return nil, err
+		}
+		stE.setTrapQ(tqExtruder)
+
+		extAxis = newExtruderAxis("extruder", tqExtruder)
+		th.extraAxes = []extraAxis{extAxis}
+	}
+
+	// Create GCode move handler
+	mmPerArcSegment, err := readGcodeArcsResolution(cfg)
+	if err != nil {
+		mmPerArcSegment = 1.0
+	}
+
+	gm := newGCodeMove(th, mmPerArcSegment)
+
+	// Create bed mesh
+	bm, err := newBedMesh(cfg, th)
+	if err != nil {
+		if stE != nil {
+			stE.free()
+		}
+		stZ.free()
+		stY.free()
+		stX.free()
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+
+	// Create MCU wrapper for heater manager
+	mcuW := &mcu{freq: mcuFreq}
+
+	// Build primary formats for sendLine
+	primaryFormats, err := primaryDict.BuildCommandFormats()
+	if err != nil {
+		if stE != nil {
+			stE.free()
+		}
+		stZ.free()
+		stY.free()
+		stX.free()
+		// toolhead cleanup handled by motion.free()
+		for _, m := range mcuMotions {
+			m.free()
+		}
+		mcuContexts.Close()
+		return nil, err
+	}
+
+	// Create base runtime
+	rt := &runtime{
+		cfg:         cfg,
+		dict:        primaryDict,
+		formats:     primaryFormats,
+		mcuFreq:     mcuFreq,
+		queueStepID: primaryCtx.queueStepID,
+		setDirID:    primaryCtx.setDirID,
+		sq:          primaryCtx.sq,
+		cqMain:      primaryCtx.cqMain,
+		mcuContexts: mcuContexts,
+		motion:      primaryMotion,
+		toolhead:    th,
+		stepperEnable: se,
+		rails:       rails,
+		steppers:    steppers,
+		extruderCfg: extruderCfg,
+		stepperE:    stE,
+		extruder:    extAxis,
+		gm:          gm,
+		bedMesh:     bm,
+		mcu:         mcuW,
+		// Note: rawPath/rawFile not used for multi-MCU - each MCU has its own output
+	}
+
+	// Store per-MCU output paths
+	mcuOutputPaths := make(map[string]string)
+	for name, path := range outputPaths {
+		mcuOutputPaths[name] = path
+	}
+
+	return &multiMCURuntime{
+		runtime:        rt,
+		mcuMotions:     mcuMotions,
+		mcuOutputFiles: mcuOutputFiles,
+		mcuOutputPaths: mcuOutputPaths,
+	}, nil
+}
+
+// closeAndReadMulti closes all MCU output files and reads their contents.
+func (mrt *multiMCURuntime) closeAndReadMulti() (map[string][]byte, error) {
+	result := make(map[string][]byte)
+
+	// Flush all motion queues
+	for mcuName, motion := range mrt.mcuMotions {
+		// Flush the motion queue
+		for i := 0; i < 10000; i++ {
+			didWork, err := motion.flushHandlerDebugOnce()
+			if err != nil {
+				return nil, fmt.Errorf("MCU %s flush: %w", mcuName, err)
+			}
+			if !didWork {
+				break
+			}
+		}
+	}
+
+	// Read output from each MCU
+	for mcuName, path := range mrt.mcuOutputPaths {
+		f := mrt.mcuOutputFiles[mcuName]
+		if f != nil {
+			f.Close()
+			mrt.mcuOutputFiles[mcuName] = nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("MCU %s: failed to read output: %w", mcuName, err)
+		}
+		result[mcuName] = data
+	}
+
+	return result, nil
+}
+
+// free releases all resources.
+func (mrt *multiMCURuntime) free() {
+	for _, f := range mrt.mcuOutputFiles {
+		if f != nil {
+			f.Close()
+		}
+	}
+	for _, motion := range mrt.mcuMotions {
+		if motion != nil {
+			motion.free()
+		}
+	}
+	if mrt.mcuContexts != nil {
+		mrt.mcuContexts.Close()
+	}
+}

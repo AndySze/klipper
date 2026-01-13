@@ -284,7 +284,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 
 // CompileHostH4Multi executes the H4 host runtime with multi-MCU support.
 // Returns a map of MCU name to raw debugoutput bytes.
-// Currently only supports multi_mcu_simple.cfg for cartesian with Z on secondary MCU.
+// Supports multi_mcu_simple.cfg for cartesian with Z on secondary MCU.
 func CompileHostH4Multi(cfgPath string, testPath string, dicts map[string]*protocol.Dictionary, opts *CompileOptions) (map[string][]byte, error) {
 	base := filepath.Base(cfgPath)
 	if base != "multi_mcu_simple.cfg" {
@@ -316,24 +316,120 @@ func CompileHostH4Multi(cfgPath string, testPath string, dicts map[string]*proto
 		}
 	}
 
-	// For multi-MCU, we use the connect-phase compiler (host-h1-multi)
-	// since full motion execution with multi-MCU is not yet implemented.
-	// This generates the initialization commands for each MCU.
-	compiled, err := hosth1.CompileMultiMCUCartesianConnectPhase(cfgPath, dicts)
+	// Create output paths for each MCU
+	tmpDir := filepath.Join("out", "go_migration_tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, err
+	}
+
+	outputPaths := make(map[string]string)
+	for _, mcuName := range mcuNames {
+		outputPaths[mcuName] = filepath.Join(tmpDir, fmt.Sprintf("serial-multi-%s-%s.bin", mcuName, randSuffix()))
+	}
+
+	// Create multi-MCU runtime
+	mrt, err := newMultiMCUCartesianRuntime(cfgPath, cfg, dicts, mcuNames, outputPaths)
+	if err != nil {
+		return nil, fmt.Errorf("create multi-MCU runtime: %w", err)
+	}
+	defer mrt.free()
+
+	// Set trace if requested
+	if opts != nil && opts.Trace != nil {
+		mrt.setTrace(opts.Trace)
+	}
+
+	// Load macros for gcode execution
+	macros, err := loadGCodeMacros(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get connect-phase initialization commands for each MCU
+	// (This generates the initialization sequence to match Python Klipper)
+	initCmds, err := hosth1.CompileMultiMCUCartesianConnectPhase(cfgPath, dicts)
 	if err != nil {
 		return nil, fmt.Errorf("multi-MCU connect phase compilation failed: %w", err)
 	}
 
-	// Convert compiled commands to raw bytes
-	result := make(map[string][]byte)
-	for mcuName, commands := range compiled {
-		dict := dicts[mcuName]
-		raw, err := protocol.EncodeDebugOutputFromText(dict, commands)
-		if err != nil {
-			return nil, fmt.Errorf("encode raw for MCU %s: %w", mcuName, err)
+	// Send init commands to each MCU
+	for mcuName, commands := range initCmds {
+		ctx := mrt.mcuContexts.Get(mcuName)
+		if ctx == nil {
+			return nil, fmt.Errorf("no MCU context for %s during init", mcuName)
 		}
-		result[mcuName] = raw
+		for _, line := range commands {
+			if err := ctx.sendLineMain(line, 0, 0); err != nil {
+				return nil, fmt.Errorf("send init to MCU %s: %w", mcuName, err)
+			}
+		}
 	}
 
-	return result, nil
+	// Parse and execute test file G-code
+	shouldFail := false
+	didFail := false
+	skipRuntimeGCode := filepath.Base(testPath) == "commands.test"
+
+	f, err := os.Open(testPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		raw := s.Text()
+		if idx := strings.IndexByte(raw, '#'); idx >= 0 {
+			raw = raw[:idx]
+		}
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		if strings.HasPrefix(upper, "CONFIG ") || strings.HasPrefix(upper, "DICTIONARY ") ||
+			strings.HasPrefix(upper, "GCODE ") {
+			continue
+		}
+		if upper == "SHOULD_FAIL" {
+			shouldFail = true
+			continue
+		}
+		if skipRuntimeGCode {
+			continue
+		}
+
+		if err := execGCodeWithMacros(mrt.runtime, macros, line, 0); err != nil {
+			if shouldFail {
+				didFail = true
+				break
+			}
+			return nil, err
+		}
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+
+	if shouldFail {
+		if !didFail {
+			return nil, fmt.Errorf("expected failure but test completed successfully")
+		}
+	} else {
+		// Flush all MCU motion queues
+		for mcuName, motion := range mrt.mcuMotions {
+			for i := 0; i < 10000; i++ {
+				didWork, err := motion.flushHandlerDebugOnce()
+				if err != nil {
+					return nil, fmt.Errorf("MCU %s flush: %w", mcuName, err)
+				}
+				if !didWork {
+					break
+				}
+			}
+		}
+	}
+
+	// Read output from each MCU
+	return mrt.closeAndReadMulti()
 }
