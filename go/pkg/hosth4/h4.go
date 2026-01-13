@@ -247,12 +247,14 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	// connect-phase baseline in the go_migration harness (it intentionally
 	// does not validate runtime MCU output here).
 	skipRuntimeGCode := filepath.Base(testPath) == "commands.test"
+
+	// First pass: collect GCODE file reference and inline gcode lines
+	var gcodeFile string
+	var inlineGcode []string
 	f, err := os.Open(testPath)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		raw := s.Text()
@@ -264,28 +266,71 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 			continue
 		}
 		upper := strings.ToUpper(line)
-		if strings.HasPrefix(upper, "CONFIG ") || strings.HasPrefix(upper, "DICTIONARY ") ||
-			strings.HasPrefix(upper, "GCODE ") {
+		if strings.HasPrefix(upper, "CONFIG ") || strings.HasPrefix(upper, "DICTIONARY ") {
+			continue
+		}
+		if strings.HasPrefix(upper, "GCODE ") {
+			// Parse GCODE filename (relative to test file directory)
+			gcodeFile = strings.TrimSpace(line[6:])
 			continue
 		}
 		if upper == "SHOULD_FAIL" {
 			shouldFail = true
 			continue
 		}
-		if skipRuntimeGCode {
-			continue
-		}
-
-		if err := execGCodeWithMacros(rt, macros, line, 0); err != nil {
-			if shouldFail {
-				didFail = true
-				break
-			}
-			return nil, err
-		}
+		inlineGcode = append(inlineGcode, line)
 	}
 	if err := s.Err(); err != nil {
+		f.Close()
 		return nil, err
+	}
+	f.Close()
+
+	// Execute gcode: either from GCODE file or inline lines
+	if skipRuntimeGCode {
+		// Skip all gcode execution for commands.test
+	} else if gcodeFile != "" {
+		// Read and execute gcode from referenced file
+		gcodeFilePath := filepath.Join(filepath.Dir(testPath), gcodeFile)
+		gf, err := os.Open(gcodeFilePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open gcode file %s: %w", gcodeFilePath, err)
+		}
+		gs := bufio.NewScanner(gf)
+		for gs.Scan() {
+			raw := gs.Text()
+			if idx := strings.IndexByte(raw, ';'); idx >= 0 {
+				raw = raw[:idx]
+			}
+			line := strings.TrimSpace(raw)
+			if line == "" {
+				continue
+			}
+			if err := execGCodeWithMacros(rt, macros, line, 0); err != nil {
+				if shouldFail {
+					didFail = true
+					break
+				}
+				gf.Close()
+				return nil, err
+			}
+		}
+		if err := gs.Err(); err != nil {
+			gf.Close()
+			return nil, err
+		}
+		gf.Close()
+	} else {
+		// Execute inline gcode lines
+		for _, line := range inlineGcode {
+			if err := execGCodeWithMacros(rt, macros, line, 0); err != nil {
+				if shouldFail {
+					didFail = true
+					break
+				}
+				return nil, err
+			}
+		}
 	}
 	if shouldFail {
 		if !didFail {
@@ -410,12 +455,13 @@ func CompileHostH4Multi(cfgPath string, testPath string, dicts map[string]*proto
 	didFail := false
 	skipRuntimeGCode := filepath.Base(testPath) == "commands.test"
 
+	// First pass: collect GCODE file reference and inline gcode lines
+	var gcodeFile string
+	var inlineGcode []string
 	f, err := os.Open(testPath)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		raw := s.Text()
@@ -427,28 +473,70 @@ func CompileHostH4Multi(cfgPath string, testPath string, dicts map[string]*proto
 			continue
 		}
 		upper := strings.ToUpper(line)
-		if strings.HasPrefix(upper, "CONFIG ") || strings.HasPrefix(upper, "DICTIONARY ") ||
-			strings.HasPrefix(upper, "GCODE ") {
+		if strings.HasPrefix(upper, "CONFIG ") || strings.HasPrefix(upper, "DICTIONARY ") {
+			continue
+		}
+		if strings.HasPrefix(upper, "GCODE ") {
+			gcodeFile = strings.TrimSpace(line[6:])
 			continue
 		}
 		if upper == "SHOULD_FAIL" {
 			shouldFail = true
 			continue
 		}
-		if skipRuntimeGCode {
-			continue
-		}
-
-		if err := execGCodeWithMacros(mrt.runtime, macros, line, 0); err != nil {
-			if shouldFail {
-				didFail = true
-				break
-			}
-			return nil, err
-		}
+		inlineGcode = append(inlineGcode, line)
 	}
 	if err := s.Err(); err != nil {
+		f.Close()
 		return nil, err
+	}
+	f.Close()
+
+	// Execute gcode: either from GCODE file or inline lines
+	if skipRuntimeGCode {
+		// Skip all gcode execution for commands.test
+	} else if gcodeFile != "" {
+		// Read and execute gcode from referenced file
+		gcodeFilePath := filepath.Join(filepath.Dir(testPath), gcodeFile)
+		gf, err := os.Open(gcodeFilePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open gcode file %s: %w", gcodeFilePath, err)
+		}
+		gs := bufio.NewScanner(gf)
+		for gs.Scan() {
+			raw := gs.Text()
+			if idx := strings.IndexByte(raw, ';'); idx >= 0 {
+				raw = raw[:idx]
+			}
+			line := strings.TrimSpace(raw)
+			if line == "" {
+				continue
+			}
+			if err := execGCodeWithMacros(mrt.runtime, macros, line, 0); err != nil {
+				if shouldFail {
+					didFail = true
+					break
+				}
+				gf.Close()
+				return nil, err
+			}
+		}
+		if err := gs.Err(); err != nil {
+			gf.Close()
+			return nil, err
+		}
+		gf.Close()
+	} else {
+		// Execute inline gcode lines
+		for _, line := range inlineGcode {
+			if err := execGCodeWithMacros(mrt.runtime, macros, line, 0); err != nil {
+				if shouldFail {
+					didFail = true
+					break
+				}
+				return nil, err
+			}
+		}
 	}
 
 	if shouldFail {

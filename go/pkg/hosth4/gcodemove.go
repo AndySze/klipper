@@ -99,6 +99,42 @@ func (gm *gcodeMove) cmdG17() { gm.arcPlane = arcPlaneXY }
 func (gm *gcodeMove) cmdG18() { gm.arcPlane = arcPlaneXZ }
 func (gm *gcodeMove) cmdG19() { gm.arcPlane = arcPlaneYZ }
 
+// cmdG92 sets the current gcode position by adjusting the base position offset.
+// This doesn't move the toolhead - it just changes how gcode coordinates map to toolhead coordinates.
+func (gm *gcodeMove) cmdG92(args map[string]string) error {
+	axisMap := map[string]int{"X": 0, "Y": 1, "Z": 2, "E": 3}
+	anySet := false
+	for axis, pos := range axisMap {
+		raw, ok := args[axis]
+		if !ok {
+			continue
+		}
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("bad %s=%q", axis, raw)
+		}
+		anySet = true
+		if axis == "E" {
+			v *= gm.extrudeFactor
+		}
+		// Set base_position so that gcode_pos becomes v
+		// gcode_pos = last_position - base_position
+		// Therefore: base_position = last_position - v
+		if pos < len(gm.basePosition) && pos < len(gm.lastPosition) {
+			gm.basePosition[pos] = gm.lastPosition[pos] - v
+		}
+	}
+	// If no arguments, reset all base positions (like G92 with no args)
+	if !anySet {
+		for i := range gm.basePosition {
+			if i < len(gm.lastPosition) {
+				gm.basePosition[i] = gm.lastPosition[i]
+			}
+		}
+	}
+	return nil
+}
+
 func (gm *gcodeMove) cmdG1(args map[string]string) error {
 	axisMap := map[string]int{"X": 0, "Y": 1, "Z": 2, "E": 3}
 	for axis, pos := range axisMap {

@@ -324,12 +324,14 @@ func (mq *motionQueuing) advanceFlushTime(wantFlushTime float64, wantStepGenTime
 	}
 
 	// Invoke callbacks first (original Python ordering)
+	mq.tracef("MQ advance calling %d callbacks\n", len(mq.callbacks))
 	for _, cb := range mq.callbacks {
 		cb.fn(flushTime, stepGenTime)
 	}
 	if mq.callbackErr != nil {
 		err := mq.callbackErr
 		mq.callbackErr = nil
+		mq.tracef("MQ advance callback error: %v\n", err)
 		return err
 	}
 
@@ -343,6 +345,7 @@ func (mq *motionQueuing) advanceFlushTime(wantFlushTime float64, wantStepGenTime
 		}
 	}
 
+	mq.tracef("MQ GenSteps call flush=%.9f stepGen=%.9f clear=%.9f\n", flushTime, stepGenTime, clearHistoryTime)
 	if err := mq.ssm.GenSteps(flushTime, stepGenTime, clearHistoryTime); err != nil {
 		return err
 	}
@@ -804,6 +807,11 @@ func (th *toolhead) dripLoadTrapQ(submitMove *move) (float64, float64, float64, 
 	endTime := th.printTime
 	preDecelTime := th.printTime
 	for _, mv := range moves {
+		th.motion.tracef("trapq.Append time=%.9f accelT=%.9f cruiseT=%.9f decelT=%.9f\n",
+			endTime, mv.accelT, mv.cruiseT, mv.decelT)
+		th.motion.tracef("  startPos=[%f,%f,%f] axesR=[%f,%f,%f]\n",
+			mv.startPos[0], mv.startPos[1], mv.startPos[2], mv.axesR[0], mv.axesR[1], mv.axesR[2])
+		th.motion.tracef("  startV=%.9f cruiseV=%.9f accel=%.9f\n", mv.startV, mv.cruiseV, mv.accel)
 		th.trapq.Append(
 			endTime,
 			mv.accelT,
@@ -1269,6 +1277,7 @@ func (s *stepper) setTrapQ(tq *chelper.TrapQ) *chelper.TrapQ {
 	prev := s.trapq
 	s.trapq = tq
 	if s.sk != nil {
+		s.motion.tracef("setTrapQ stepper=%c oid=%d stepDist=%f\n", s.axis, s.oid, s.stepDist)
 		s.sk.SetTrapQ(tq, s.stepDist)
 	}
 	return prev
@@ -2089,6 +2098,13 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	stepDistX := rails[0].rotationDistance / float64(rails[0].fullSteps*rails[0].microsteps)
 	stepDistY := rails[1].rotationDistance / float64(rails[1].fullSteps*rails[1].microsteps)
 	stepDistZ := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
+
+	motion.tracef("STEPPER stepDistX=%f rotDist=%f fullSteps=%d microsteps=%d\n",
+		stepDistX, rails[0].rotationDistance, rails[0].fullSteps, rails[0].microsteps)
+	motion.tracef("STEPPER stepDistY=%f rotDist=%f fullSteps=%d microsteps=%d\n",
+		stepDistY, rails[1].rotationDistance, rails[1].fullSteps, rails[1].microsteps)
+	motion.tracef("STEPPER stepDistZ=%f rotDist=%f fullSteps=%d microsteps=%d\n",
+		stepDistZ, rails[2].rotationDistance, rails[2].fullSteps, rails[2].microsteps)
 
 	// Stepper names depend on kinematics type
 	var stepperNames [3]string
@@ -4159,9 +4175,9 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 			r.gm.resetFromToolhead()
 		}
 	case "G92":
-		// Set position without moving.
-		// This is used by macros.test and should not emit MCU traffic.
-		if err := r.cmdG92(cmd.Args); err != nil {
+		// Set gcode position offset without moving.
+		// This adjusts the coordinate mapping, not the actual toolhead position.
+		if err := r.gm.cmdG92(cmd.Args); err != nil {
 			return err
 		}
 	case "SAVE_GCODE_STATE", "RESTORE_GCODE_STATE":
@@ -4657,53 +4673,6 @@ func (r *runtime) cmdBedMeshCalibrate(args map[string]string) error {
 	return nil
 }
 
-func (r *runtime) cmdG92(args map[string]string) error {
-	if r.toolhead == nil {
-		return fmt.Errorf("toolhead not initialized")
-	}
-	pos := append([]float64{}, r.toolhead.commandedPos...)
-	setAxis := func(axis byte, idx int) error {
-		raw, ok := args[string(axis)]
-		if !ok {
-			return nil
-		}
-		if raw == "" {
-			return fmt.Errorf("empty arg %c", axis)
-		}
-		v, err := strconv.ParseFloat(raw, 64)
-		if err != nil {
-			return fmt.Errorf("bad float %c=%q", axis, raw)
-		}
-		if idx >= 0 && idx < len(pos) {
-			pos[idx] = v
-		}
-		return nil
-	}
-	if err := setAxis('X', 0); err != nil {
-		return err
-	}
-	if err := setAxis('Y', 1); err != nil {
-		return err
-	}
-	if err := setAxis('Z', 2); err != nil {
-		return err
-	}
-	if err := setAxis('E', 3); err != nil {
-		return err
-	}
-	for i := 0; i < len(r.toolhead.commandedPos) && i < len(pos); i++ {
-		r.toolhead.commandedPos[i] = pos[i]
-	}
-	if len(pos) >= 3 && r.toolhead.trapq != nil {
-		r.toolhead.trapq.SetPosition(r.toolhead.printTime, pos[0], pos[1], pos[2])
-	}
-	if r.toolhead.kin != nil && len(pos) >= 3 {
-		r.toolhead.kin.SetPosition(pos, "")
-	}
-	r.gm.resetFromToolhead()
-	return nil
-}
-
 func (r *runtime) onEOF() error {
 	if r.stepperEnable == nil {
 		return nil
@@ -4765,6 +4734,7 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
 		return nil
 	}
 	stepDist := r.steppers[axis].stepDist
+	r.tracef("HOMING axis=%d stepDist=%f moveD=%f\n", axis, stepDist, moveD)
 	maxSteps := moveD / stepDist
 	if maxSteps <= 0.0 {
 		maxSteps = 1.0
@@ -4840,6 +4810,14 @@ func (r *runtime) homeAxis(axis int) error {
 	if err := r.toolhead.setPosition(forcepos, homingAxes); err != nil {
 		return err
 	}
+	// Update stepper kinematics positions to match the new toolhead position
+	// This is critical for step generation - the stepper_kinematics needs to know
+	// the current position to calculate correct step timing.
+	for i := 0; i < 3 && i < len(r.steppers); i++ {
+		if r.steppers[i] != nil {
+			r.steppers[i].setPosition(forcepos[i])
+		}
+	}
 	isProbeZ := axis == 2 && rail.endstopPin.pin == "probe:z_virtual_endstop" && r.bltouch != nil
 	if isProbeZ {
 		if err := r.bltouch.lowerProbe(); err != nil {
@@ -4900,6 +4878,12 @@ func (r *runtime) homeAxis(axis int) error {
 	}
 	if err := r.toolhead.setPosition(start2pos, ""); err != nil {
 		return err
+	}
+	// Update stepper kinematics positions for second homing move
+	for i := 0; i < 3 && i < len(r.steppers); i++ {
+		if r.steppers[i] != nil {
+			r.steppers[i].setPosition(start2pos[i])
+		}
 	}
 	if isProbeZ {
 		if err := r.bltouch.lowerProbe(); err != nil {
