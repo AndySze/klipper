@@ -163,7 +163,7 @@ func writeActual(path string, srcTest string, mode string, sections []mcuSection
 		switch mode {
 		case "stub":
 			// Keep the section empty on purpose; it's a placeholder contract.
-		case "roundtrip", "copy-expected", "parsedump", "encode-raw", "host-h1", "host-h1-multi", "host-h2", "host-h3", "host-h4":
+		case "roundtrip", "copy-expected", "parsedump", "encode-raw", "host-h1", "host-h1-multi", "host-h2", "host-h3", "host-h4", "host-h4-multi":
 			for _, ln := range sec.lines {
 				ln = strings.TrimSpace(ln)
 				if ln == "" {
@@ -2081,7 +2081,7 @@ func main() {
 		suite   = flag.String("suite", "../test/go_migration/suites/minimal.txt", "suite file")
 		outdir  = flag.String("outdir", "../test/go_migration/golden", "golden directory")
 		only    = flag.String("only", "", "only generate for a single test (path or stem)")
-		mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw|host-h1|host-h1-multi|host-h2|host-h3|host-h4|auto")
+		mode    = flag.String("mode", "stub", "output mode: stub|copy-expected|roundtrip|parsedump|encode-raw|host-h1|host-h1-multi|host-h2|host-h3|host-h4|host-h4-multi|auto")
 		dictdir = flag.String("dictdir", "../dict", "dictionary directory")
 		trace   = flag.Bool("trace", false, "write host trace logs (host-h4 only)")
 	)
@@ -2597,6 +2597,71 @@ func main() {
 				sections[i].lines = lines
 			}
 			if err := writeActual(actual, testRel, modeForTest, sections); err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				os.Exit(2)
+			}
+		case "host-h4-multi":
+			// Multi-MCU motion execution (currently falls back to connect-phase)
+			srcTest, cfgRel, err := parseExpectedHeader(expected)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				os.Exit(2)
+			}
+			sections, err := parseExpectedSections(expected)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				os.Exit(2)
+			}
+
+			testPath := filepath.Clean(filepath.Join("..", srcTest))
+			cfgPath := filepath.Clean(filepath.Join(filepath.Dir(testPath), cfgRel))
+
+			// Load dictionaries for all MCUs
+			dicts := make(map[string]*protocol.Dictionary)
+			for _, sec := range sections {
+				dictPath := filepath.Join(*dictdir, sec.dict)
+				dict, err := protocol.LoadDictionary(dictPath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: load dict %s: %v\n", dictPath, err)
+					os.Exit(2)
+				}
+				dicts[sec.name] = dict
+			}
+
+			// Compile multi-MCU
+			rawOutputs, err := hosth4.CompileHostH4Multi(cfgPath, testPath, dicts, nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: compile H4 multi: %v\n", err)
+				os.Exit(2)
+			}
+
+			// Build output sections per MCU
+			var outSections []mcuSection
+			for _, sec := range sections {
+				mcuName := sec.name
+				dict := dicts[mcuName]
+				raw := rawOutputs[mcuName]
+				if raw == nil {
+					fmt.Fprintf(os.Stderr, "ERROR: no output for MCU %s\n", mcuName)
+					os.Exit(2)
+				}
+				rawPath := filepath.Join(caseDir, fmt.Sprintf("raw-host-h4-multi-%s.bin", mcuName))
+				if err := os.WriteFile(rawPath, raw, 0o644); err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: write raw %s: %v\n", rawPath, err)
+					os.Exit(2)
+				}
+				lines, err := protocol.DecodeDebugOutput(dict, raw)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: decode raw %s: %v\n", rawPath, err)
+					os.Exit(2)
+				}
+				outSections = append(outSections, mcuSection{
+					name:  mcuName,
+					dict:  sec.dict,
+					lines: lines,
+				})
+			}
+			if err := writeActual(actual, testRel, modeForTest, outSections); err != nil {
 				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 				os.Exit(2)
 			}

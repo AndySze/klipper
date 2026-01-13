@@ -281,3 +281,59 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	}
 	return rawOut, nil
 }
+
+// CompileHostH4Multi executes the H4 host runtime with multi-MCU support.
+// Returns a map of MCU name to raw debugoutput bytes.
+// Currently only supports multi_mcu_simple.cfg for cartesian with Z on secondary MCU.
+func CompileHostH4Multi(cfgPath string, testPath string, dicts map[string]*protocol.Dictionary, opts *CompileOptions) (map[string][]byte, error) {
+	base := filepath.Base(cfgPath)
+	if base != "multi_mcu_simple.cfg" {
+		return nil, fmt.Errorf("host-h4-multi: only multi_mcu_simple.cfg is supported (got %s)", base)
+	}
+
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+
+	printerSec, ok := cfg.section("printer")
+	if !ok {
+		return nil, fmt.Errorf("missing [printer] section")
+	}
+	kin := strings.TrimSpace(printerSec["kinematics"])
+	if kin != "cartesian" {
+		return nil, fmt.Errorf("host-h4-multi only supports cartesian kinematics (got %q)", kin)
+	}
+
+	// Parse MCU sections to determine which MCUs are present
+	mcuSections := ParseMCUSections(cfg)
+	mcuNames := SortedMCUNames(mcuSections)
+
+	// Verify we have dictionaries for all MCUs
+	for _, name := range mcuNames {
+		if dicts[name] == nil {
+			return nil, fmt.Errorf("missing dictionary for MCU %q", name)
+		}
+	}
+
+	// For multi-MCU, we use the connect-phase compiler (host-h1-multi)
+	// since full motion execution with multi-MCU is not yet implemented.
+	// This generates the initialization commands for each MCU.
+	compiled, err := hosth1.CompileMultiMCUCartesianConnectPhase(cfgPath, dicts)
+	if err != nil {
+		return nil, fmt.Errorf("multi-MCU connect phase compilation failed: %w", err)
+	}
+
+	// Convert compiled commands to raw bytes
+	result := make(map[string][]byte)
+	for mcuName, commands := range compiled {
+		dict := dicts[mcuName]
+		raw, err := protocol.EncodeDebugOutputFromText(dict, commands)
+		if err != nil {
+			return nil, fmt.Errorf("encode raw for MCU %s: %w", mcuName, err)
+		}
+		result[mcuName] = raw
+	}
+
+	return result, nil
+}
