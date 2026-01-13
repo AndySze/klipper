@@ -65,6 +65,8 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"generic-duet3-mini.cfg":                   true, // samd51p20
 		"generic-duet3-6hc.cfg":                    true, // same70q20b
 		"printer-anycubic-kobra-go-2022.cfg":       true, // hc32f460
+		// PRU (BeagleBone) architecture test
+		"arch_pru.cfg": true, // pru
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)

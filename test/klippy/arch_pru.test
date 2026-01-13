@@ -1,0 +1,5 @@
+# Test PRU (BeagleBone) architecture with simplified CRAMPS-style config
+# PRU doesn't have ADC, so no extruder/heater (uses move_xyz.gcode)
+DICTIONARY pru.dict
+CONFIG arch_pru.cfg
+GCODE move_xyz.gcode
