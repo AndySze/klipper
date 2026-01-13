@@ -1656,6 +1656,7 @@ func (e *endstop) homeStop() error {
 type runtime struct {
 	cfg *configWrapper
 
+	// Single-MCU resources (for backward compatibility)
 	dict        *protocol.Dictionary
 	formats     map[string]*protocol.MessageFormat
 	mcuFreq     float64
@@ -1666,6 +1667,9 @@ type runtime struct {
 	cqMain       *chelper.CommandQueue
 	cqTrigger    *chelper.CommandQueue
 	cqEnablePins []*chelper.CommandQueue
+
+	// Multi-MCU resources
+	mcuContexts *mcuContextMap // nil for single-MCU mode
 
 	motion        *motionQueuing
 	toolhead      *toolhead
@@ -4006,6 +4010,11 @@ func (r *runtime) cleanup(removeFile bool) error {
 		r.cqTrigger.Free()
 		r.cqTrigger = nil
 	}
+	// Free multi-MCU contexts if present
+	if r.mcuContexts != nil {
+		r.mcuContexts.Close()
+		r.mcuContexts = nil
+	}
 	if r.motion != nil {
 		r.motion.free()
 		r.motion = nil
@@ -4074,6 +4083,27 @@ func (r *runtime) sendLine(line string, cq *chelper.CommandQueue, minClock uint6
 func (r *runtime) sendConfigLine(line string) error {
 	// For config commands, we send them immediately on the main queue
 	return r.sendLine(line, r.cqMain, 0, 0)
+}
+
+// getMCUContext returns the MCU context for the given MCU name.
+// For single-MCU mode (mcuContexts is nil), returns nil.
+func (r *runtime) getMCUContext(mcuName string) *mcuContext {
+	if r.mcuContexts == nil {
+		return nil
+	}
+	return r.mcuContexts.Get(mcuName)
+}
+
+// sendLineToMCU sends a command to a specific MCU in multi-MCU mode.
+// Falls back to default sendLine for single-MCU mode.
+func (r *runtime) sendLineToMCU(mcuName string, line string, cq *chelper.CommandQueue, minClock, reqClock uint64) error {
+	ctx := r.getMCUContext(mcuName)
+	if ctx == nil {
+		// Single-MCU mode
+		return r.sendLine(line, cq, minClock, reqClock)
+	}
+	// Multi-MCU mode - use MCU-specific resources
+	return ctx.sendLine(line, cq, minClock, reqClock)
 }
 
 func (r *runtime) exec(cmd *gcodeCommand) error {
