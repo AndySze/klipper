@@ -1,0 +1,4 @@
+# Test same70q20b architecture with generic-duet3-6hc.cfg
+DICTIONARY same70q20b.dict
+CONFIG ../../config/generic-duet3-6hc.cfg
+GCODE move.gcode

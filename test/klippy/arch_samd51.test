@@ -1,0 +1,4 @@
+# Test samd51p20 architecture with generic-duet3-mini.cfg
+DICTIONARY samd51p20.dict
+CONFIG ../../config/generic-duet3-mini.cfg
+GCODE move.gcode

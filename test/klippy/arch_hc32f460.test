@@ -1,0 +1,4 @@
+# Test hc32f460 architecture with printer-anycubic-kobra-go-2022.cfg
+DICTIONARY hc32f460-serial-PA3PA2.dict
+CONFIG ../../config/printer-anycubic-kobra-go-2022.cfg
+GCODE move.gcode

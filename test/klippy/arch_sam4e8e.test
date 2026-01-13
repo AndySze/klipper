@@ -1,0 +1,4 @@
+# Test sam4e8e architecture with generic-duet2.cfg
+DICTIONARY sam4e8e.dict
+CONFIG ../../config/generic-duet2.cfg
+GCODE move.gcode

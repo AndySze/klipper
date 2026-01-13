@@ -60,6 +60,11 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"generic-bigtreetech-skr-pro.cfg":          true, // stm32f407
 		"generic-fysetc-spider.cfg":                true, // stm32f446
 		"generic-bigtreetech-skr-pico-v1.0.cfg":    true, // rp2040
+		"generic-archim2.cfg":                      true, // sam3x8e
+		"generic-duet2.cfg":                        true, // sam4e8e
+		"generic-duet3-mini.cfg":                   true, // samd51p20
+		"generic-duet3-6hc.cfg":                    true, // same70q20b
+		"printer-anycubic-kobra-go-2022.cfg":       true, // hc32f460
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)

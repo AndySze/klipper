@@ -1,0 +1,4 @@
+# Test sam3x8e architecture with generic-archim2.cfg
+DICTIONARY sam3x8e.dict
+CONFIG ../../config/generic-archim2.cfg
+GCODE move.gcode
