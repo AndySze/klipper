@@ -1,0 +1,4 @@
+# Test stm32f446 architecture with generic-fysetc-spider.cfg
+DICTIONARY stm32f446.dict
+CONFIG ../../config/generic-fysetc-spider.cfg
+GCODE move.gcode

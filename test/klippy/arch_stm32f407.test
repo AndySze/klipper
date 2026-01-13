@@ -1,0 +1,4 @@
+# Test stm32f407 architecture with generic-bigtreetech-skr-pro.cfg
+DICTIONARY stm32f407.dict
+CONFIG ../../config/generic-bigtreetech-skr-pro.cfg
+GCODE move.gcode

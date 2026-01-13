@@ -1,0 +1,4 @@
+# Test atmega1280 architecture with generic-mightyboard.cfg
+DICTIONARY atmega1280.dict
+CONFIG ../../config/generic-mightyboard.cfg
+GCODE move.gcode

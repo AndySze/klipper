@@ -1,0 +1,4 @@
+# Test lpc176x architecture with generic-smoothieboard.cfg
+DICTIONARY lpc176x.dict
+CONFIG ../../config/generic-smoothieboard.cfg
+GCODE move.gcode

@@ -52,6 +52,14 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"corexyuv.cfg":                     true,
 		"hybrid_corexy_dual_carriage.cfg":  true,
 		"rotary_delta_calibrate.cfg":       true,
+		// Generic board configs for MCU architecture tests
+		"generic-mightyboard.cfg":                  true, // atmega1280
+		"generic-melzi.cfg":                        true, // atmega1284p
+		"generic-smoothieboard.cfg":                true, // lpc176x
+		"generic-bigtreetech-skr-mini-e3-v2.0.cfg": true, // stm32f103
+		"generic-bigtreetech-skr-pro.cfg":          true, // stm32f407
+		"generic-fysetc-spider.cfg":                true, // stm32f446
+		"generic-bigtreetech-skr-pico-v1.0.cfg":    true, // rp2040
 	}
 	if !allowedConfigs[base] {
 		return nil, fmt.Errorf("host-h4: unsupported config %s (only supported configs allowed)", base)

@@ -1,0 +1,4 @@
+# Test stm32f103 architecture with generic-bigtreetech-skr-mini-e3-v2.0.cfg
+DICTIONARY stm32f103.dict
+CONFIG ../../config/generic-bigtreetech-skr-mini-e3-v2.0.cfg
+GCODE move.gcode

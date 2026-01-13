@@ -1,0 +1,4 @@
+# Test rp2040 architecture with generic-bigtreetech-skr-pico-v1.0.cfg
+DICTIONARY rp2040.dict
+CONFIG ../../config/generic-bigtreetech-skr-pico-v1.0.cfg
+GCODE move.gcode

@@ -4,8 +4,8 @@
 # hybrid_corexy, hybrid_corexz, winch kinematics and are verified to pass against
 # Python Klipper golden output.
 #
-# Test count: 41 tests
-# Pass rate: 95% (out_of_bounds, sdcard_loop known issues)
+# Test count: 48 tests
+# Pass rate: ~94% (out_of_bounds, sdcard_loop known issues)
 
 # === Basic commands and motion ===
 test/klippy/commands.test
@@ -86,3 +86,13 @@ test/klippy/example_corexy.test
 test/klippy/example_corexz.test
 test/klippy/example_hybrid_corexy.test
 test/klippy/example_rotary_delta.test
+
+# === MCU Architecture tests ===
+# Tests different MCU architectures with representative board configs
+test/klippy/arch_atmega1280.test
+test/klippy/arch_atmega1284p.test
+test/klippy/arch_lpc176x.test
+test/klippy/arch_stm32f103.test
+test/klippy/arch_stm32f407.test
+test/klippy/arch_stm32f446.test
+test/klippy/arch_rp2040.test

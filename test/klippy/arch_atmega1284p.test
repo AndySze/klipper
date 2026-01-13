@@ -1,0 +1,4 @@
+# Test atmega1284p architecture with generic-melzi.cfg
+DICTIONARY atmega1284p.dict
+CONFIG ../../config/generic-melzi.cfg
+GCODE move.gcode
