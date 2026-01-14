@@ -1463,6 +1463,61 @@ func (d *digitalOut) setOnTicks(printTime float64, onTicks uint32) error {
 	return nil
 }
 
+// servoController handles PWM servo control.
+// Python servo.py parameters:
+// - minimum_pulse_width: 0.001s (default)
+// - maximum_pulse_width: 0.002s (default)
+// - maximum_servo_angle: 180° (default)
+// - SERVO_SIGNAL_PERIOD: 0.020s (20ms)
+type servoController struct {
+	out        *digitalOut
+	minWidth   float64 // minimum pulse width in seconds
+	maxWidth   float64 // maximum pulse width in seconds
+	maxAngle   float64 // maximum angle in degrees
+	period     float64 // PWM signal period in seconds
+	cycleTicks uint32  // PWM cycle ticks (period * mcuFreq)
+	lastValue  float64 // last PWM value sent (0.0 to 1.0)
+}
+
+func newServoController(out *digitalOut, cycleTicks uint32) *servoController {
+	return &servoController{
+		out:        out,
+		minWidth:   0.001,   // Default 1ms
+		maxWidth:   0.002,   // Default 2ms
+		maxAngle:   180.0,   // Default 180 degrees
+		period:     0.020,   // 20ms period
+		cycleTicks: cycleTicks,
+		lastValue:  0.0,
+	}
+}
+
+// setAngle sets the servo position by angle (0 to maxAngle degrees).
+func (s *servoController) setAngle(printTime, angle float64) error {
+	// Clamp angle to valid range
+	if angle < 0 {
+		angle = 0
+	} else if angle > s.maxAngle {
+		angle = s.maxAngle
+	}
+
+	// Convert angle to pulse width
+	width := s.minWidth + angle*(s.maxWidth-s.minWidth)/s.maxAngle
+
+	// Convert pulse width to PWM value (0.0 to 1.0)
+	pwmValue := width / s.period
+
+	// Check if value changed
+	if pwmValue == s.lastValue {
+		return nil // Discard duplicate
+	}
+	s.lastValue = pwmValue
+
+	// Convert PWM value to on_ticks (round to nearest integer, matching Python)
+	onTicks := uint32(pwmValue*float64(s.cycleTicks) + 0.5)
+
+	return s.out.setOnTicks(printTime, onTicks)
+}
+
 type stepperEnablePin struct {
 	out          *digitalOut
 	enableCount  int
@@ -1848,6 +1903,9 @@ type runtime struct {
 
 	// Fan control
 	fanManager *fanManager
+
+	// Servo controllers (keyed by servo name, e.g., "my_servo")
+	servos map[string]*servoController
 }
 
 type pressureAdvanceState struct {
@@ -4186,6 +4244,21 @@ func newCartesianDualCarriageRuntime(cfg *configWrapper, dict *protocol.Dictiona
 		rt.extruder1 = ext1Axis
 	}
 
+	// Initialize servos
+	rt.servos = make(map[string]*servoController)
+	for secName := range cfg.sections {
+		if !strings.HasPrefix(secName, "servo ") {
+			continue
+		}
+		servoName := strings.TrimPrefix(secName, "servo ")
+		// Servo OID is 14 for dual_carriage config
+		// cycle_ticks = 320000 (20ms @ 16MHz)
+		const servoOID = 14
+		const servoCycleTicks = 320000
+		servoOut := newDigitalOut(servoOID, false, sq, cqMain, formats, mcuFreq, "mcu")
+		rt.servos[servoName] = newServoController(servoOut, servoCycleTicks)
+	}
+
 	// Initialize heater manager
 	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
 
@@ -5219,9 +5292,9 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 			return err
 		}
 	case "SET_SERVO":
-		// SET_SERVO - stub implementation for now
-		// TODO: implement proper PWM servo control
-		r.tracef("SET_SERVO: stub (servo=%s angle=%s)\n", cmd.Args["SERVO"], cmd.Args["ANGLE"])
+		if err := r.cmdSetServo(cmd.Args); err != nil {
+			return err
+		}
 	case "QUERY_ENDSTOPS":
 		// Query endstops - just a status report, no MCU output needed
 		return nil
@@ -5495,6 +5568,67 @@ func (r *runtime) manualStepperMove(stepper *stepper, trapq *chelper.TrapQ, sk *
 	r.motion.wipeTrapQ(trapq)
 
 	return nil
+}
+
+// cmdSetServo sets a servo's position by angle.
+// SET_SERVO SERVO=<name> ANGLE=<degrees>
+func (r *runtime) cmdSetServo(args map[string]string) error {
+	servoName := strings.TrimSpace(args["SERVO"])
+	if servoName == "" {
+		return fmt.Errorf("SET_SERVO requires SERVO parameter")
+	}
+
+	servo, ok := r.servos[servoName]
+	if !ok {
+		return fmt.Errorf("unknown servo %s", servoName)
+	}
+
+	// Parse angle (required if WIDTH not specified)
+	angleStr := strings.TrimSpace(args["ANGLE"])
+	widthStr := strings.TrimSpace(args["WIDTH"])
+
+	var angle float64
+	if widthStr != "" {
+		// WIDTH parameter takes precedence
+		width, err := strconv.ParseFloat(widthStr, 64)
+		if err != nil {
+			return fmt.Errorf("invalid WIDTH value: %v", err)
+		}
+		// Clamp width to valid range
+		if width > 0 {
+			if width < servo.minWidth {
+				width = servo.minWidth
+			} else if width > servo.maxWidth {
+				width = servo.maxWidth
+			}
+		}
+		// Convert width to angle for setAngle call
+		if width > 0 {
+			angle = (width - servo.minWidth) * servo.maxAngle / (servo.maxWidth - servo.minWidth)
+		} else {
+			// width=0 means off
+			angle = 0
+		}
+	} else if angleStr != "" {
+		var err error
+		angle, err = strconv.ParseFloat(angleStr, 64)
+		if err != nil {
+			return fmt.Errorf("invalid ANGLE value: %v", err)
+		}
+	} else {
+		return fmt.Errorf("SET_SERVO requires ANGLE or WIDTH parameter")
+	}
+
+	r.tracef("SET_SERVO: servo=%s angle=%.3f\n", servoName, angle)
+
+	// Queue the servo command using lookahead callback pattern
+	// This matches Python's servo.py behavior
+	pt, err := r.toolhead.getLastMoveTime()
+	if err != nil {
+		return err
+	}
+
+	return servo.setAngle(pt, angle)
 }
 
 func (r *runtime) cmdProbe(args map[string]string) error {
