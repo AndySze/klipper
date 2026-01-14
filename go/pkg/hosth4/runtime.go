@@ -3172,10 +3172,113 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 		return nil, fmt.Errorf("alloc trigger command queue failed")
 	}
 
-	// Create endstops for primary carriages
+	// Create trsync and endstops for primary carriages (X, Y, Z)
+	// Sort all carriages by name to determine OID assignment (matching h1.go)
+	type carriageInfo struct {
+		name       string
+		axis       int
+		endstopOID uint32
+		trsyncOID  uint32
+		stepperOID uint32 // OID of the first stepper with non-zero coefficient for this axis
+	}
+	var allCarriageInfos []carriageInfo
+
+	// Add primary carriages
+	for _, c := range gcKin.Carriages {
+		allCarriageInfos = append(allCarriageInfos, carriageInfo{name: c.Name, axis: c.Axis})
+	}
+	// Add dual carriages
+	for _, dc := range gcKin.DualCarriages {
+		axis := -1
+		if dc.Primary != nil {
+			axis = dc.Primary.Axis
+		}
+		allCarriageInfos = append(allCarriageInfos, carriageInfo{name: dc.Name, axis: axis})
+	}
+	// Add extra carriages
+	for _, ec := range gcKin.ExtraCarriages {
+		axis := -1
+		if ec.Primary != nil {
+			axis = ec.Primary.Axis
+		}
+		allCarriageInfos = append(allCarriageInfos, carriageInfo{name: ec.Name, axis: axis})
+	}
+
+	// Sort by name
+	for i := 0; i < len(allCarriageInfos)-1; i++ {
+		for j := i + 1; j < len(allCarriageInfos); j++ {
+			if allCarriageInfos[i].name > allCarriageInfos[j].name {
+				allCarriageInfos[i], allCarriageInfos[j] = allCarriageInfos[j], allCarriageInfos[i]
+			}
+		}
+	}
+
+	// Assign OIDs: endstop, then trsync for each carriage
+	for i := range allCarriageInfos {
+		allCarriageInfos[i].endstopOID = uint32(i * 2)
+		allCarriageInfos[i].trsyncOID = uint32(i*2 + 1)
+	}
+
+	// Create trsync objects for X, Y, Z axes
+	var trX, trY, trZ *trsync
+	for _, ci := range allCarriageInfos {
+		switch ci.axis {
+		case 0: // X axis
+			if trX == nil {
+				trX = &trsync{oid: ci.trsyncOID, rt: nil, mcuFreq: mcuFreq}
+			}
+		case 1: // Y axis
+			if trY == nil {
+				trY = &trsync{oid: ci.trsyncOID, rt: nil, mcuFreq: mcuFreq}
+			}
+		case 2: // Z axis
+			if trZ == nil {
+				trZ = &trsync{oid: ci.trsyncOID, rt: nil, mcuFreq: mcuFreq}
+			}
+		}
+	}
+
+	// Get endstop OIDs for X, Y, Z carriages
+	var endstopOIDX, endstopOIDY, endstopOIDZ uint32
+	for _, ci := range allCarriageInfos {
+		switch ci.axis {
+		case 0:
+			endstopOIDX = ci.endstopOID
+		case 1:
+			endstopOIDY = ci.endstopOID
+		case 2:
+			endstopOIDZ = ci.endstopOID
+		}
+	}
+
+	// Find stepper OIDs for each axis (first stepper with non-zero coefficient)
+	stepperOIDX := uint32(stepperOIDBase)
+	stepperOIDY := uint32(stepperOIDBase + 1)
+	stepperOIDZ := uint32(stepperOIDBase + 2)
+	for i, name := range stepperOrder {
+		s := stepperMap[name]
+		if s.Coeffs[0] != 0 {
+			stepperOIDX = uint32(stepperOIDBase + i)
+			break
+		}
+	}
+	for i, name := range stepperOrder {
+		s := stepperMap[name]
+		if s.Coeffs[1] != 0 {
+			stepperOIDY = uint32(stepperOIDBase + i)
+			break
+		}
+	}
+	for i, name := range stepperOrder {
+		s := stepperMap[name]
+		if s.Coeffs[2] != 0 {
+			stepperOIDZ = uint32(stepperOIDBase + i)
+			break
+		}
+	}
+
 	endstops := [3]*endstop{}
-	// Note: Endstop OIDs are 0, 2, 4 for carriages in sorted order
-	// We need to match the connect-phase compiler's carriage ordering
+	// Note: Endstop OIDs are assigned based on carriage sort order
 
 	// Initialize MCU for temperature control
 	mcu := &mcu{
@@ -3278,6 +3381,20 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 
 	// Store generic cartesian kinematics state in runtime (for SET_DUAL_CARRIAGE etc.)
 	rt.genericCartesianKin = gcKin
+
+	// Set trsync runtime references and create endstops
+	if trX != nil {
+		trX.rt = rt
+		rt.endstops[0] = &endstop{oid: endstopOIDX, stepperOID: stepperOIDX, tr: trX, rt: rt, mcuFreq: mcuFreq}
+	}
+	if trY != nil {
+		trY.rt = rt
+		rt.endstops[1] = &endstop{oid: endstopOIDY, stepperOID: stepperOIDY, tr: trY, rt: rt, mcuFreq: mcuFreq}
+	}
+	if trZ != nil {
+		trZ.rt = rt
+		rt.endstops[2] = &endstop{oid: endstopOIDZ, stepperOID: stepperOIDZ, tr: trZ, rt: rt, mcuFreq: mcuFreq}
+	}
 
 	// Initialize heater manager after runtime is created
 	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
@@ -3829,6 +3946,17 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 		rt.stepperE1 = stE1
 		rt.extruder1 = extAxis1
 	}
+
+	// Create trsync objects for homing
+	// OID layout: X (0,1,2), Y (3,4,5), Z (6,7,8), DC (9,10,11)
+	trX := &trsync{oid: 1, rt: rt, mcuFreq: mcuFreq}
+	trY := &trsync{oid: 4, rt: rt, mcuFreq: mcuFreq}
+	trZ := &trsync{oid: 7, rt: rt, mcuFreq: mcuFreq}
+
+	// Initialize endstops array
+	rt.endstops[0] = &endstop{oid: 0, stepperOID: 2, tr: trX, rt: rt, mcuFreq: mcuFreq}
+	rt.endstops[1] = &endstop{oid: 3, stepperOID: 5, tr: trY, rt: rt, mcuFreq: mcuFreq}
+	rt.endstops[2] = &endstop{oid: 6, stepperOID: 8, tr: trZ, rt: rt, mcuFreq: mcuFreq}
 
 	// Initialize heater manager
 	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
@@ -4795,6 +4923,170 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
 	return nil
 }
 
+// homePolarArm homes the arm stepper for polar kinematics.
+// In polar kinematics, X and Y are both controlled by the arm (radius),
+// so homing X or Y means homing the arm stepper.
+func (r *runtime) homePolarArm() error {
+	// For polar, the arm stepper is steppers[1] and uses endstops[0] (arm endstop)
+	// We need to use the arm rail configuration which is stored in rails with arm parameters
+	armRail := r.rails[0] // Rails[0] has the arm parameters (position_max from arm config)
+
+	// Get arm stepper configuration
+	armStepper := r.steppers[1] // stepper_arm
+	if armStepper == nil {
+		return fmt.Errorf("polar arm stepper not initialized")
+	}
+
+	// Calculate homing parameters using arm rail config
+	cur := append([]float64{}, r.toolhead.commandedPos...)
+	homepos := append([]float64{}, cur...)
+	// For polar, we home along X axis (radius direction) to position_endstop
+	homepos[0] = armRail.positionEndstop // X position at arm endstop
+	homepos[1] = 0                        // Y = 0 when arm is homed
+
+	forcepos := append([]float64{}, homepos...)
+	if armRail.homingPositiveDir {
+		forcepos[0] -= 1.5 * (armRail.positionEndstop - armRail.positionMin)
+	} else {
+		forcepos[0] += 1.5 * (armRail.positionMax - armRail.positionEndstop)
+	}
+
+	// Set homing axes to "xy" since we're homing both X and Y together
+	if err := r.toolhead.setPosition(forcepos, "xy"); err != nil {
+		return err
+	}
+
+	// Update stepper positions
+	for i := 0; i < 3 && i < len(r.steppers); i++ {
+		if r.steppers[i] != nil {
+			r.steppers[i].setPosition(forcepos[i])
+		}
+	}
+
+	// Perform homing move using arm stepper (axis 0 for endstops mapping)
+	if err := r.homingMovePolar(homepos, armRail.homingSpeed); err != nil {
+		return err
+	}
+
+	// Handle retract if needed
+	if armRail.homingRetractDist == 0.0 {
+		if err := r.toolhead.flushStepGeneration(); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Retract move
+	axesD := []float64{homepos[0] - forcepos[0], homepos[1] - forcepos[1], 0}
+	moveD := math.Sqrt(axesD[0]*axesD[0] + axesD[1]*axesD[1])
+	retractR := 1.0
+	if moveD != 0.0 {
+		retractR = math.Min(1.0, armRail.homingRetractDist/moveD)
+	}
+	retractpos := append([]float64{}, homepos...)
+	for i := 0; i < 2; i++ {
+		retractpos[i] -= retractR * axesD[i]
+	}
+
+	retractSpeed := armRail.homingRetractSpeed
+	if retractSpeed == 0.0 {
+		retractSpeed = armRail.homingSpeed
+	}
+	if err := r.toolhead.move(retractpos, retractSpeed); err != nil {
+		return err
+	}
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+
+	// Second homing move at slower speed
+	secondSpeed := armRail.secondHomingSpeed
+	if secondSpeed == 0.0 {
+		secondSpeed = armRail.homingSpeed / 2.0
+	}
+	if err := r.homingMovePolar(homepos, secondSpeed); err != nil {
+		return err
+	}
+
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// homingMovePolar performs the homing move for polar arm.
+// It uses endstops[0] which is the arm endstop.
+func (r *runtime) homingMovePolar(movepos []float64, speed float64) error {
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+	pt, err := r.toolhead.getLastMoveTime()
+	if err != nil {
+		return err
+	}
+	r.tracef("HOMING polar arm: pt=%.9f movepos=%v speed=%.3f\n", pt, movepos, speed)
+
+	curPos := r.toolhead.commandedPos
+	moveD := 0.0
+	for i := 0; i < 2; i++ {
+		d := movepos[i] - curPos[i]
+		moveD += d * d
+	}
+	moveD = math.Sqrt(moveD)
+	if moveD == 0.0 {
+		return nil
+	}
+
+	// Use arm stepper's step distance
+	stepDist := r.steppers[1].stepDist
+	r.tracef("HOMING polar arm: stepDist=%f moveD=%f\n", stepDist, moveD)
+	maxSteps := moveD / stepDist
+	if maxSteps <= 0.0 {
+		maxSteps = 1.0
+	}
+	moveT := moveD / speed
+	restTime := moveT / maxSteps
+	r.tracef("HOMING polar arm: restTime=%.9f moveT=%.9f maxSteps=%.3f\n", restTime, moveT, maxSteps)
+
+	// Use endstops[0] for arm homing
+	if err := r.endstops[0].homeStart(pt, restTime, true); err != nil {
+		return err
+	}
+	r.traceMotion("HOMING polar arm: after homeStart")
+	if err := r.toolhead.dwell(homingStartDelaySec); err != nil {
+		return err
+	}
+
+	// Generate move to trapq and flush
+	preDecelTime, endTime, err := r.toolhead.dripMove(movepos, speed)
+	if err != nil {
+		return err
+	}
+	r.tracef("HOMING polar arm: after dripMove preDecelTime=%.9f endTime=%.9f\n", preDecelTime, endTime)
+	r.traceMotion("HOMING polar arm: before homeStop")
+	if err := r.endstops[0].homeStop(); err != nil {
+		return err
+	}
+	r.tracef("HOMING polar arm: after homeStop\n")
+
+	// Flush remaining decel steps
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+
+	// Set final position
+	if err := r.toolhead.setPosition(movepos, "xy"); err != nil {
+		return err
+	}
+	for i := 0; i < 3 && i < len(r.steppers); i++ {
+		if r.steppers[i] != nil {
+			r.steppers[i].setPosition(movepos[i])
+		}
+	}
+
+	return nil
+}
+
 func (r *runtime) homeAxis(axis int) error {
 	rail := r.rails[axis]
 	cur := append([]float64{}, r.toolhead.commandedPos...)
@@ -5433,6 +5725,20 @@ func (r *runtime) cmdSyncExtruderMotion(args map[string]string) error {
 }
 
 func (r *runtime) homeAll() error {
+	// For polar kinematics, X and Y are both controlled by the arm (radius),
+	// so we only home the arm once (for X/Y) and then home Z.
+	// Polar homing order: arm (XY together), then Z.
+	if r.isPolar {
+		// Home arm first (this homes both X and Y in polar coordinates)
+		if err := r.homePolarArm(); err != nil {
+			return err
+		}
+		// Then home Z
+		if err := r.homeAxis(2); err != nil {
+			return err
+		}
+		return nil
+	}
 	// Match Klippy cartesian homing order: X, then Y, then Z.
 	for _, axis := range []int{0, 1, 2} {
 		if err := r.homeAxis(axis); err != nil {
@@ -5605,11 +5911,19 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 		f.Close()
 		return nil, fmt.Errorf("alloc main command queue failed")
 	}
+	cqTrigger := chelper.NewCommandQueue()
+	if cqTrigger == nil {
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc trigger command queue failed")
+	}
 	cqEnablePins := []*chelper.CommandQueue{}
 
 	reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
 	motion, err := newMotionQueuing(sq, mcuFreq, reservedMoveSlots)
 	if err != nil {
+		cqTrigger.Free()
 		cqMain.Free()
 		sq.Free()
 		f.Close()
@@ -5857,6 +6171,12 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 		zCfg,
 	}
 
+	// Create trsync objects for arm and z (polar bed has no endstop)
+	// OID layout: arm endstop=1, arm trsync=2, arm stepper=3
+	//             z endstop=4, z trsync=5, z stepper=6
+	trArm := &trsync{oid: 2, rt: nil, mcuFreq: mcuFreq}
+	trZ := &trsync{oid: 5, rt: nil, mcuFreq: mcuFreq}
+
 	rt := &runtime{
 		cfg:           cfg,
 		dict:          dict,
@@ -5866,6 +6186,7 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 		setDirID:      setDirID,
 		sq:            sq,
 		cqMain:        cqMain,
+		cqTrigger:     cqTrigger,
 		cqEnablePins:  cqEnablePins,
 		motion:        motion,
 		toolhead:      th,
@@ -5883,6 +6204,22 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 		rawFile:       f,
 		isPolar:       true, // Flag for polar-specific behavior
 	}
+
+	// Set trsync runtime references
+	trArm.rt = rt
+	trZ.rt = rt
+
+	// Initialize endstops for polar:
+	// - endstops[0] = arm endstop (for X homing, which homes the arm)
+	// - endstops[1] = arm endstop (for Y homing, which also homes the arm)
+	// - endstops[2] = z endstop
+	// In polar kinematics, X and Y are both controlled by the arm (radius),
+	// so homing X or Y means homing the arm.
+	armEndstop := &endstop{oid: 1, stepperOID: 3, tr: trArm, rt: rt, mcuFreq: mcuFreq}
+	zEndstop := &endstop{oid: 4, stepperOID: 6, tr: trZ, rt: rt, mcuFreq: mcuFreq}
+	rt.endstops[0] = armEndstop // X homing -> arm
+	rt.endstops[1] = armEndstop // Y homing -> arm
+	rt.endstops[2] = zEndstop   // Z homing -> z
 
 	// Initialize heater manager
 	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
