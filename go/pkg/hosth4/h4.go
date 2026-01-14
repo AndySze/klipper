@@ -51,6 +51,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"generic_cartesian.cfg":            true,
 		"corexyuv.cfg":                     true,
 		"hybrid_corexy_dual_carriage.cfg":  true,
+		"dual_carriage.cfg":                true,
 		"rotary_delta_calibrate.cfg":       true,
 		// Generic board configs for MCU architecture tests
 		"generic-mightyboard.cfg":                  true, // atmega1280
@@ -209,8 +210,42 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		if err != nil {
 			return nil, err
 		}
+	} else if kin == "cartesian" {
+		// Check for dual_carriage section
+		_, hasDualCarriage := cfg.section("dual_carriage")
+		if hasDualCarriage {
+			// Use cartesian dual_carriage connect-phase compiler
+			initLines, err = hosth1.CompileCartesianDualCarriageConnectPhase(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		} else if hasBedHeater {
+			// Use the full connect-phase compiler for configs with heater_bed
+			initLines, err = hosth1.CompileExampleCartesianConnectPhase(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		} else if hasExtraStepper {
+			// Use the compiler for configs with extruder_stepper (pressure_advance, extruders)
+			initLines, err = hosth1.CompileCartesianWithExtruderStepper(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		} else if hasExtruder {
+			// For configs with extruder but no heater_bed, use minimal connect-phase
+			initLines, err = hosth1.CompileMinimalCartesianConnectPhase(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// For configs without heater_bed and without extruder (e.g., bed_screws)
+			initLines, err = hosth1.CompileCartesianNoExtruder(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		}
 	} else if hasBedHeater {
-		// Use the full connect-phase compiler for configs with heater_bed
+		// Use the full connect-phase compiler for configs with heater_bed (non-cartesian)
 		initLines, err = hosth1.CompileExampleCartesianConnectPhase(cfgPath, dict)
 		if err != nil {
 			return nil, err

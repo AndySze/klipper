@@ -12,6 +12,11 @@ type Config struct {
 	Rails        []Rail  // Rail configurations
 	MaxZVelocity float64 // Maximum Z velocity
 	MaxZAccel    float64 // Maximum Z acceleration
+
+	// Delta-specific configuration (only used when Type == "delta")
+	DeltaRadius    float64   // Delta radius
+	DeltaArmLength []float64 // Arm lengths [A, B, C]
+	DeltaAngles    []float64 // Tower angles in degrees [A, B, C]
 }
 
 // NewFromConfig creates a new kinematics instance based on the configuration.
@@ -41,6 +46,43 @@ func NewFromConfig(cfg Config) (Kinematics, error) {
 
 	case "polar":
 		return NewPolarKinematics(cfg.Rails, cfg.MaxZVelocity, cfg.MaxZAccel), nil
+
+	case "deltesian":
+		// Deltesian uses similar bounds checking to cartesian
+		// The actual stepper kinematics are handled separately via chelper
+		return NewCartesianKinematics(cfg.Rails, cfg.MaxZVelocity, cfg.MaxZAccel), nil
+
+	case "delta":
+		// Delta uses a different configuration structure.
+		// Create a DeltaConfig from the Rails.
+		if len(cfg.Rails) < 3 {
+			return nil, fmt.Errorf("delta kinematics requires 3 rails")
+		}
+		// Use provided delta configuration or defaults
+		radius := cfg.DeltaRadius
+		if radius <= 0 {
+			radius = 140.0 // Default radius
+		}
+		armLengths := cfg.DeltaArmLength
+		if len(armLengths) != 3 {
+			armLengths = []float64{250.0, 250.0, 250.0} // Default arm lengths
+		}
+		angles := cfg.DeltaAngles
+		if len(angles) != 3 {
+			angles = []float64{210.0, 330.0, 90.0} // Default angles
+		}
+		deltaCfg := DeltaConfig{
+			Radius:       radius,
+			ArmLengths:   armLengths,
+			Angles:       angles,
+			Endstops:     []float64{cfg.Rails[0].PositionEndstop, cfg.Rails[1].PositionEndstop, cfg.Rails[2].PositionEndstop},
+			MinZ:         cfg.Rails[0].PositionMin,
+			MaxVelocity:  500.0,
+			MaxAccel:     3000.0,
+			MaxZVelocity: cfg.MaxZVelocity,
+			MaxZAccel:    cfg.MaxZAccel,
+		}
+		return NewDeltaKinematics(deltaCfg)
 
 	default:
 		return nil, fmt.Errorf("unsupported kinematics type: %s", cfg.Type)
@@ -194,7 +236,7 @@ func LoadFromPrinterConfig(printerCfg map[string]map[string]string) (Kinematics,
 func IsSupported(kinType string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(kinType))
 	switch normalized {
-	case "cartesian", "corexy", "corexz", "delta", "polar":
+	case "cartesian", "corexy", "corexz", "delta", "deltesian", "polar":
 		return true
 	default:
 		return false
@@ -203,5 +245,5 @@ func IsSupported(kinType string) bool {
 
 // SupportedTypes returns a list of supported kinematic types.
 func SupportedTypes() []string {
-	return []string{"cartesian", "corexy", "corexz", "delta", "polar"}
+	return []string{"cartesian", "corexy", "corexz", "delta", "deltesian", "polar"}
 }

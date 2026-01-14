@@ -402,6 +402,14 @@ func evalInlineExpr(expr string, ctx *macroEvalContext) (string, error) {
 		return value, nil
 	}
 
+	// Handle printer.toolhead.extruder - returns the name of the currently active extruder
+	if expr == "printer.toolhead.extruder" {
+		if ctx.rt != nil && ctx.rt.activeExtruder != "" {
+			return ctx.rt.activeExtruder, nil
+		}
+		return "extruder", nil
+	}
+
 	// Return as-is for now
 	return expr, nil
 }

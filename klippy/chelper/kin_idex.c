@@ -10,6 +10,7 @@
 #include "compiler.h" // __visible
 #include "itersolve.h" // struct stepper_kinematics
 #include "trapq.h" // struct move
+#include "pyhelper.h" // errorf
 
 #define DUMMY_T 500.0
 
@@ -50,6 +51,8 @@ dual_carriage_set_transform(struct stepper_kinematics *sk, char axis
 {
     struct dual_carriage_stepper *dc = container_of(
             sk, struct dual_carriage_stepper, sk);
+    errorf("dual_carriage_set_transform: axis=%c scale=%f offs=%f active_flags_before=%d",
+           axis, scale, offs, dc->sk.active_flags);
     if (axis == 'x') {
         dc->x_scale = scale;
         dc->x_offs = offs;
@@ -57,6 +60,7 @@ dual_carriage_set_transform(struct stepper_kinematics *sk, char axis
             dc->sk.active_flags &= ~AF_X;
         else if (scale && dc->orig_sk->active_flags & AF_X)
             dc->sk.active_flags |= AF_X;
+        errorf("dual_carriage_set_transform: active_flags_after=%d", dc->sk.active_flags);
         return 0;
     }
     if (axis == 'y') {

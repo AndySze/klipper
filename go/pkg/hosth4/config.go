@@ -267,7 +267,8 @@ func readStepper(cfg *configWrapper, axis byte) (stepperCfg, error) {
 	} else {
 		// Some configs (e.g., probe-based Z endstop) do not specify position_endstop
 		// on the stepper. Klippy derives it from the probe object (z_offset).
-		if strings.HasPrefix(strings.ToLower(endstopPin.pin), "probe:") {
+		// Check if endstop is from probe chip (e.g., "probe:z_virtual_endstop")
+		if strings.ToLower(endstopPin.chip) == "probe" {
 			positionEndstop = positionMin
 		} else {
 			return stepperCfg{}, config.ErrMissingOption(secName, "position_endstop")
@@ -391,14 +392,20 @@ func readStepperByName(cfg *configWrapper, secName string, axis byte) (stepperCf
 		}
 	}
 
-	// position_endstop: required for delta towers
-	positionEndstop, err := sec.GetFloat("position_endstop")
-	if err != nil {
-		return stepperCfg{}, err
+	// position_endstop: optional for delta secondary towers (stepper_b, stepper_c)
+	// They can inherit from the primary tower (stepper_a)
+	var positionEndstop float64
+	hasPositionEndstop := false
+	if sec.HasOption("position_endstop") {
+		positionEndstop, err = sec.GetFloat("position_endstop")
+		if err != nil {
+			return stepperCfg{}, err
+		}
+		hasPositionEndstop = true
 	}
 
-	// If position_max not set, use position_endstop as default
-	if !sec.HasOption("position_max") {
+	// If position_max not set, use position_endstop as default (if available)
+	if !sec.HasOption("position_max") && hasPositionEndstop {
 		positionMax = positionEndstop
 	}
 

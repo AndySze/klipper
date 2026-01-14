@@ -35,6 +35,9 @@ struct stepper_kinematics *corexz_stepper_alloc(char type);
 // kin_polar.c - polar kinematics
 struct stepper_kinematics *polar_stepper_alloc(char type);
 
+// kin_delta.c - linear delta kinematics
+struct stepper_kinematics *delta_stepper_alloc(double arm2, double tower_x, double tower_y);
+
 // kin_rotary_delta.c - rotary delta kinematics
 struct stepper_kinematics *rotary_delta_stepper_alloc(double shoulder_radius
     , double shoulder_height, double angle, double upper_arm, double lower_arm);
@@ -44,6 +47,11 @@ struct stepper_kinematics *deltesian_stepper_alloc(double arm2, double arm_x);
 
 // kin_winch.c - winch (cable robot) kinematics
 struct stepper_kinematics *winch_stepper_alloc(double anchor_x, double anchor_y, double anchor_z);
+
+// kin_idex.c - dual carriage (IDEX) kinematics wrapper
+struct stepper_kinematics *dual_carriage_alloc(void);
+void dual_carriage_set_sk(struct stepper_kinematics *sk, struct stepper_kinematics *orig_sk);
+int dual_carriage_set_transform(struct stepper_kinematics *sk, char axis, double scale, double offs);
 */
 import "C"
 
@@ -597,6 +605,19 @@ func NewPolarStepperKinematics(stepperType byte) (*StepperKinematics, error) {
 	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
 }
 
+// NewDeltaStepperKinematics creates a linear delta stepper kinematics.
+// Parameters:
+//   - arm2: arm length squared
+//   - towerX: X coordinate of the tower
+//   - towerY: Y coordinate of the tower
+func NewDeltaStepperKinematics(arm2, towerX, towerY float64) (*StepperKinematics, error) {
+	sk := C.delta_stepper_alloc(C.double(arm2), C.double(towerX), C.double(towerY))
+	if sk == nil {
+		return nil, fmt.Errorf("delta_stepper_alloc failed")
+	}
+	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
 // NewRotaryDeltaStepperKinematics creates a rotary delta stepper kinematics.
 // Parameters:
 //   - shoulderRadius: radius from center to shoulder joint
@@ -632,4 +653,31 @@ func NewWinchStepperKinematics(anchorX, anchorY, anchorZ float64) (*StepperKinem
 		return nil, fmt.Errorf("winch_stepper_alloc failed")
 	}
 	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
+// NewDualCarriageStepperKinematics creates a dual carriage wrapper for IDEX printers.
+// The wrapper allows transforming X/Y axes with scale and offset.
+func NewDualCarriageStepperKinematics() (*StepperKinematics, error) {
+	sk := C.dual_carriage_alloc()
+	if sk == nil {
+		return nil, fmt.Errorf("dual_carriage_alloc failed")
+	}
+	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
+// DualCarriageSetSK sets the original stepper kinematics that the dual carriage
+// wrapper will delegate to.
+func (sk *StepperKinematics) DualCarriageSetSK(origSK *StepperKinematics) {
+	C.dual_carriage_set_sk(sk.ptr, origSK.ptr)
+}
+
+// DualCarriageSetTransform sets the scale and offset transform for a given axis.
+// When scale is 0, the axis is disabled (no steps generated for that axis).
+// axis should be 'x' or 'y'.
+func (sk *StepperKinematics) DualCarriageSetTransform(axis byte, scale, offset float64) error {
+	ret := C.dual_carriage_set_transform(sk.ptr, C.char(axis), C.double(scale), C.double(offset))
+	if ret != 0 {
+		return fmt.Errorf("dual_carriage_set_transform failed for axis %c", axis)
+	}
+	return nil
 }

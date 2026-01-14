@@ -4,6 +4,7 @@ package kinematics
 import (
 	"fmt"
 	"math"
+	"os"
 )
 
 // Move represents a movement command with position and velocity information.
@@ -29,8 +30,18 @@ type Move struct {
 func (m *Move) LimitSpeed(maxV, maxA float64) {
 	if m.MaxCruiseV > maxV {
 		m.MaxCruiseV = maxV
+		if maxV > 0 {
+			m.MinMoveTime = m.MoveD / maxV
+		}
 	}
-	// Additional speed limiting logic would go here
+	if maxA < m.AccelR {
+		m.AccelR = maxA
+		m.DecelR = maxA
+		m.DeltaV2 = 2.0 * m.MoveD * maxA
+		if m.SmoothDeltaV2 > m.DeltaV2 {
+			m.SmoothDeltaV2 = m.DeltaV2
+		}
+	}
 }
 
 // Rail represents a stepper motor rail configuration.
@@ -71,6 +82,9 @@ type Kinematics interface {
 
 	// GetLimits returns the current axis limits.
 	GetLimits() [][2]float64
+
+	// UpdateLimits updates the limits for a specific axis.
+	UpdateLimits(axis int, newLimits [2]float64)
 
 	// GetMaxZVelocity returns the maximum Z axis velocity.
 	GetMaxZVelocity() float64
@@ -142,6 +156,7 @@ func (bk *BaseKinematics) CheckEndstops(move *Move) error {
 		if bk.Limits[i][0] > bk.Limits[i][1] {
 			return fmt.Errorf("must home axis first")
 		}
+		fmt.Fprintf(os.Stderr, "DEBUG BaseKinematics.CheckEndstops: axis=%d endPos=%f limits=[%f,%f]\n", i, move.EndPos[i], bk.Limits[i][0], bk.Limits[i][1])
 		return fmt.Errorf("move out of range")
 	}
 	return nil
@@ -163,6 +178,13 @@ func (bk *BaseKinematics) GetRails() []Rail {
 // GetLimits returns the current axis limits.
 func (bk *BaseKinematics) GetLimits() [][2]float64 {
 	return bk.Limits
+}
+
+// UpdateLimits updates the limits for a specific axis.
+func (bk *BaseKinematics) UpdateLimits(axis int, newLimits [2]float64) {
+	if axis >= 0 && axis < len(bk.Limits) {
+		bk.Limits[axis] = newLimits
+	}
 }
 
 // GetMaxZVelocity returns the maximum Z axis velocity.

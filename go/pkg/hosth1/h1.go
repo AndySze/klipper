@@ -2605,6 +2605,271 @@ func CompileHybridCoreXYConnectPhase(cfgPath string, dict *protocol.Dictionary) 
 	return out, nil
 }
 
+// CompileCartesianDualCarriageConnectPhase generates connect-phase commands for
+// cartesian kinematics with dual_carriage (IDEX).
+// This matches Python Klippy's output for dual_carriage.cfg test.
+func CompileCartesianDualCarriageConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+	if err != nil {
+		return nil, err
+	}
+	adcMax, err := dictConfigFloat(dict, "ADC_MAX")
+	if err != nil {
+		return nil, err
+	}
+	mcuFreq := clockFreq
+
+	// Extract required steppers
+	stepperX, err := readStepper(cfg, "stepper_x")
+	if err != nil {
+		return nil, err
+	}
+	stepperY, err := readStepper(cfg, "stepper_y")
+	if err != nil {
+		return nil, err
+	}
+	stepperZ, err := readStepper(cfg, "stepper_z")
+	if err != nil {
+		return nil, err
+	}
+
+	// Read dual_carriage section (similar to stepper)
+	dcSec, ok := cfg.sections["dual_carriage"]
+	if !ok {
+		return nil, fmt.Errorf("missing [dual_carriage] section")
+	}
+	dcStep, err := parsePin(dcSec, "step_pin", true, false)
+	if err != nil {
+		return nil, err
+	}
+	dcDir, err := parsePin(dcSec, "dir_pin", true, false)
+	if err != nil {
+		return nil, err
+	}
+	dcEnable, err := parsePin(dcSec, "enable_pin", true, false)
+	if err != nil {
+		return nil, err
+	}
+	dcEndstop, err := parsePin(dcSec, "endstop_pin", true, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract heaters and extruders
+	bed, err := readHeater(cfg, "heater_bed")
+	if err != nil {
+		return nil, err
+	}
+	extruder, err := readExtruder(cfg, "extruder")
+	if err != nil {
+		return nil, err
+	}
+	extruder1, err := readExtruder(cfg, "extruder1")
+	if err != nil {
+		return nil, err
+	}
+
+	// Read servo if present (optional)
+	var servoPin *pin
+	if servoSec, ok := cfg.sections["servo my_servo"]; ok {
+		p, err := parsePin(servoSec, "pin", true, false)
+		if err == nil {
+			servoPin = &p
+		}
+	}
+
+	// OID layout matching Python output for dual_carriage.cfg:
+	// 0-2: X (endstop, trsync, stepper)
+	// 3-5: Y (endstop, trsync, stepper)
+	// 6-8: Z (endstop, trsync, stepper)
+	// 9-11: dual_carriage (endstop, trsync, stepper)
+	// 12: stepper extruder
+	// 13: stepper extruder1
+	// 14: servo
+	// 15-16: heater_bed (adc, pwm)
+	// 17-20: enable pins (X, Y, Z, dual_carriage)
+	// 21-23: extruder (adc, pwm, enable)
+	// 24-26: extruder1 (adc, pwm, enable)
+	type cartesianDCOIDs struct {
+		endstopX, trsyncX, stepperX    int
+		endstopY, trsyncY, stepperY    int
+		endstopZ, trsyncZ, stepperZ    int
+		endstopDC, trsyncDC, stepperDC int
+		stepperE, stepperE1            int
+		servo                          int
+		adcBed, pwmBed                 int
+		enableX, enableY, enableZ      int
+		enableDC                       int
+		adcE, pwmE, enableE            int
+		adcE1, pwmE1, enableE1         int
+		count                          int
+	}
+	o := cartesianDCOIDs{
+		endstopX: 0, trsyncX: 1, stepperX: 2,
+		endstopY: 3, trsyncY: 4, stepperY: 5,
+		endstopZ: 6, trsyncZ: 7, stepperZ: 8,
+		endstopDC: 9, trsyncDC: 10, stepperDC: 11,
+		stepperE: 12, stepperE1: 13,
+		servo:   14,
+		adcBed:  15, pwmBed: 16,
+		enableX: 17, enableY: 18, enableZ: 19,
+		enableDC: 20,
+		adcE: 21, pwmE: 22, enableE: 23,
+		adcE1: 24, pwmE1: 25, enableE1: 26,
+		count: 27,
+	}
+
+	// Derived constants
+	const (
+		pwmCycleTime     = 0.100
+		heaterMaxHeatSec = 3.0
+		stepPulseSec     = 0.000002
+		adcSampleTime    = 0.001
+		adcSampleCount   = 8
+		adcReportTime    = 0.300
+		adcRangeChecks   = 4
+		pwmInitDelaySec  = 0.200
+	)
+	cycleTicks := secondsToClock(mcuFreq, pwmCycleTime)
+	mdurTicks := secondsToClock(mcuFreq, heaterMaxHeatSec)
+	stepPulseTicks := secondsToClock(mcuFreq, stepPulseSec)
+	sampleTicks := secondsToClock(mcuFreq, adcSampleTime)
+	reportTicks := secondsToClock(mcuFreq, adcReportTime)
+	pwmInitClock := secondsToClock(mcuFreq, pwmInitDelaySec)
+
+	// ADC min/max for thermistors
+	bedMin, bedMax, err := thermistorMinMaxTicks(bed, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+	extMin, extMax, err := thermistorMinMaxTicks(extruder.Heater, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+	ext1Min, ext1Max, err := thermistorMinMaxTicks(extruder1.Heater, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build config commands in the order matching Python output
+	var configCmds []string
+
+	// servo (first in Python output)
+	if servoPin != nil {
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+				o.servo, servoPin.pin, 0, 0, 0),
+			fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.servo, cycleTicks/5), // servo uses 20ms cycle
+		)
+	}
+
+	// heater_bed
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", o.adcBed, bed.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.pwmBed, bed.HeaterPin.pin, 0, 0, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmBed, cycleTicks),
+	)
+
+	// stepper_x
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopX, stepperX.Endstop.pin, stepperX.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", o.trsyncX),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperX, stepperX.Step.pin, stepperX.Dir.pin, boolToInt(stepperX.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableX, stepperX.Enable.pin, boolToInt(stepperX.Enable.invert), boolToInt(stepperX.Enable.invert), 0),
+	)
+
+	// stepper_y
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopY, stepperY.Endstop.pin, stepperY.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", o.trsyncY),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperY, stepperY.Step.pin, stepperY.Dir.pin, boolToInt(stepperY.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableY, stepperY.Enable.pin, boolToInt(stepperY.Enable.invert), boolToInt(stepperY.Enable.invert), 0),
+	)
+
+	// stepper_z
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopZ, stepperZ.Endstop.pin, stepperZ.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", o.trsyncZ),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperZ, stepperZ.Step.pin, stepperZ.Dir.pin, boolToInt(stepperZ.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableZ, stepperZ.Enable.pin, boolToInt(stepperZ.Enable.invert), boolToInt(stepperZ.Enable.invert), 0),
+	)
+
+	// dual_carriage
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", o.endstopDC, dcEndstop.pin, dcEndstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", o.trsyncDC),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperDC, dcStep.pin, dcDir.pin, boolToInt(dcStep.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableDC, dcEnable.pin, boolToInt(dcEnable.invert), boolToInt(dcEnable.invert), 0),
+	)
+
+	// extruder
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", o.adcE, extruder.Heater.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.pwmE, extruder.Heater.HeaterPin.pin, 0, 0, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmE, cycleTicks),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperE, extruder.Step.pin, extruder.Dir.pin, boolToInt(extruder.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableE, extruder.Enable.pin, boolToInt(extruder.Enable.invert), boolToInt(extruder.Enable.invert), 0),
+	)
+
+	// extruder1
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", o.adcE1, extruder1.Heater.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.pwmE1, extruder1.Heater.HeaterPin.pin, 0, 0, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", o.pwmE1, cycleTicks),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			o.stepperE1, extruder1.Step.pin, extruder1.Dir.pin, boolToInt(extruder1.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=%d",
+			o.enableE1, extruder1.Enable.pin, boolToInt(extruder1.Enable.invert), boolToInt(extruder1.Enable.invert), 0),
+	)
+
+	// Prepend allocate_oids and compute CRC
+	withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", o.count)}, configCmds...)
+	crcText := strings.Join(withAllocate, "\n")
+	crc := crc32.ChecksumIEEE([]byte(crcText))
+
+	// Build init commands
+	initCmds := []string{}
+	if servoPin != nil {
+		initCmds = append(initCmds,
+			fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.servo, pwmInitClock, 0),
+		)
+	}
+	initCmds = append(initCmds,
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			o.adcBed, querySlotClock(mcuFreq, o.adcBed), sampleTicks, adcSampleCount, reportTicks, bedMin, bedMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmBed, pwmInitClock, 0),
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			o.adcE, querySlotClock(mcuFreq, o.adcE), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmE, pwmInitClock, 0),
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			o.adcE1, querySlotClock(mcuFreq, o.adcE1), sampleTicks, adcSampleCount, reportTicks, ext1Min, ext1Max, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=%d", o.pwmE1, pwmInitClock, 0),
+	)
+
+	out := make([]string, 0, 1+len(configCmds)+1+len(initCmds))
+	out = append(out, withAllocate...)
+	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+	out = append(out, initCmds...)
+	return out, nil
+}
+
 // CompilePolarConnectPhase generates connect-phase commands for polar kinematics.
 // Polar printers have a rotating bed (stepper_bed), a linear arm (stepper_arm), and a Z axis.
 func CompilePolarConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {

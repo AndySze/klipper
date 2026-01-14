@@ -457,7 +457,7 @@ func (k *cartesianKinematics) setPosition(newPos []float64, homingAxes string) {
 	}
 	for i := 0; i < 3; i++ {
 		if k.steppers[i] != nil {
-			k.steppers[i].setPosition(newPos[i])
+			k.steppers[i].setPosition(newPos[0], newPos[1], newPos[2])
 		}
 	}
 	for _, axisName := range homingAxes {
@@ -512,6 +512,7 @@ func (k *cartesianKinematics) checkEndstops(mv *move) error {
 		if limits[i][0] > limits[i][1] {
 			return fmt.Errorf("must home axis first")
 		}
+		fmt.Fprintf(os.Stderr, "DEBUG checkEndstops: axis=%d endPos=%f limits=[%f,%f]\n", i, endPos[i], limits[i][0], limits[i][1])
 		return fmt.Errorf("move out of range")
 	}
 	return nil
@@ -866,14 +867,11 @@ func (th *toolhead) dripMove(newPos []float64, speed float64) (float64, float64,
 	if err != nil {
 		return 0, 0, err
 	}
-	th.motion.tracef("dripMove: startTime=%.9f preDecelTime=%.9f endTime=%.9f (decelDuration=%.9f)\n",
-		startTime, preDecelTime, endTime, endTime-preDecelTime)
 	// Generate ALL steps (cruise + decel) like Python does.
 	// The serialqueue's req_clock ordering will handle placing the disable correctly.
 	if err := th.motion.dripUpdateTime(startTime, endTime); err != nil {
 		return 0, 0, err
 	}
-	th.motion.tracef("dripMove: after full flush\n")
 	th.advanceMoveTime(endTime)
 	th.motion.wipeTrapQ(th.trapq)
 	// Return preDecelTime and endTime for caller's reference (but decel already flushed)
@@ -1203,6 +1201,9 @@ type stepper struct {
 	sk        *chelper.StepperKinematics
 	trapq     *chelper.TrapQ
 
+	// isDualCarriage is true if this stepper uses IDEX dual_carriage wrapper
+	isDualCarriage bool
+
 	activeCallbacks []func(printTime float64)
 	activeCBID      int
 }
@@ -1263,6 +1264,92 @@ func newStepper(
 	return st, nil
 }
 
+// newIDEXStepper creates a stepper using dual_carriage kinematics wrapper.
+// The dual_carriage wrapper allows dynamically enabling/disabling step generation
+// via scale factor (scale=0 disables, scale=1 enables).
+// This is used for IDEX (Independent Dual EXtruder) printers where both stepper_x
+// and dual_carriage use the same trapq but only one should generate steps at a time.
+func newIDEXStepper(
+	motion *motionQueuing,
+	sq *chelper.SerialQueue,
+	seName string,
+	axis byte,
+	oid uint32,
+	stepDist float64,
+	invertDir bool,
+	queueStepTag int32,
+	setDirTag int32,
+	mcuFreq float64,
+	mcuName string,
+	initialActive bool, // true if this stepper should start active
+) (*stepper, error) {
+	se, err := motion.allocSyncEmitter(seName)
+	if err != nil {
+		return nil, err
+	}
+	sc := se.GetStepcompress()
+	if sc == nil {
+		return nil, fmt.Errorf("missing stepcompress for %s", seName)
+	}
+	maxErr := uint32(int64(maxStepcompressErrorSec * mcuFreq))
+	if err := sc.Fill(oid, maxErr, queueStepTag, setDirTag); err != nil {
+		return nil, err
+	}
+	if err := sc.SetInvertSdir(invertDir); err != nil {
+		return nil, err
+	}
+
+	// Create the underlying cartesian kinematics
+	origSK, err := chelper.NewCartesianStepperKinematics(axis)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create dual_carriage wrapper
+	dcSK, err := chelper.NewDualCarriageStepperKinematics()
+	if err != nil {
+		origSK.Free()
+		return nil, err
+	}
+
+	// Set the original kinematics in the wrapper
+	dcSK.DualCarriageSetSK(origSK)
+
+	// Set initial transform (scale=1 for active, scale=0 for inactive)
+	scale := 0.0
+	if initialActive {
+		scale = 1.0
+	}
+	fmt.Fprintf(os.Stderr, "DEBUG: newIDEXStepper %s: setting transform axis=%c scale=%f\n", seName, axis, scale)
+	if err := dcSK.DualCarriageSetTransform(axis, scale, 0.0); err != nil {
+		dcSK.Free()
+		origSK.Free()
+		return nil, err
+	}
+	fmt.Fprintf(os.Stderr, "DEBUG: newIDEXStepper %s: transform set successfully\n", seName)
+
+	if err := se.SetStepperKinematics(dcSK); err != nil {
+		dcSK.Free()
+		origSK.Free()
+		return nil, err
+	}
+
+	st := &stepper{
+		axis:           axis,
+		oid:            oid,
+		stepDist:       stepDist,
+		invertDir:      invertDir,
+		mcuName:        mcuName,
+		motion:         motion,
+		sq:             sq,
+		se:             se,
+		stepqueue:      sc,
+		sk:             dcSK,
+		isDualCarriage: true,
+	}
+	return st, nil
+}
+
 func (s *stepper) free() {
 	if s == nil {
 		return
@@ -1283,20 +1370,13 @@ func (s *stepper) setTrapQ(tq *chelper.TrapQ) *chelper.TrapQ {
 	return prev
 }
 
-func (s *stepper) setPosition(pos float64) {
+// setPosition sets the stepper kinematics position using all 3 coordinates.
+// This is critical - the stepper_kinematics needs the full 3D position,
+// not just the axis being homed. Python calls:
+//   ffi_lib.itersolve_set_position(sk, coord[0], coord[1], coord[2])
+func (s *stepper) setPosition(x, y, z float64) {
 	if s.sk != nil {
-		switch s.axis {
-		case 'x':
-			s.sk.SetPosition(pos, 0.0, 0.0)
-		case 'e':
-			s.sk.SetPosition(pos, 0.0, 0.0)
-		case 'y':
-			s.sk.SetPosition(0.0, pos, 0.0)
-		case 'z':
-			s.sk.SetPosition(0.0, 0.0, pos)
-		default:
-			s.sk.SetPosition(pos, 0.0, 0.0)
-		}
+		s.sk.SetPosition(x, y, z)
 	}
 }
 
@@ -1744,15 +1824,27 @@ type runtime struct {
 	genericCartesianKin *GenericCartesianKinematics
 
 	// Hybrid CoreXY / dual carriage support
-	dualCarriage       *stepper
-	dualCarriageActive int // 0 = primary (stepper_x), 1 = secondary (dual_carriage)
+	dualCarriage        *stepper
+	dualCarriageEndstop *endstop  // endstop for dual_carriage homing
+	dualCarriageActive  int       // 0 = primary (stepper_x), 1 = secondary (dual_carriage)
+	dualCarriageSaved   map[string]*dualCarriageState // saved states by name
+	dualCarriageRange   [2]float64 // [positionMin, positionMax] for dual_carriage
+	// Track offset for each carriage (used for position calculation when switching)
+	// Offset = physical position when deactivated (scale=0)
+	// For active carriage: scale=1, offset=0
+	// For inactive carriage: scale=0, offset=physical_position
+	dualCarriageOffsets [2]float64 // [primary_offset, secondary_offset]
 
 	// Polar kinematics flag
 	isPolar bool
 
+	// Delta kinematics flag
+	isDelta bool
+
 	// Multiple extruder support
-	stepperE1     *stepper
-	extruder1     *extruderAxis
+	stepperE1       *stepper
+	extruder1       *extruderAxis
+	activeExtruder  string // "extruder" or "extruder1" - name of currently active extruder
 
 	// Fan control
 	fanManager *fanManager
@@ -1761,6 +1853,12 @@ type runtime struct {
 type pressureAdvanceState struct {
 	advance    float64
 	smoothTime float64
+}
+
+// dualCarriageState stores the saved state for dual carriage operations.
+type dualCarriageState struct {
+	activeCarriage int       // 0 = primary, 1 = secondary
+	position       []float64 // toolhead position when saved
 }
 
 func (r *runtime) setTrace(w io.Writer) {
@@ -1775,6 +1873,14 @@ func (r *runtime) tracef(format string, args ...any) {
 		return
 	}
 	fmt.Fprintf(r.trace, format, args...)
+}
+
+func (r *runtime) getRegisteredStepperNames() []string {
+	names := make([]string, 0, len(r.stepperEnable.lines))
+	for name := range r.stepperEnable.lines {
+		names = append(names, name)
+	}
+	return names
 }
 
 // gcodeRespond sends a response message to the G-code handler
@@ -1891,6 +1997,14 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		return newHybridCoreXYRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
 	}
 
+	// For cartesian with [dual_carriage], use separate IDEX initialization path
+	dcSection, hasDualCarriage := cfg.section("dual_carriage")
+	fmt.Fprintf(os.Stderr, "DEBUG NewRuntime: kinType=%s hasDualCarriage=%v dcSection=%v\n", kinType, hasDualCarriage, dcSection)
+	if hasDualCarriage && kinType == "cartesian" {
+		fmt.Fprintf(os.Stderr, "DEBUG NewRuntime: using IDEX path\n")
+		return newCartesianDualCarriageRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
+	}
+
 	// For hybrid_corexz, use separate initialization path
 	if isHybridCoreXZ {
 		return newHybridCoreXZRuntime(cfg, dict, formats, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel, queueStepID, setDirID)
@@ -1934,6 +2048,15 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		sz, err = readStepperByName(cfg, "stepper_c", 'c')
 		if err != nil {
 			return nil, err
+		}
+		// Delta: inherit position_endstop from stepper_a if not set on stepper_b/c
+		if sy.positionEndstop == 0 && sx.positionEndstop != 0 {
+			sy.positionEndstop = sx.positionEndstop
+			sy.positionMax = sx.positionMax
+		}
+		if sz.positionEndstop == 0 && sx.positionEndstop != 0 {
+			sz.positionEndstop = sx.positionEndstop
+			sz.positionMax = sx.positionMax
 		}
 	} else {
 		// Cartesian/CoreXY/CoreXZ use stepper_x, stepper_y, stepper_z
@@ -2149,6 +2272,162 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	stY.setTrapQ(th.trapq)
 	stZ.setTrapQ(th.trapq)
 
+	// Delta-specific configuration (used for both stepper kinematics and factory kinematics)
+	var deltaRadius float64
+	var deltaArmLengths []float64
+	var deltaAngles []float64
+
+	// For delta kinematics, replace cartesian stepper kinematics with delta-specific ones
+	if isDelta {
+		// Read delta_radius from [printer] section
+		var err error
+		deltaRadius, err = parseFloat(printerSec, "delta_radius", nil)
+		if err != nil {
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("delta kinematics requires delta_radius: %w", err)
+		}
+
+		// Read arm_length from stepper sections (stepper_a, stepper_b, stepper_c)
+		// arm_length is read from each stepper section with stepper_a as default
+		secA, _ := cfg.section("stepper_a")
+		armLengthA, err := parseFloat(secA, "arm_length", nil)
+		if err != nil {
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("stepper_a requires arm_length: %w", err)
+		}
+
+		secB, _ := cfg.section("stepper_b")
+		armLengthB, err := parseFloat(secB, "arm_length", &armLengthA)
+		if err != nil {
+			armLengthB = armLengthA
+		}
+
+		secC, _ := cfg.section("stepper_c")
+		armLengthC, err := parseFloat(secC, "arm_length", &armLengthA)
+		if err != nil {
+			armLengthC = armLengthA
+		}
+
+		// Read tower angles (default: 210°, 330°, 90°)
+		defaultAngleA := 210.0
+		defaultAngleB := 330.0
+		defaultAngleC := 90.0
+		angleA, _ := parseFloat(secA, "angle", &defaultAngleA)
+		angleB, _ := parseFloat(secB, "angle", &defaultAngleB)
+		angleC, _ := parseFloat(secC, "angle", &defaultAngleC)
+
+		// Store delta parameters for kinematics factory
+		deltaArmLengths = []float64{armLengthA, armLengthB, armLengthC}
+		deltaAngles = []float64{angleA, angleB, angleC}
+
+		// Calculate tower positions
+		towerAX := math.Cos(angleA*math.Pi/180.0) * deltaRadius
+		towerAY := math.Sin(angleA*math.Pi/180.0) * deltaRadius
+		towerBX := math.Cos(angleB*math.Pi/180.0) * deltaRadius
+		towerBY := math.Sin(angleB*math.Pi/180.0) * deltaRadius
+		towerCX := math.Cos(angleC*math.Pi/180.0) * deltaRadius
+		towerCY := math.Sin(angleC*math.Pi/180.0) * deltaRadius
+
+		// Calculate arm^2 for each tower
+		arm2A := armLengthA * armLengthA
+		arm2B := armLengthB * armLengthB
+		arm2C := armLengthC * armLengthC
+
+		// Replace stepper kinematics with delta kinematics
+		if stX.sk != nil {
+			stX.sk.Free()
+		}
+		skA, err := chelper.NewDeltaStepperKinematics(arm2A, towerAX, towerAY)
+		if err != nil {
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("failed to create delta kinematics for stepper_a: %w", err)
+		}
+		if err := stX.se.SetStepperKinematics(skA); err != nil {
+			skA.Free()
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+		stX.sk = skA
+
+		if stY.sk != nil {
+			stY.sk.Free()
+		}
+		skB, err := chelper.NewDeltaStepperKinematics(arm2B, towerBX, towerBY)
+		if err != nil {
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("failed to create delta kinematics for stepper_b: %w", err)
+		}
+		if err := stY.se.SetStepperKinematics(skB); err != nil {
+			skB.Free()
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+		stY.sk = skB
+
+		if stZ.sk != nil {
+			stZ.sk.Free()
+		}
+		skC, err := chelper.NewDeltaStepperKinematics(arm2C, towerCX, towerCY)
+		if err != nil {
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, fmt.Errorf("failed to create delta kinematics for stepper_c: %w", err)
+		}
+		if err := stZ.se.SetStepperKinematics(skC); err != nil {
+			skC.Free()
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+		stZ.sk = skC
+	}
+
 	// Convert rails to kinematics.Rail slice
 	// (stepDistX, stepDistY, stepDistZ already calculated above)
 	kinRails := []kinematics.Rail{
@@ -2189,10 +2468,13 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 
 	// Create kinematics based on type
 	kinCfg := kinematics.Config{
-		Type:         kinType,
-		Rails:        kinRails,
-		MaxZVelocity: maxZVelocity,
-		MaxZAccel:    maxZAccel,
+		Type:           kinType,
+		Rails:          kinRails,
+		MaxZVelocity:   maxZVelocity,
+		MaxZAccel:      maxZAccel,
+		DeltaRadius:    deltaRadius,
+		DeltaArmLength: deltaArmLengths,
+		DeltaAngles:    deltaAngles,
 	}
 
 	kin, err := kinematics.NewFromConfig(kinCfg)
@@ -2414,7 +2696,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 				f.Close()
 				return nil, fmt.Errorf("create extra stepper failed: %v", err)
 			}
-			extraStepper.setPosition(exAxis.lastPosition)
+			extraStepper.setPosition(exAxis.lastPosition, 0.0, 0.0)
 			// Default to syncing with the referenced extruder at connect.
 			extraStepper.setTrapQ(tqExtruder)
 
@@ -2456,7 +2738,7 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 			return nil, err
 		}
 		stE.setTrapQ(tqExtruder)
-		stE.setPosition(0.0)
+		stE.setPosition(0.0, 0.0, 0.0)
 
 		cqEnE := chelper.NewCommandQueue()
 		if cqEnE == nil {
@@ -2589,10 +2871,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		pressureAdvance: map[string]*pressureAdvanceState{
 			"extruder": &pressureAdvanceState{advance: 0.0, smoothTime: 0.040},
 		},
-		motorOffOrder: motorOffOrder,
-		mcu:           mcu,
-		rawPath:       rawPath,
-		rawFile:       f,
+		motorOffOrder:  motorOffOrder,
+		mcu:            mcu,
+		rawPath:        rawPath,
+		rawFile:        f,
+		isDelta:        isDelta,
+		activeExtruder: "extruder",
 	}
 	if hasExtraStepper {
 		rt.pressureAdvance["my_extra_stepper"] = &pressureAdvanceState{advance: 0.0, smoothTime: 0.040}
@@ -3459,6 +3743,451 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 			rt.homingOverrideAxes = "xyz"
 		}
 	}
+
+	// Load and setup heaters from config
+	heaterConfigs, err := readHeaterConfigs(cfg)
+	if err != nil {
+		rt.tracef("Warning: failed to load heater configs: %v\n", err)
+	} else {
+		for _, hc := range heaterConfigs {
+			if err := rt.setupHeater(hc); err != nil {
+				rt.tracef("Warning: failed to setup heater %s: %v\n", hc.name, err)
+			}
+		}
+	}
+
+	return rt, nil
+}
+
+// newCartesianDualCarriageRuntime creates a runtime for cartesian kinematics with dual_carriage (IDEX).
+func newCartesianDualCarriageRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[string]*protocol.MessageFormat, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel float64, queueStepID, setDirID int32) (*runtime, error) {
+	// Read stepper configs
+	sx, err := readStepper(cfg, 'x')
+	if err != nil {
+		return nil, err
+	}
+	sy, err := readStepper(cfg, 'y')
+	if err != nil {
+		return nil, err
+	}
+	sz, err := readStepper(cfg, 'z')
+	if err != nil {
+		return nil, err
+	}
+
+	// Read dual_carriage config
+	dcSec, _ := cfg.section("dual_carriage")
+	_, err = parsePin(dcSec, "step_pin", true, false)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
+	}
+	dcDirPin, err := parsePin(dcSec, "dir_pin", true, false)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
+	}
+	dcEnablePin, err := parsePin(dcSec, "enable_pin", true, false)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
+	}
+	_, err = parsePin(dcSec, "endstop_pin", true, true)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
+	}
+	dcRotDist := 40.0
+	if v := dcSec["rotation_distance"]; v != "" {
+		dcRotDist, _ = strconv.ParseFloat(v, 64)
+	}
+	dcMicrosteps := 16
+	if v := dcSec["microsteps"]; v != "" {
+		dcMicrosteps, _ = strconv.Atoi(v)
+	}
+	dcStepDist := dcRotDist / float64(200*dcMicrosteps)
+
+	// Parse dual_carriage position limits
+	dcPositionMin := 0.0
+	dcPositionMax := 200.0
+	if v := dcSec["position_min"]; v != "" {
+		dcPositionMin, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := dcSec["position_max"]; v != "" {
+		dcPositionMax, _ = strconv.ParseFloat(v, 64)
+	}
+
+	rails := [3]stepperCfg{sx, sy, sz}
+
+	// Check for extruders
+	extruderCfg, _, err := readExtruderStepperOptional(cfg, "extruder")
+	if err != nil {
+		return nil, err
+	}
+	extruder1Cfg, hasExtruder1, err := readExtruderStepperOptional(cfg, "extruder1")
+	if err != nil {
+		return nil, err
+	}
+
+	// Create serial queue output file
+	tmpDir := filepath.Join("out", "go_migration_tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, err
+	}
+	rawPath := filepath.Join(tmpDir, "serial-"+randSuffix()+".bin")
+	f, err := os.OpenFile(rawPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+
+	sq, err := chelper.NewSerialQueue(int(f.Fd()), 'f', 0, "serialq mcu")
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	sq.SetClockEst(1e12, chelper.Monotonic(), 0, 0)
+
+	cqMain := chelper.NewCommandQueue()
+	if cqMain == nil {
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc main command queue failed")
+	}
+	cqTrigger := chelper.NewCommandQueue()
+	if cqTrigger == nil {
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, fmt.Errorf("alloc trigger command queue failed")
+	}
+	cqEnablePins := []*chelper.CommandQueue{}
+
+	reservedMoveSlots := reservedMoveSlotsForConfig(cfg)
+	motion, err := newMotionQueuing(sq, mcuFreq, reservedMoveSlots)
+	if err != nil {
+		cqTrigger.Free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	numAxes := 4 // X, Y, Z, E
+	th, err := newToolhead(mcuFreq, motion, maxVelocity, maxAccel, numAxes)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	se := newStepperEnable(th)
+
+	// OID layout for cartesian dual_carriage (matching connect-phase compiler):
+	// 0-2: X (endstop, trsync, stepper)
+	// 3-5: Y (endstop, trsync, stepper)
+	// 6-8: Z (endstop, trsync, stepper)
+	// 9-11: dual_carriage (endstop, trsync, stepper)
+	// 12: stepper extruder
+	// 13: stepper extruder1
+	// 14: servo
+	// 15-16: heater_bed (adc, pwm)
+	// 17-20: enable pins (X, Y, Z, dual_carriage)
+	// 21-23: extruder (adc, pwm, enable)
+	// 24-26: extruder1 (adc, pwm, enable)
+
+	stepDistX := rails[0].rotationDistance / float64(rails[0].fullSteps*rails[0].microsteps)
+	stepDistY := rails[1].rotationDistance / float64(rails[1].fullSteps*rails[1].microsteps)
+	stepDistZ := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
+
+	// Use IDEX stepper wrapper for stepper_x (initially active with scale=1)
+	// The IDEX wrapper enables/disables step generation via scale factor
+	stX, err := newIDEXStepper(motion, sq, "stepper_x", 'x', 2, stepDistX, rails[0].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu", true)
+	if err != nil {
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stY, err := newStepper(motion, sq, "stepper_y", 'y', 5, stepDistY, rails[1].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
+	if err != nil {
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stZ, err := newStepper(motion, sq, "stepper_z", 'z', 8, stepDistZ, rails[2].dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
+	if err != nil {
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	steppers := [3]*stepper{stX, stY, stZ}
+	stX.setTrapQ(th.trapq)
+	stY.setTrapQ(th.trapq)
+	stZ.setTrapQ(th.trapq)
+
+	// Use IDEX stepper wrapper for dual_carriage (initially inactive with scale=0)
+	// The IDEX wrapper enables/disables step generation via scale factor
+	stDC, err := newIDEXStepper(motion, sq, "dual_carriage", 'x', 11, dcStepDist, dcDirPin.invert, queueStepID, setDirID, mcuFreq, "mcu", false)
+	if err != nil {
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	// Both stepper_x and dual_carriage use the same trapq, but only one is active at a time
+	// via the IDEX wrapper's scale factor (scale=0 disables step generation)
+	stDC.setTrapQ(th.trapq)
+
+	// Create extruder trapq and stepper
+	tqExtruder, err := chelper.NewTrapQ()
+	if err != nil {
+		stDC.free()
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+
+	stepDistE := extruderCfg.rotationDistance / float64(extruderCfg.fullSteps*extruderCfg.microsteps)
+	stE, err := newStepper(motion, sq, "extruder", 'e', 12, stepDistE, extruderCfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
+	if err != nil {
+		tqExtruder.Free()
+		stDC.free()
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	stE.setTrapQ(tqExtruder)
+
+	// Create extruder1 if present
+	var stE1 *stepper
+	var tqExtruder1 *chelper.TrapQ
+	if hasExtruder1 {
+		tqExtruder1, err = chelper.NewTrapQ()
+		if err != nil {
+			stE.free()
+			tqExtruder.Free()
+			stDC.free()
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+		stepDistE1 := extruder1Cfg.rotationDistance / float64(extruder1Cfg.fullSteps*extruder1Cfg.microsteps)
+		stE1, err = newStepper(motion, sq, "extruder1", 'e', 13, stepDistE1, extruder1Cfg.dirPin.invert, queueStepID, setDirID, mcuFreq, "mcu")
+		if err != nil {
+			tqExtruder1.Free()
+			stE.free()
+			tqExtruder.Free()
+			stDC.free()
+			stZ.free()
+			stY.free()
+			stX.free()
+			motion.free()
+			cqMain.Free()
+			sq.Free()
+			f.Close()
+			return nil, err
+		}
+		stE1.setTrapQ(tqExtruder1)
+	}
+
+	// Create enable pins - OIDs: 17=X, 18=Y, 19=Z, 20=dual_carriage, 23=extruder, 26=extruder1
+	enX := &stepperEnablePin{out: newDigitalOut(17, rails[0].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enY := &stepperEnablePin{out: newDigitalOut(18, rails[1].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enZ := &stepperEnablePin{out: newDigitalOut(19, rails[2].enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enDC := &stepperEnablePin{out: newDigitalOut(20, dcEnablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+	enE := &stepperEnablePin{out: newDigitalOut(23, extruderCfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+
+	motion.registerEnablePin(enX)
+	motion.registerEnablePin(enY)
+	motion.registerEnablePin(enZ)
+	motion.registerEnablePin(enDC)
+	motion.registerEnablePin(enE)
+
+	se.registerStepper("stepper_x", stX, enX)
+	se.registerStepper("stepper_y", stY, enY)
+	se.registerStepper("stepper_z", stZ, enZ)
+	se.registerStepper("dual_carriage", stDC, enDC)
+	se.registerStepper("extruder", stE, enE)
+
+	var enE1 *stepperEnablePin
+	if hasExtruder1 {
+		enE1 = &stepperEnablePin{out: newDigitalOut(26, extruder1Cfg.enablePin.invert, sq, cqMain, formats, mcuFreq, "mcu")}
+		motion.registerEnablePin(enE1)
+		se.registerStepper("extruder1", stE1, enE1)
+	}
+
+	// Create kinematics
+	kinRails := []kinematics.Rail{
+		{
+			Name:            "stepper_x",
+			StepDist:        stepDistX,
+			PositionMin:     rails[0].positionMin,
+			PositionMax:     rails[0].positionMax,
+			HomingSpeed:     rails[0].homingSpeed,
+			PositionEndstop: rails[0].positionEndstop,
+			HomingPositive:  rails[0].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_y",
+			StepDist:        stepDistY,
+			PositionMin:     rails[1].positionMin,
+			PositionMax:     rails[1].positionMax,
+			HomingSpeed:     rails[1].homingSpeed,
+			PositionEndstop: rails[1].positionEndstop,
+			HomingPositive:  rails[1].homingPositiveDir,
+		},
+		{
+			Name:            "stepper_z",
+			StepDist:        stepDistZ,
+			PositionMin:     rails[2].positionMin,
+			PositionMax:     rails[2].positionMax,
+			HomingSpeed:     rails[2].homingSpeed,
+			PositionEndstop: rails[2].positionEndstop,
+			HomingPositive:  rails[2].homingPositiveDir,
+		},
+	}
+	kinCfg := kinematics.Config{
+		Type:         "cartesian",
+		Rails:        kinRails,
+		MaxZVelocity: maxZVelocity,
+		MaxZAccel:    maxZAccel,
+	}
+	kin, err := kinematics.NewFromConfig(kinCfg)
+	if err != nil {
+		if hasExtruder1 {
+			stE1.free()
+			tqExtruder1.Free()
+		}
+		stE.free()
+		tqExtruder.Free()
+		stDC.free()
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	th.kin = kin
+
+	extAxis := newExtruderAxis("extruder", tqExtruder)
+	var ext1Axis *extruderAxis
+	if hasExtruder1 {
+		ext1Axis = newExtruderAxis("extruder1", tqExtruder1)
+	}
+
+	mcu := &mcu{freq: mcuFreq, clock: 0}
+
+	// Create trsync for homing - OID layout:
+	// endstop=0,3,6,9 trsync=1,4,7,10 stepper=2,5,8,11
+	trX := &trsync{oid: 1, rt: nil, mcuFreq: mcuFreq}
+	trY := &trsync{oid: 4, rt: nil, mcuFreq: mcuFreq}
+	trZ := &trsync{oid: 7, rt: nil, mcuFreq: mcuFreq}
+	trDC := &trsync{oid: 10, rt: nil, mcuFreq: mcuFreq}
+
+	// G-code arcs resolution
+	mmPerArcSegment, err := readGcodeArcsResolution(cfg)
+	if err != nil {
+		if hasExtruder1 {
+			stE1.free()
+			tqExtruder1.Free()
+		}
+		stE.free()
+		tqExtruder.Free()
+		stDC.free()
+		stZ.free()
+		stY.free()
+		stX.free()
+		motion.free()
+		cqMain.Free()
+		sq.Free()
+		f.Close()
+		return nil, err
+	}
+	gm := newGCodeMove(th, mmPerArcSegment)
+
+	motorOffOrder := []string{"stepper_x", "stepper_y", "stepper_z", "dual_carriage", "extruder"}
+	if hasExtruder1 {
+		motorOffOrder = append(motorOffOrder, "extruder1")
+	}
+
+	rt := &runtime{
+		cfg:                cfg,
+		dict:               dict,
+		formats:            formats,
+		mcuFreq:            mcuFreq,
+		queueStepID:        queueStepID,
+		setDirID:           setDirID,
+		sq:                 sq,
+		cqMain:             cqMain,
+		cqTrigger:          cqTrigger,
+		cqEnablePins:       cqEnablePins,
+		motion:             motion,
+		toolhead:           th,
+		stepperEnable:      se,
+		rails:              rails,
+		steppers:           steppers,
+		extruderCfg:        extruderCfg,
+		stepperE:           stE,
+		extruder:           extAxis,
+		gm:                 gm,
+		motorOffOrder:      motorOffOrder,
+		mcu:                mcu,
+		rawPath:            rawPath,
+		rawFile:            f,
+		dualCarriage:       stDC,
+		dualCarriageActive: 0, // Start with primary carriage
+		dualCarriageRange:  [2]float64{dcPositionMin, dcPositionMax},
+		activeExtruder:     "extruder",
+	}
+
+	// Set trsync runtime references
+	trX.rt = rt
+	trY.rt = rt
+	trZ.rt = rt
+	trDC.rt = rt
+
+	// Initialize endstops - OID layout: endstop=0,3,6,9 trsync=1,4,7,10 stepper=2,5,8,11
+	rt.endstops[0] = &endstop{oid: 0, stepperOID: 2, tr: trX, rt: rt, mcuFreq: mcuFreq}
+	rt.endstops[1] = &endstop{oid: 3, stepperOID: 5, tr: trY, rt: rt, mcuFreq: mcuFreq}
+	rt.endstops[2] = &endstop{oid: 6, stepperOID: 8, tr: trZ, rt: rt, mcuFreq: mcuFreq}
+	rt.dualCarriageEndstop = &endstop{oid: 9, stepperOID: 11, tr: trDC, rt: rt, mcuFreq: mcuFreq}
+
+	// Store extruder1 if present
+	if hasExtruder1 {
+		rt.stepperE1 = stE1
+		rt.extruder1 = ext1Axis
+	}
+
+	// Initialize heater manager
+	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
 
 	// Load and setup heaters from config
 	heaterConfigs, err := readHeaterConfigs(cfg)
@@ -4415,6 +5144,14 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		if err := r.cmdBedMeshCalibrate(cmd.Args); err != nil {
 			return err
 		}
+	case "DELTA_CALIBRATE":
+		// Delta calibration - stub for golden testing
+		// In real Klipper this runs a probe sequence to calibrate delta parameters
+		return nil
+	case "STEPPER_BUZZ":
+		if err := r.cmdStepperBuzz(cmd.Args); err != nil {
+			return err
+		}
 	case "PROBE":
 		if err := r.cmdProbe(cmd.Args); err != nil {
 			return err
@@ -4465,6 +5202,29 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		if err := r.execSDCardLoopEnd(); err != nil {
 			return err
 		}
+	case "SET_DUAL_CARRIAGE":
+		if err := r.cmdSetDualCarriage(cmd.Args); err != nil {
+			return err
+		}
+	case "SAVE_DUAL_CARRIAGE_STATE":
+		if err := r.cmdSaveDualCarriageState(cmd.Args); err != nil {
+			return err
+		}
+	case "RESTORE_DUAL_CARRIAGE_STATE":
+		if err := r.cmdRestoreDualCarriageState(cmd.Args); err != nil {
+			return err
+		}
+	case "ACTIVATE_EXTRUDER":
+		if err := r.cmdActivateExtruder(cmd.Args); err != nil {
+			return err
+		}
+	case "SET_SERVO":
+		// SET_SERVO - stub implementation for now
+		// TODO: implement proper PWM servo control
+		r.tracef("SET_SERVO: stub (servo=%s angle=%s)\n", cmd.Args["SERVO"], cmd.Args["ANGLE"])
+	case "QUERY_ENDSTOPS":
+		// Query endstops - just a status report, no MCU output needed
+		return nil
 	default:
 		return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
 	}
@@ -4546,6 +5306,194 @@ func (r *runtime) runSingleProbe(probeSpeed float64) error {
 	if err := r.bltouch.syncPrintTime(); err != nil {
 		return err
 	}
+	return nil
+}
+
+// cmdStepperBuzz oscillates a stepper motor to help identify it.
+// STEPPER_BUZZ STEPPER=<name>
+func (r *runtime) cmdStepperBuzz(args map[string]string) error {
+	stepperName := strings.TrimSpace(args["STEPPER"])
+	if stepperName == "" {
+		return fmt.Errorf("STEPPER_BUZZ requires STEPPER parameter")
+	}
+	r.tracef("STEPPER_BUZZ: stepper=%s\n", stepperName)
+
+	// Find the stepper in stepperEnable's registered lines
+	et, ok := r.stepperEnable.lines[stepperName]
+	if !ok {
+		r.tracef("STEPPER_BUZZ: unknown stepper %s (registered: %v)\n", stepperName, r.getRegisteredStepperNames())
+		return fmt.Errorf("unknown stepper %s", stepperName)
+	}
+	stepper := et.stepper
+	r.tracef("STEPPER_BUZZ: found stepper %s (oid=%d, axis=%c)\n", stepperName, stepper.oid, stepper.axis)
+
+	// BUZZ_DISTANCE = 1.0mm, BUZZ_VELOCITY = 4.0mm/s (1.0 / 0.250)
+	const buzzDistance = 1.0
+	const buzzVelocity = 4.0 // = buzzDistance / 0.250
+
+	// Force enable the stepper
+	wasEnabled := et.isEnabled
+	if !wasEnabled {
+		pt, err := r.toolhead.getLastMoveTime()
+		if err != nil {
+			return err
+		}
+		et.enablePin.out.setDigital(pt, true)
+		et.isEnabled = true
+	}
+
+	// Create a temporary trapq for manual movement
+	buzzTrapQ, err := chelper.NewTrapQ()
+	if err != nil {
+		return err
+	}
+	defer buzzTrapQ.Free()
+
+	// Create a cartesian stepper kinematics for the 'x' axis (manual move uses single axis)
+	buzzSK, err := chelper.NewCartesianStepperKinematics('x')
+	if err != nil {
+		return err
+	}
+	defer buzzSK.Free()
+
+	// Flush step generation BEFORE switching stepper kinematics
+	// This ensures all pending moves from the main trapq are processed
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+
+	// Save previous stepper kinematics and trapq
+	prevSK := stepper.sk
+	prevTrapQ := stepper.trapq
+
+	// Set up stepper for manual movement
+	stepper.sk = buzzSK
+	stepper.trapq = buzzTrapQ
+	// Connect the stepper's syncemitter to the new SK
+	if stepper.se != nil {
+		if err := stepper.se.SetStepperKinematics(buzzSK); err != nil {
+			return err
+		}
+	}
+	// Set trapq on the SK (with a step distance of 1.0 for manual moves)
+	buzzSK.SetTrapQ(buzzTrapQ, stepper.stepDist)
+	buzzSK.SetPosition(0, 0, 0)
+
+	// Helper to restore stepper state
+	restoreStepper := func() {
+		stepper.sk = prevSK
+		stepper.trapq = prevTrapQ
+		if stepper.se != nil && prevSK != nil {
+			stepper.se.SetStepperKinematics(prevSK)
+		}
+		if prevSK != nil && prevTrapQ != nil {
+			prevSK.SetTrapQ(prevTrapQ, stepper.stepDist)
+		}
+	}
+
+	// Do 10 buzz iterations
+	for i := 0; i < 10; i++ {
+		// Move +distance at speed
+		if err := r.manualStepperMove(stepper, buzzTrapQ, buzzSK, buzzDistance, buzzVelocity); err != nil {
+			restoreStepper()
+			return err
+		}
+
+		// Dwell 0.050 seconds
+		if err := r.toolhead.dwell(0.050); err != nil {
+			restoreStepper()
+			return err
+		}
+
+		// Move -distance at speed
+		if err := r.manualStepperMove(stepper, buzzTrapQ, buzzSK, -buzzDistance, buzzVelocity); err != nil {
+			restoreStepper()
+			return err
+		}
+
+		// Dwell 0.450 seconds
+		if err := r.toolhead.dwell(0.450); err != nil {
+			restoreStepper()
+			return err
+		}
+	}
+
+	// Restore stepper state
+	restoreStepper()
+
+	// Restore enable state
+	if !wasEnabled {
+		pt, err := r.toolhead.getLastMoveTime()
+		if err != nil {
+			return err
+		}
+		et.enablePin.out.setDigital(pt, false)
+		et.isEnabled = false
+	}
+
+	return nil
+}
+
+// manualStepperMove performs a single manual stepper move using a dedicated trapq.
+// This matches Python's force_move.manual_move() for STEPPER_BUZZ.
+func (r *runtime) manualStepperMove(stepper *stepper, trapq *chelper.TrapQ, sk *chelper.StepperKinematics, dist, speed float64) error {
+	// Flush step generation first
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+
+	// Set position to origin for manual move
+	sk.SetPosition(0, 0, 0)
+
+	// Calculate move time (accel=0 case: pure cruise)
+	axisR := 1.0
+	if dist < 0 {
+		axisR = -1.0
+		dist = -dist
+	}
+	cruiseT := dist / speed
+	cruiseV := speed
+
+	// Get print time
+	pt, err := r.toolhead.getLastMoveTime()
+	if err != nil {
+		return err
+	}
+
+	// Append move to trapq (accel_t=0, cruise_t=moveTime, decel_t=0)
+	trapq.Append(
+		pt,
+		0,        // accel_t
+		cruiseT,  // cruise_t
+		0,        // decel_t
+		0, 0, 0,  // start_pos x, y, z
+		axisR, 0, 0, // axes_r (only x axis moves)
+		0,        // start_v
+		cruiseV,  // cruise_v
+		0,        // accel
+	)
+
+	// Calculate end time
+	endTime := pt + cruiseT
+
+	// Note movequeue activity
+	if err := r.motion.noteMovequeueActivity(endTime, true); err != nil {
+		return err
+	}
+
+	// Dwell for the move duration
+	if err := r.toolhead.dwell(cruiseT); err != nil {
+		return err
+	}
+
+	// Flush step generation
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+
+	// Wipe the trapq
+	r.motion.wipeTrapQ(trapq)
+
 	return nil
 }
 
@@ -4856,6 +5804,7 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
 		return fmt.Errorf("bad axis %d", axis)
 	}
 	startPos := append([]float64{}, r.toolhead.commandedPos...)
+	r.tracef("HOMING axis=%d startPos=[%f, %f, %f]\n", axis, startPos[0], startPos[1], startPos[2])
 	delta := movepos[axis] - startPos[axis]
 	moveD := math.Abs(delta)
 	if moveD == 0.0 {
@@ -4956,10 +5905,10 @@ func (r *runtime) homePolarArm() error {
 		return err
 	}
 
-	// Update stepper positions
+	// Update stepper positions with full 3D coordinates
 	for i := 0; i < 3 && i < len(r.steppers); i++ {
 		if r.steppers[i] != nil {
-			r.steppers[i].setPosition(forcepos[i])
+			r.steppers[i].setPosition(forcepos[0], forcepos[1], forcepos[2])
 		}
 	}
 
@@ -5080,7 +6029,7 @@ func (r *runtime) homingMovePolar(movepos []float64, speed float64) error {
 	}
 	for i := 0; i < 3 && i < len(r.steppers); i++ {
 		if r.steppers[i] != nil {
-			r.steppers[i].setPosition(movepos[i])
+			r.steppers[i].setPosition(movepos[0], movepos[1], movepos[2])
 		}
 	}
 
@@ -5105,9 +6054,10 @@ func (r *runtime) homeAxis(axis int) error {
 	// Update stepper kinematics positions to match the new toolhead position
 	// This is critical for step generation - the stepper_kinematics needs to know
 	// the current position to calculate correct step timing.
+	// NOTE: All steppers must receive full 3D coordinates, not just their axis value.
 	for i := 0; i < 3 && i < len(r.steppers); i++ {
 		if r.steppers[i] != nil {
-			r.steppers[i].setPosition(forcepos[i])
+			r.steppers[i].setPosition(forcepos[0], forcepos[1], forcepos[2])
 		}
 	}
 	isProbeZ := axis == 2 && rail.endstopPin.pin == "probe:z_virtual_endstop" && r.bltouch != nil
@@ -5174,7 +6124,7 @@ func (r *runtime) homeAxis(axis int) error {
 	// Update stepper kinematics positions for second homing move
 	for i := 0; i < 3 && i < len(r.steppers); i++ {
 		if r.steppers[i] != nil {
-			r.steppers[i].setPosition(start2pos[i])
+			r.steppers[i].setPosition(start2pos[0], start2pos[1], start2pos[2])
 		}
 	}
 	if isProbeZ {
@@ -5717,7 +6667,8 @@ func (r *runtime) cmdSyncExtruderMotion(args map[string]string) error {
 	}
 
 	// Match Klippy: set the stepper position to the extruder's last position.
-	targetStepper.setPosition(r.extruder.lastPosition)
+	// For extruder steppers, position is 1D (x coordinate only).
+	targetStepper.setPosition(r.extruder.lastPosition, 0.0, 0.0)
 	targetStepper.setTrapQ(r.extruder.trapq)
 	r.updateKinFlushDelay()
 	r.tracef("SYNC_EXTRUDER_MOTION: %s -> extruder (connected)\n", extruderName)
@@ -5739,12 +6690,513 @@ func (r *runtime) homeAll() error {
 		}
 		return nil
 	}
+	// For delta kinematics, all three towers home simultaneously.
+	// All towers move up together until all endstops trigger.
+	if r.isDelta {
+		if err := r.homeDelta(); err != nil {
+			return err
+		}
+		return nil
+	}
+	// For IDEX (dual carriage) printers, need special X-axis homing
+	if r.dualCarriage != nil {
+		if err := r.homeIDEX(); err != nil {
+			return err
+		}
+		return nil
+	}
 	// Match Klippy cartesian homing order: X, then Y, then Z.
 	for _, axis := range []int{0, 1, 2} {
 		if err := r.homeAxis(axis); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// homeIDEX performs homing for IDEX (dual carriage) printers.
+// In IDEX, both stepper_x and dual_carriage need to be homed on the X axis.
+// Homing order matches Python Klippy: X, dual_carriage, Y, Z
+func (r *runtime) homeIDEX() error {
+	// Read dual_carriage section to get its homing parameters
+	dcSec, _ := r.cfg.section("dual_carriage")
+	dcPositionEndstop := 200.0
+	dcPositionMin := 0.0
+	dcPositionMax := 200.0
+	dcHomingSpeed := 50.0
+	dcPositiveDir := true // dual_carriage typically homes positive
+	dcRetractDist := 5.0
+	dcSecondHomingSpeed := 25.0
+
+	if v := dcSec["position_endstop"]; v != "" {
+		dcPositionEndstop, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := dcSec["position_min"]; v != "" {
+		dcPositionMin, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := dcSec["position_max"]; v != "" {
+		dcPositionMax, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := dcSec["homing_speed"]; v != "" {
+		dcHomingSpeed, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := dcSec["homing_retract_dist"]; v != "" {
+		dcRetractDist, _ = strconv.ParseFloat(v, 64)
+	}
+	if v := dcSec["second_homing_speed"]; v != "" {
+		dcSecondHomingSpeed, _ = strconv.ParseFloat(v, 64)
+	} else {
+		dcSecondHomingSpeed = dcHomingSpeed / 2
+	}
+	// Check homing_positive_dir: default based on position_endstop
+	dcPositiveDir = dcPositionEndstop > (dcPositionMin+dcPositionMax)/2
+	if v := dcSec["homing_positive_dir"]; v != "" {
+		dcPositiveDir = strings.ToLower(v) == "true"
+	}
+
+	// Home X axis (stepper_x) first
+	if err := r.homeAxis(0); err != nil {
+		return err
+	}
+
+	// Home dual_carriage second - use dualCarriageEndstop
+	if r.dualCarriageEndstop != nil {
+		if err := r.homeDualCarriage(dcPositionEndstop, dcPositionMin, dcPositionMax, dcHomingSpeed, dcPositiveDir, dcRetractDist, dcSecondHomingSpeed); err != nil {
+			return err
+		}
+		// After homeDualCarriage completes, it calls restoreIDEXTransforms() which makes
+		// stepper_x active again. We need to update the toolhead position to reflect
+		// stepper_x's position (its position_endstop), not dual_carriage's position.
+		// This matches Python's toggle_active_dc_rail behavior.
+		xPos := r.rails[0].positionEndstop // stepper_x home position
+		curPos := r.toolhead.commandedPos
+		newPos := []float64{xPos, curPos[1], curPos[2]}
+		if len(curPos) > 3 {
+			newPos = append(newPos, curPos[3:]...)
+		}
+		if err := r.toolhead.setPosition(newPos, ""); err != nil {
+			return err
+		}
+		// Also update stepper_x's position to match
+		if r.steppers[0] != nil {
+			r.steppers[0].setPosition(newPos[0], newPos[1], newPos[2])
+		}
+		r.tracef("homeIDEX: after dual_carriage homing, restored toolhead X to stepper_x position: %f\n", xPos)
+	}
+
+	// Home Y axis
+	if err := r.homeAxis(1); err != nil {
+		return err
+	}
+
+	// Home Z axis
+	if err := r.homeAxis(2); err != nil {
+		return err
+	}
+
+	// Initialize dual carriage offsets:
+	// - Primary carriage (stepper_x) is active at position 0 (its position_endstop)
+	// - Secondary carriage (dual_carriage) is inactive at its position_endstop
+	r.dualCarriageOffsets[0] = r.rails[0].positionEndstop // primary at its home position
+	r.dualCarriageOffsets[1] = dcPositionEndstop          // secondary at its home position
+	r.tracef("homeIDEX: initialized offsets - primary=%f, secondary=%f\n",
+		r.dualCarriageOffsets[0], r.dualCarriageOffsets[1])
+
+	return nil
+}
+
+// homeIDEXCarriage homes the dual_carriage rail (similar to homeAxis but with custom params)
+func (r *runtime) homeIDEXCarriage(positionEndstop, positionMin, positionMax, homingSpeed float64, positiveDir bool, retractDist, secondHomingSpeed float64) error {
+	cur := append([]float64{}, r.toolhead.commandedPos...)
+	homepos := append([]float64{}, cur...)
+	homepos[0] = positionEndstop
+	forcepos := append([]float64{}, homepos...)
+	if positiveDir {
+		forcepos[0] -= 1.5 * (positionEndstop - positionMin)
+	} else {
+		forcepos[0] += 1.5 * (positionMax - positionEndstop)
+	}
+
+	if err := r.toolhead.setPosition(forcepos, "x"); err != nil {
+		return err
+	}
+	// Update stepper kinematics - only dual_carriage for IDEX
+	if r.dualCarriage != nil {
+		r.dualCarriage.setPosition(forcepos[0], forcepos[1], forcepos[2])
+	}
+
+	if err := r.homingMove(0, homepos, homingSpeed); err != nil {
+		return err
+	}
+
+	if retractDist == 0.0 {
+		if err := r.toolhead.flushStepGeneration(); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Retract move
+	axesD := make([]float64, 3)
+	for i := 0; i < 3; i++ {
+		axesD[i] = homepos[i] - forcepos[i]
+	}
+	moveD := math.Sqrt(axesD[0]*axesD[0] + axesD[1]*axesD[1] + axesD[2]*axesD[2])
+	retractR := 1.0
+	if moveD != 0.0 {
+		retractR = math.Min(1.0, retractDist/moveD)
+	}
+	retractpos := append([]float64{}, homepos...)
+	for i := 0; i < 3; i++ {
+		retractpos[i] = homepos[i] - axesD[i]*retractR
+	}
+	if err := r.toolhead.move(retractpos, homingSpeed); err != nil {
+		return err
+	}
+
+	// Second homing move
+	start2pos := append([]float64{}, retractpos...)
+	for i := 0; i < 3; i++ {
+		start2pos[i] = retractpos[i] - axesD[i]*retractR
+	}
+	if err := r.toolhead.setPosition(start2pos, ""); err != nil {
+		return err
+	}
+	if r.dualCarriage != nil {
+		r.dualCarriage.setPosition(start2pos[0], start2pos[1], start2pos[2])
+	}
+
+	if err := r.homingMove(0, homepos, secondHomingSpeed); err != nil {
+		return err
+	}
+
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// homeDualCarriage homes the dual_carriage stepper using its own endstop.
+// This is similar to homeAxis but uses the dual_carriage's specific endstop and stepper.
+// For IDEX, we need to temporarily activate dual_carriage and deactivate stepper_x.
+func (r *runtime) homeDualCarriage(positionEndstop, positionMin, positionMax, homingSpeed float64, positiveDir bool, retractDist, secondHomingSpeed float64) error {
+	if r.dualCarriage == nil || r.dualCarriageEndstop == nil {
+		return nil
+	}
+
+	r.tracef("homeDualCarriage: begin posEndstop=%f posMin=%f posMax=%f speed=%f positiveDir=%v\n",
+		positionEndstop, positionMin, positionMax, homingSpeed, positiveDir)
+
+	// Flush any pending step generation before changing transforms
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+
+	// For IDEX homing: swap stepper transforms
+	// Deactivate stepper_x (scale=0), activate dual_carriage (scale=1)
+	stX := r.steppers[0]
+	stDC := r.dualCarriage
+	if stX != nil && stX.sk != nil && stX.isDualCarriage {
+		// Deactivate stepper_x
+		stX.sk.DualCarriageSetTransform('x', 0, 0) // scale=0
+		r.tracef("homeDualCarriage: deactivated stepper_x\n")
+	}
+	if stDC != nil && stDC.sk != nil && stDC.isDualCarriage {
+		// Activate dual_carriage
+		stDC.sk.DualCarriageSetTransform('x', 1, 0) // axis=x, scale=1
+		r.tracef("homeDualCarriage: activated dual_carriage\n")
+	}
+
+	// Get current position
+	cur := append([]float64{}, r.toolhead.commandedPos...)
+	homepos := append([]float64{}, cur...)
+	homepos[0] = positionEndstop
+
+	// Calculate force position (starting position for homing move)
+	forcepos := append([]float64{}, homepos...)
+	if positiveDir {
+		// Homing positive: start from below the endstop
+		forcepos[0] = positionEndstop - 1.5*(positionEndstop-positionMin)
+	} else {
+		// Homing negative: start from above the endstop
+		forcepos[0] = positionEndstop + 1.5*(positionMax-positionEndstop)
+	}
+
+	// Set toolhead to force position
+	if err := r.toolhead.setPosition(forcepos, "x"); err != nil {
+		r.restoreIDEXTransforms()
+		return err
+	}
+
+	// Update dual_carriage stepper position
+	if stDC != nil && stDC.sk != nil {
+		stDC.sk.SetPosition(forcepos[0], forcepos[1], forcepos[2])
+	}
+
+	// Perform homing move using the dual_carriage endstop
+	if err := r.homingMoveDualCarriage(homepos, homingSpeed, true); err != nil {
+		r.restoreIDEXTransforms()
+		return err
+	}
+
+	// If no retract, we're done
+	if retractDist == 0.0 {
+		// Set final position
+		if err := r.toolhead.setPosition(homepos, "x"); err != nil {
+			r.restoreIDEXTransforms()
+			return err
+		}
+		if stDC != nil && stDC.sk != nil {
+			stDC.sk.SetPosition(homepos[0], homepos[1], homepos[2])
+		}
+		if err := r.toolhead.flushStepGeneration(); err != nil {
+			r.restoreIDEXTransforms()
+			return err
+		}
+		r.restoreIDEXTransforms()
+		return nil
+	}
+
+	// Retract move
+	axesD := make([]float64, 3)
+	for i := 0; i < 3; i++ {
+		axesD[i] = homepos[i] - forcepos[i]
+	}
+	moveD := math.Sqrt(axesD[0]*axesD[0] + axesD[1]*axesD[1] + axesD[2]*axesD[2])
+	retractR := 1.0
+	if moveD != 0.0 {
+		retractR = math.Min(1.0, retractDist/moveD)
+	}
+	retractpos := append([]float64{}, homepos...)
+	for i := 0; i < 3; i++ {
+		retractpos[i] = homepos[i] - axesD[i]*retractR
+	}
+	if err := r.toolhead.move(retractpos, homingSpeed); err != nil {
+		r.restoreIDEXTransforms()
+		return err
+	}
+
+	// Second homing move (slower, more precise)
+	start2pos := append([]float64{}, retractpos...)
+	for i := 0; i < 3; i++ {
+		start2pos[i] = retractpos[i] - axesD[i]*retractR
+	}
+	if err := r.toolhead.setPosition(start2pos, ""); err != nil {
+		r.restoreIDEXTransforms()
+		return err
+	}
+	if stDC != nil && stDC.sk != nil {
+		stDC.sk.SetPosition(start2pos[0], start2pos[1], start2pos[2])
+	}
+
+	if err := r.homingMoveDualCarriage(homepos, secondHomingSpeed, true); err != nil {
+		r.restoreIDEXTransforms()
+		return err
+	}
+
+	// Set final position
+	if err := r.toolhead.setPosition(homepos, "x"); err != nil {
+		r.restoreIDEXTransforms()
+		return err
+	}
+	if stDC != nil && stDC.sk != nil {
+		stDC.sk.SetPosition(homepos[0], homepos[1], homepos[2])
+	}
+
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		r.restoreIDEXTransforms()
+		return err
+	}
+
+	// Restore IDEX transforms: stepper_x active, dual_carriage inactive
+	r.restoreIDEXTransforms()
+	return nil
+}
+
+// restoreIDEXTransforms restores the default IDEX state: stepper_x active, dual_carriage inactive
+func (r *runtime) restoreIDEXTransforms() {
+	stX := r.steppers[0]
+	stDC := r.dualCarriage
+	if stX != nil && stX.sk != nil && stX.isDualCarriage {
+		stX.sk.DualCarriageSetTransform('x', 1, 0) // axis=x, scale=1
+		r.tracef("restoreIDEXTransforms: activated stepper_x\n")
+	}
+	if stDC != nil && stDC.sk != nil && stDC.isDualCarriage {
+		stDC.sk.DualCarriageSetTransform('x', 0, 0) // scale=0
+		r.tracef("restoreIDEXTransforms: deactivated dual_carriage\n")
+	}
+}
+
+// homingMoveDualCarriage performs a homing move for the dual_carriage axis.
+// This is similar to homingMove but uses the dual_carriage endstop.
+func (r *runtime) homingMoveDualCarriage(homepos []float64, speed float64, triggered bool) error {
+	r.tracef("HOMING dual_carriage: begin speed=%.6f homepos=%v\n", speed, homepos)
+
+	// Flush any pending step generation
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+
+	// Get current print time
+	pt, err := r.toolhead.getLastMoveTime()
+	if err != nil {
+		return err
+	}
+	r.tracef("HOMING dual_carriage: start_pt=%.9f\n", pt)
+
+	// Calculate move distance and rest time
+	startPos := append([]float64{}, r.toolhead.commandedPos...)
+	delta := homepos[0] - startPos[0]
+	moveD := math.Abs(delta)
+	if moveD == 0.0 {
+		return nil
+	}
+
+	// Get step distance for dual_carriage
+	stepDist := r.dualCarriage.stepDist
+	maxSteps := moveD / stepDist
+	if maxSteps <= 0.0 {
+		maxSteps = 1.0
+	}
+	moveT := moveD / speed
+	restTime := moveT / maxSteps
+	r.tracef("HOMING dual_carriage: restTime=%.9f moveT=%.9f maxSteps=%.3f\n", restTime, moveT, maxSteps)
+
+	// Start endstop monitoring
+	if err := r.dualCarriageEndstop.homeStart(pt, restTime, triggered); err != nil {
+		return err
+	}
+	r.traceMotion("HOMING dual_carriage: after homeStart")
+
+	// Dwell to ensure endstop monitoring is ready
+	if err := r.toolhead.dwell(homingStartDelaySec); err != nil {
+		return err
+	}
+
+	// Generate move and flush only cruise phase steps
+	preDecelTime, endTime, err := r.toolhead.dripMove(homepos, speed)
+	if err != nil {
+		return err
+	}
+	r.tracef("HOMING dual_carriage: after dripMove preDecelTime=%.9f endTime=%.9f\n", preDecelTime, endTime)
+
+	// Stop endstop monitoring
+	if err := r.dualCarriageEndstop.homeStop(); err != nil {
+		return err
+	}
+	r.tracef("HOMING dual_carriage: after homeStop\n")
+
+	_ = preDecelTime
+	_ = endTime
+	return nil
+}
+
+// homeDelta performs delta homing where all three towers home to their endstops.
+// In delta kinematics, all towers must be homed together to mark XYZ as homed.
+func (r *runtime) homeDelta() error {
+	// Delta homing: home all three towers (stepper_a, stepper_b, stepper_c)
+	// Each tower homes independently to its endstop.
+	// Delta towers always home in the positive direction (up).
+
+	// Get delta parameters from config
+	printerSec, _ := r.cfg.section("printer")
+	deltaRadius := 174.75
+	if v := printerSec["delta_radius"]; v != "" {
+		deltaRadius, _ = strconv.ParseFloat(v, 64)
+	}
+
+	// Get arm lengths from stepper sections
+	secA, _ := r.cfg.section("stepper_a")
+	armLengthA := 333.0
+	if v := secA["arm_length"]; v != "" {
+		armLengthA, _ = strconv.ParseFloat(v, 64)
+	}
+	arm2 := armLengthA * armLengthA
+	maxXY2 := (deltaRadius * 0.8) * (deltaRadius * 0.8)
+
+	// Calculate home position (x=0, y=0, z=min_endstop)
+	minEndstop := r.rails[0].positionEndstop
+	for i := 1; i < 3; i++ {
+		if r.rails[i].positionEndstop < minEndstop {
+			minEndstop = r.rails[i].positionEndstop
+		}
+	}
+	homePos := []float64{0, 0, minEndstop, 0}
+
+	// Calculate force position (below the bed)
+	forceZ := -1.5 * math.Sqrt(arm2-maxXY2)
+	forcePos := []float64{0, 0, forceZ, 0}
+
+	// Set position to forcePos and mark all axes as "homing" (xyz)
+	// This allows the homing moves to proceed without "must home first" errors
+	if err := r.toolhead.setPosition(forcePos, "xyz"); err != nil {
+		return err
+	}
+
+	// Update stepper kinematics positions - delta uses Z coordinate for all towers
+	// Pass full 3D position (0, 0, forceZ) to each stepper
+	for i := 0; i < 3 && i < len(r.steppers); i++ {
+		if r.steppers[i] != nil {
+			r.steppers[i].setPosition(0.0, 0.0, forceZ)
+		}
+	}
+
+	// Home all three towers sequentially
+	for axis := 0; axis < 3; axis++ {
+		rail := r.rails[axis]
+		posEndstop := rail.positionEndstop
+		homePosAxis := []float64{0, 0, posEndstop, 0}
+
+		if err := r.homingMove(axis, homePosAxis, rail.homingSpeed); err != nil {
+			return fmt.Errorf("delta home tower %d: %w", axis, err)
+		}
+
+		// Handle retract if configured
+		if rail.homingRetractDist != 0.0 {
+			retractZ := posEndstop - rail.homingRetractDist
+			retractPos := []float64{0, 0, retractZ, 0}
+			retractSpeed := rail.homingRetractSpeed
+			if retractSpeed == 0 {
+				retractSpeed = rail.homingSpeed
+			}
+			if err := r.toolhead.move(retractPos, retractSpeed); err != nil {
+				return fmt.Errorf("delta retract tower %d: %w", axis, err)
+			}
+
+			// Second homing move
+			start2Z := retractZ - rail.homingRetractDist
+			start2Pos := []float64{0, 0, start2Z, 0}
+			if err := r.toolhead.setPosition(start2Pos, ""); err != nil {
+				return err
+			}
+			if r.steppers[axis] != nil {
+				r.steppers[axis].setPosition(0.0, 0.0, start2Z)
+			}
+
+			if err := r.homingMove(axis, homePosAxis, rail.secondHomingSpeed); err != nil {
+				return fmt.Errorf("delta home2 tower %d: %w", axis, err)
+			}
+		}
+	}
+
+	// Set final position to delta home position
+	if err := r.toolhead.setPosition(homePos, "xyz"); err != nil {
+		return err
+	}
+
+	// Update stepper positions to match home position
+	// For delta at home, all steppers are at their endstop positions
+	// Delta uses homePos which is (0, 0, z_height)
+	for i := 0; i < 3; i++ {
+		if r.steppers[i] != nil {
+			r.steppers[i].setPosition(homePos[0], homePos[1], homePos[2])
+		}
+	}
+
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -6164,10 +7616,24 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 	}
 	gm := newGCodeMove(th, mmPerArcSegment)
 
-	// Use dummy rails for runtime struct (polar doesn't have X/Y/Z rails)
+	// Use rails for runtime struct
+	// rails[0] is arm rail (used for X/Y homing which homes the arm)
+	// rails[1] is unused (Y is controlled by arm)
+	// rails[2] is Z rail
 	dummyRails := [3]stepperCfg{
-		{positionMin: 0, positionMax: armCfg.positionMax},               // Use arm range as X
-		{positionMin: -armCfg.positionMax, positionMax: armCfg.positionMax}, // Y is symmetric
+		{
+			positionMin:       0,
+			positionMax:       armCfg.positionMax,
+			positionEndstop:   armCfg.positionEndstop,
+			homingSpeed:       armCfg.homingSpeed,
+			secondHomingSpeed: armCfg.secondHomingSpeed,
+			homingRetractDist: armCfg.homingRetractDist,
+			homingPositiveDir: armCfg.homingPositiveDir,
+		}, // Use arm config for X (arm radius)
+		{
+			positionMin: -armCfg.positionMax,
+			positionMax: armCfg.positionMax,
+		}, // Y is symmetric (no homing on Y directly)
 		zCfg,
 	}
 
@@ -8144,4 +9610,241 @@ func (mrt *multiMCURuntime) free() {
 	if mrt.mcuContexts != nil {
 		mrt.mcuContexts.Close()
 	}
+}
+
+// =============================================================================
+// Dual Carriage (IDEX) Support
+// =============================================================================
+
+// cmdSetDualCarriage handles the SET_DUAL_CARRIAGE command.
+// This switches between the primary (CARRIAGE=0) and secondary (CARRIAGE=1) carriage.
+// cmdActivateExtruder handles the ACTIVATE_EXTRUDER command.
+func (r *runtime) cmdActivateExtruder(args map[string]string) error {
+	extruderName := strings.ToLower(strings.TrimSpace(args["EXTRUDER"]))
+	if extruderName == "" {
+		return fmt.Errorf("ACTIVATE_EXTRUDER requires EXTRUDER parameter")
+	}
+
+	// Validate extruder name
+	if extruderName != "extruder" && extruderName != "extruder1" {
+		return fmt.Errorf("invalid EXTRUDER: %s", extruderName)
+	}
+
+	// Check if extruder1 exists if trying to activate it
+	if extruderName == "extruder1" && r.stepperE1 == nil {
+		return fmt.Errorf("extruder1 not configured")
+	}
+
+	// Update active extruder
+	r.activeExtruder = extruderName
+	r.tracef("ACTIVATE_EXTRUDER: activated %s\n", extruderName)
+
+	return nil
+}
+
+func (r *runtime) cmdSetDualCarriage(args map[string]string) error {
+	if r.dualCarriage == nil {
+		return fmt.Errorf("dual_carriage not configured")
+	}
+
+	carriageStr := strings.TrimSpace(args["CARRIAGE"])
+	if carriageStr == "" {
+		return fmt.Errorf("SET_DUAL_CARRIAGE requires CARRIAGE parameter")
+	}
+
+	carriage, err := strconv.Atoi(carriageStr)
+	if err != nil {
+		return fmt.Errorf("invalid CARRIAGE value: %s", carriageStr)
+	}
+	if carriage < 0 || carriage > 1 {
+		return fmt.Errorf("CARRIAGE must be 0 or 1")
+	}
+
+	// MODE parameter is optional - only PRIMARY mode is currently supported
+	// COPY and MIRROR modes require more complex kinematic transform handling
+	mode := strings.ToUpper(strings.TrimSpace(args["MODE"]))
+	if mode != "" && mode != "PRIMARY" {
+		// For now, just ignore COPY/MIRROR modes - they're complex and not needed for basic test
+		r.tracef("SET_DUAL_CARRIAGE: MODE=%s ignored (only PRIMARY supported)\n", mode)
+	}
+
+	// If already on requested carriage, nothing to do
+	if carriage == r.dualCarriageActive {
+		return nil
+	}
+
+	// Flush any pending moves before switching
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
+
+	// Get current toolhead position
+	currentPos := r.toolhead.commandedPos[0]
+
+	// Switch carriages using IDEX scale factors
+	// Scale=1 enables step generation, Scale=0 disables it
+	// When deactivating: offset = current position (freezes the stepper at this position)
+	// When activating: offset = 0 (stepper tracks toolhead position directly)
+	stX := r.steppers[0]
+	stDC := r.dualCarriage
+
+	// Save current position as offset for the currently active carriage
+	r.dualCarriageOffsets[r.dualCarriageActive] = currentPos
+	fmt.Fprintf(os.Stderr, "SET_DUAL_CARRIAGE: currentPos=%f, saving offset[%d] = %f\n", currentPos, r.dualCarriageActive, currentPos)
+
+	// Get new toolhead position from the target carriage's offset
+	newPos := r.dualCarriageOffsets[carriage]
+	fmt.Fprintf(os.Stderr, "SET_DUAL_CARRIAGE: switching to carriage %d, new X pos from offset[%d] = %f\n", carriage, carriage, newPos)
+
+	if carriage == 0 {
+		// Deactivate dual_carriage first (before activating stepper_x)
+		if stDC.sk != nil {
+			stDC.sk.DualCarriageSetTransform('x', 0.0, currentPos)
+		}
+		// Activate stepper_x
+		if stX.sk != nil {
+			stX.sk.DualCarriageSetTransform('x', 1.0, 0.0)
+		}
+		// Update X-axis limits to stepper_x range
+		if r.toolhead.kin != nil {
+			r.toolhead.kin.UpdateLimits(0, [2]float64{r.rails[0].positionMin, r.rails[0].positionMax})
+		}
+	} else {
+		// Deactivate stepper_x first (before activating dual_carriage)
+		if stX.sk != nil {
+			stX.sk.DualCarriageSetTransform('x', 0.0, currentPos)
+		}
+		// Activate dual_carriage
+		if stDC.sk != nil {
+			stDC.sk.DualCarriageSetTransform('x', 1.0, 0.0)
+		}
+		// Update X-axis limits to dual_carriage range
+		if r.toolhead.kin != nil {
+			r.toolhead.kin.UpdateLimits(0, r.dualCarriageRange)
+		}
+	}
+
+	// Update toolhead position to reflect the new carriage's position
+	newToolheadPos := make([]float64, len(r.toolhead.commandedPos))
+	copy(newToolheadPos, r.toolhead.commandedPos)
+	newToolheadPos[0] = newPos
+
+	// Use internal setPosition to update toolhead and stepper positions
+	// This is like Python's toolhead.set_position(newpos) in toggle_active_dc_rail
+	if err := r.toolhead.setPosition(newToolheadPos, ""); err != nil {
+		return err
+	}
+
+	// CRITICAL: Update stepper commanded_pos on all X-axis steppers
+	// The newly activated stepper needs to have commanded_pos matching the
+	// calc_position output, otherwise itersolve will try to generate steps
+	// to "catch up" from the old commanded_pos to the new position.
+	// Set position for stepper_x
+	if stX.sk != nil {
+		stX.sk.SetPosition(newPos, r.toolhead.commandedPos[1], r.toolhead.commandedPos[2])
+	}
+	// Set position for dual_carriage
+	if stDC.sk != nil {
+		stDC.sk.SetPosition(newPos, r.toolhead.commandedPos[1], r.toolhead.commandedPos[2])
+	}
+
+	r.dualCarriageActive = carriage
+
+	// Sync gcode_move position with new toolhead position
+	// This is critical for relative moves (G91) to work correctly
+	if r.gm != nil {
+		r.gm.resetFromToolhead()
+	}
+
+	fmt.Fprintf(os.Stderr, "SET_DUAL_CARRIAGE: switched to CARRIAGE=%d, X pos now %f, toolhead.commandedPos[0]=%f\n",
+		carriage, newPos, r.toolhead.commandedPos[0])
+
+	return nil
+}
+
+// cmdSaveDualCarriageState handles the SAVE_DUAL_CARRIAGE_STATE command.
+func (r *runtime) cmdSaveDualCarriageState(args map[string]string) error {
+	if r.dualCarriage == nil {
+		return fmt.Errorf("dual_carriage not configured")
+	}
+
+	name := strings.TrimSpace(args["NAME"])
+	if name == "" {
+		name = "default"
+	}
+
+	// Initialize saved states map if needed
+	if r.dualCarriageSaved == nil {
+		r.dualCarriageSaved = make(map[string]*dualCarriageState)
+	}
+
+	// Save current state
+	pos := make([]float64, len(r.toolhead.commandedPos))
+	copy(pos, r.toolhead.commandedPos)
+
+	r.dualCarriageSaved[name] = &dualCarriageState{
+		activeCarriage: r.dualCarriageActive,
+		position:       pos,
+	}
+
+	r.tracef("SAVE_DUAL_CARRIAGE_STATE: saved state '%s' carriage=%d pos=%v\n",
+		name, r.dualCarriageActive, pos)
+
+	return nil
+}
+
+// cmdRestoreDualCarriageState handles the RESTORE_DUAL_CARRIAGE_STATE command.
+func (r *runtime) cmdRestoreDualCarriageState(args map[string]string) error {
+	if r.dualCarriage == nil {
+		return fmt.Errorf("dual_carriage not configured")
+	}
+
+	name := strings.TrimSpace(args["NAME"])
+	if name == "" {
+		name = "default"
+	}
+
+	if r.dualCarriageSaved == nil {
+		return fmt.Errorf("no saved dual carriage state")
+	}
+
+	state, ok := r.dualCarriageSaved[name]
+	if !ok {
+		return fmt.Errorf("no saved state named '%s'", name)
+	}
+
+	// Restore carriage by calling SET_DUAL_CARRIAGE
+	// This ensures proper transform switching and limit updates
+	carriageStr := fmt.Sprintf("%d", state.activeCarriage)
+	if err := r.cmdSetDualCarriage(map[string]string{"CARRIAGE": carriageStr}); err != nil {
+		return err
+	}
+
+	// MOVE parameter controls whether to move back to saved position
+	// Default is MOVE=1 in Python
+	moveStr := strings.TrimSpace(args["MOVE"])
+	if moveStr == "" {
+		moveStr = "1" // Default to move
+	}
+	if moveStr == "1" {
+		// Move to saved position
+		moveSpeed := 0.0 // 0 means use homing speed
+		if speedStr := strings.TrimSpace(args["MOVE_SPEED"]); speedStr != "" {
+			if s, err := strconv.ParseFloat(speedStr, 64); err == nil {
+				moveSpeed = s
+			}
+		}
+		if moveSpeed == 0.0 {
+			// Use a reasonable default speed if not specified
+			moveSpeed = 50.0 // mm/s homing speed
+		}
+		if err := r.toolhead.move(state.position, moveSpeed); err != nil {
+			return err
+		}
+	}
+
+	r.tracef("RESTORE_DUAL_CARRIAGE_STATE: restored state '%s' carriage=%d\n",
+		name, state.activeCarriage)
+
+	return nil
 }
