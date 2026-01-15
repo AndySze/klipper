@@ -6278,7 +6278,7 @@ func (r *runtime) homeAxis(axis int) error {
 			r.steppers[i].setPosition(forcepos[0], forcepos[1], forcepos[2])
 		}
 	}
-	isProbeZ := axis == 2 && rail.endstopPin.pin == "probe:z_virtual_endstop" && r.bltouch != nil
+	isProbeZ := axis == 2 && strings.ToLower(rail.endstopPin.chip) == "probe" && r.bltouch != nil
 	if isProbeZ {
 		if err := r.bltouch.lowerProbe(); err != nil {
 			return err
