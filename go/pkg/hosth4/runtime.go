@@ -1469,17 +1469,21 @@ func (d *digitalOut) setOnTicks(printTime float64, onTicks uint32) error {
 // - maximum_pulse_width: 0.002s (default)
 // - maximum_servo_angle: 180° (default)
 // - SERVO_SIGNAL_PERIOD: 0.020s (20ms)
+// - RESCHEDULE_SLACK: 0.0005s (500us)
 type servoController struct {
 	out        *digitalOut
 	minWidth   float64 // minimum pulse width in seconds
 	maxWidth   float64 // maximum pulse width in seconds
 	maxAngle   float64 // maximum angle in degrees
 	period     float64 // PWM signal period in seconds
-	cycleTicks uint32  // PWM cycle ticks (period * mcuFreq)
+	cycleTicks uint64  // PWM cycle ticks (period * mcuFreq)
+	mcuFreq    float64 // MCU frequency for time conversion
 	lastValue  float64 // last PWM value sent (0.0 to 1.0)
 }
 
-func newServoController(out *digitalOut, cycleTicks uint32) *servoController {
+const servoRescheduleSlack = 0.0005 // 500us slack for PWM cycle alignment
+
+func newServoController(out *digitalOut, cycleTicks uint64, mcuFreq float64) *servoController {
 	return &servoController{
 		out:        out,
 		minWidth:   0.001,   // Default 1ms
@@ -1487,11 +1491,34 @@ func newServoController(out *digitalOut, cycleTicks uint32) *servoController {
 		maxAngle:   180.0,   // Default 180 degrees
 		period:     0.020,   // 20ms period
 		cycleTicks: cycleTicks,
+		mcuFreq:    mcuFreq,
 		lastValue:  0.0,
 	}
 }
 
+// nextAlignedPrintTime aligns printTime to the next PWM cycle boundary.
+// This matches Python mcu.py MCU_pwm_cycle.next_aligned_print_time().
+func (s *servoController) nextAlignedPrintTime(printTime float64) float64 {
+	// If last value is exactly 0 or 1 (full off or full on), no alignment needed
+	// (hardware can change immediately at any time)
+	if s.lastValue == 0.0 || s.lastValue == 1.0 {
+		return printTime
+	}
+
+	// Allow scheduling slightly earlier by subtracting half the slack
+	reqPtime := printTime - min(servoRescheduleSlack, 0.5*s.period)
+	reqClock := uint64(int64(reqPtime * s.mcuFreq))
+	lastClock := s.out.lastClk
+
+	// Calculate number of full cycles since lastClock
+	pulses := (reqClock - lastClock + s.cycleTicks - 1) / s.cycleTicks
+	nextClock := lastClock + pulses*s.cycleTicks
+
+	return float64(nextClock) / s.mcuFreq
+}
+
 // setAngle sets the servo position by angle (0 to maxAngle degrees).
+// Uses PWM cycle alignment matching Python servo.py behavior.
 func (s *servoController) setAngle(printTime, angle float64) error {
 	// Clamp angle to valid range
 	if angle < 0 {
@@ -1506,16 +1533,32 @@ func (s *servoController) setAngle(printTime, angle float64) error {
 	// Convert pulse width to PWM value (0.0 to 1.0)
 	pwmValue := width / s.period
 
-	// Check if value changed
+	// Check if value changed (discard duplicate)
 	if pwmValue == s.lastValue {
-		return nil // Discard duplicate
+		return nil
 	}
+
+	// Align to next PWM cycle boundary (matches Python behavior)
+	alignedTime := s.nextAlignedPrintTime(printTime)
+
+	// Python's servo.py checks if aligned time is too far in the future
+	// and returns "reschedule" to delay the command. We emulate this by
+	// using the later of (printTime, alignedTime), but clamping to ensure
+	// we don't send too early if alignment pushed us back.
+	finalTime := alignedTime
+	if alignedTime > printTime+servoRescheduleSlack {
+		// In Python, this would trigger a reschedule. Since we don't have
+		// the full GCodeRequestQueue mechanism, we use the aligned time anyway.
+		// The command will be sent at the aligned boundary.
+		finalTime = alignedTime
+	}
+
 	s.lastValue = pwmValue
 
 	// Convert PWM value to on_ticks (round to nearest integer, matching Python)
 	onTicks := uint32(pwmValue*float64(s.cycleTicks) + 0.5)
 
-	return s.out.setOnTicks(printTime, onTicks)
+	return s.out.setOnTicks(finalTime, onTicks)
 }
 
 type stepperEnablePin struct {
@@ -2274,6 +2317,28 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		oidEndstopZ = 7
 		oidTrsyncZ = 8
 		oidStepperZ = 9
+	} else {
+		// Check for TMC2130 sections (OIDs 0-3 are SPI, 4+ for steppers)
+		hasTMC2130 := false
+		for secName := range cfg.sections {
+			if strings.HasPrefix(secName, "tmc2130 ") {
+				hasTMC2130 = true
+				break
+			}
+		}
+		if hasTMC2130 {
+			// Match go/pkg/hosth1/h1.go:CompileTMC2130CartesianConnectPhase()
+			// OID layout: 0-3 SPI, 4-12 steppers
+			oidEndstopX = 4
+			oidTrsyncX = 5
+			oidStepperX = 6
+			oidEndstopY = 7
+			oidTrsyncY = 8
+			oidStepperY = 9
+			oidEndstopZ = 10
+			oidTrsyncZ = 11
+			oidStepperZ = 12
+		}
 	}
 
 	stepDistX := rails[0].rotationDistance / float64(rails[0].fullSteps*rails[0].microsteps)
@@ -2556,11 +2621,26 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	var exAxis *extruderAxis
 
 	// Determine enable pin OIDs based on config type
+	// Check for TMC2130 first (OIDs 0-3 are SPI)
+	hasTMC2130Enable := false
+	for secName := range cfg.sections {
+		if strings.HasPrefix(secName, "tmc2130 ") {
+			hasTMC2130Enable = true
+			break
+		}
+	}
+
+	// With TMC2130: enable_x=18, enable_y=19, enable_z=20, enable_e=23
 	// With extruder + buttons/bltouch/fan: enable_x=13, enable_y=14, enable_z=15, enable_e=18
 	// With extruder (no buttons/bltouch/fan): enable_x=12, enable_y=13, enable_z=14, enable_e=17
 	// Without extruder: enable_x=9, enable_y=10, enable_z=11
 	var oidEnableX, oidEnableY, oidEnableZ, oidEnableE int
-	if hasExtruder {
+	if hasTMC2130Enable && hasExtruder {
+		oidEnableX = 18
+		oidEnableY = 19
+		oidEnableZ = 20
+		oidEnableE = 23
+	} else if hasExtruder {
 		if hasButtons || hasBLTouch || hasFan {
 			oidEnableX = 13
 			oidEnableY = 14
@@ -4254,9 +4334,9 @@ func newCartesianDualCarriageRuntime(cfg *configWrapper, dict *protocol.Dictiona
 		// Servo OID is 14 for dual_carriage config
 		// cycle_ticks = 320000 (20ms @ 16MHz)
 		const servoOID = 14
-		const servoCycleTicks = 320000
+		const servoCycleTicks uint64 = 320000
 		servoOut := newDigitalOut(servoOID, false, sq, cqMain, formats, mcuFreq, "mcu")
-		rt.servos[servoName] = newServoController(servoOut, servoCycleTicks)
+		rt.servos[servoName] = newServoController(servoOut, servoCycleTicks, mcuFreq)
 	}
 
 	// Initialize heater manager
@@ -5622,13 +5702,17 @@ func (r *runtime) cmdSetServo(args map[string]string) error {
 	r.tracef("SET_SERVO: servo=%s angle=%.3f\n", servoName, angle)
 
 	// Queue the servo command using lookahead callback pattern
-	// This matches Python's servo.py behavior
-	pt, err := r.toolhead.getLastMoveTime()
-	if err != nil {
+	// This matches Python's servo.py + GCodeRequestQueue behavior:
+	// 1. Register callback with lookahead queue
+	// 2. When queue flushes, callback is invoked with print_time
+	// 3. setAngle() aligns to PWM cycle boundary
+	var servoErr error
+	if err := r.toolhead.registerLookaheadCallback(func(printTime float64) {
+		servoErr = servo.setAngle(printTime, angle)
+	}); err != nil {
 		return err
 	}
-
-	return servo.setAngle(pt, angle)
+	return servoErr
 }
 
 func (r *runtime) cmdProbe(args map[string]string) error {

@@ -3684,3 +3684,638 @@ func CompileMultiMCUCartesianConnectPhase(cfgPath string, dicts map[string]*prot
 
 	return results, nil
 }
+
+// TMC2130 register addresses
+const (
+	tmc2130GCONF      = 0x00
+	tmc2130IHOLD_IRUN = 0x10
+	tmc2130TPOWERDOWN = 0x11
+	tmc2130TPWMTHRS   = 0x13
+	tmc2130TCOOLTHRS  = 0x14
+	tmc2130THIGH      = 0x15
+	tmc2130MSLUT0     = 0x60
+	tmc2130MSLUT1     = 0x61
+	tmc2130MSLUT2     = 0x62
+	tmc2130MSLUT3     = 0x63
+	tmc2130MSLUT4     = 0x64
+	tmc2130MSLUT5     = 0x65
+	tmc2130MSLUT6     = 0x66
+	tmc2130MSLUT7     = 0x67
+	tmc2130MSLUTSEL   = 0x68
+	tmc2130MSLUTSTART = 0x69
+	tmc2130CHOPCONF   = 0x6c
+	tmc2130COOLCONF   = 0x6d
+	tmc2130PWMCONF    = 0x70
+)
+
+// TMC2130 default wave table values
+var tmc2130DefaultMSLUT = [8]uint32{
+	0xAAAAB554, // MSLUT0
+	0x4A9554AA, // MSLUT1
+	0x24492929, // MSLUT2
+	0x10104222, // MSLUT3
+	0xFBFFFFFF, // MSLUT4
+	0xB5BB777D, // MSLUT5
+	0x49295556, // MSLUT6
+	0x00404222, // MSLUT7
+}
+
+// TMC2130 current calculation
+func tmc2130CalcCurrentBits(current, senseResistor float64, vsense bool) int {
+	sr := senseResistor + 0.020
+	vref := 0.32
+	if vsense {
+		vref = 0.18
+	}
+	cs := int(32.*sr*current*math.Sqrt(2.)/vref+0.5) - 1
+	if cs < 0 {
+		return 0
+	}
+	if cs > 31 {
+		return 31
+	}
+	return cs
+}
+
+func tmc2130CalcCurrentFromBits(cs int, senseResistor float64, vsense bool) float64 {
+	sr := senseResistor + 0.020
+	vref := 0.32
+	if vsense {
+		vref = 0.18
+	}
+	return float64(cs+1) * vref / (32. * sr * math.Sqrt(2.))
+}
+
+func tmc2130CalcCurrent(runCurrent, holdCurrent, senseResistor float64) (vsense bool, irun, ihold int) {
+	vsense = true
+	irun = tmc2130CalcCurrentBits(runCurrent, senseResistor, true)
+	if irun == 31 {
+		cur := tmc2130CalcCurrentFromBits(irun, senseResistor, true)
+		if cur < runCurrent {
+			irun2 := tmc2130CalcCurrentBits(runCurrent, senseResistor, false)
+			cur2 := tmc2130CalcCurrentFromBits(irun2, senseResistor, false)
+			if math.Abs(runCurrent-cur2) < math.Abs(runCurrent-cur) {
+				vsense = false
+				irun = irun2
+			}
+		}
+	}
+	minHoldRun := holdCurrent
+	if minHoldRun > runCurrent {
+		minHoldRun = runCurrent
+	}
+	ihold = tmc2130CalcCurrentBits(minHoldRun, senseResistor, vsense)
+	return
+}
+
+// TMC2130 register value builders
+func tmc2130BuildCHOPCONF(toff, hstrt, hend, tbl, vsense, mres int, intpol bool) uint32 {
+	val := uint32(toff & 0x0f)
+	val |= uint32((hstrt & 0x07) << 4)
+	val |= uint32((hend & 0x0f) << 7)
+	val |= uint32((tbl & 0x03) << 15)
+	if vsense == 1 {
+		val |= 1 << 17
+	}
+	val |= uint32((mres & 0x0f) << 24)
+	if intpol {
+		val |= 1 << 28
+	}
+	return val
+}
+
+func tmc2130BuildIHOLD_IRUN(ihold, irun, iholddelay int) uint32 {
+	return uint32(ihold&0x1f) | uint32((irun&0x1f)<<8) | uint32((iholddelay&0x0f)<<16)
+}
+
+func tmc2130BuildMSLUTSEL(w0, w1, w2, w3, x1, x2, x3 int) uint32 {
+	return uint32(w0&0x03) | uint32((w1&0x03)<<2) | uint32((w2&0x03)<<4) | uint32((w3&0x03)<<6) |
+		uint32((x1&0xff)<<8) | uint32((x2&0xff)<<16) | uint32((x3&0xff)<<24)
+}
+
+func tmc2130BuildMSLUTSTART(startSin, startSin90 int) uint32 {
+	return uint32(startSin&0xff) | uint32((startSin90&0xff)<<16)
+}
+
+func tmc2130BuildPWMCONF(pwmAmpl, pwmGrad, pwmFreq int, pwmAutoscale bool, freewheel int) uint32 {
+	val := uint32(pwmAmpl&0xff) | uint32((pwmGrad&0xff)<<8) | uint32((pwmFreq&0x03)<<16)
+	if pwmAutoscale {
+		val |= 1 << 18
+	}
+	val |= uint32((freewheel & 0x03) << 20)
+	return val
+}
+
+// formatSPISend formats spi_send command with data bytes
+func formatSPISend(oid int, reg byte, val uint32) string {
+	// Write bit is 0x80
+	data := []byte{
+		reg | 0x80,
+		byte(val >> 24),
+		byte(val >> 16),
+		byte(val >> 8),
+		byte(val),
+	}
+	return fmt.Sprintf("spi_send oid=%d data=b'%s'", oid, formatPythonBytes(data))
+}
+
+// formatPythonBytes formats bytes as Python byte string
+func formatPythonBytes(data []byte) string {
+	var sb strings.Builder
+	for _, b := range data {
+		if b >= 32 && b < 127 && b != '\'' && b != '\\' {
+			sb.WriteByte(b)
+		} else {
+			sb.WriteString(fmt.Sprintf("\\x%02x", b))
+		}
+	}
+	return sb.String()
+}
+
+// tmc2130Config holds parsed TMC2130 configuration
+type tmc2130Config struct {
+	csPin         string
+	runCurrent    float64
+	senseResistor float64
+	microsteps    int
+}
+
+// parseTMC2130 parses a [tmc2130 xxx] section
+func parseTMC2130(cfg *config, stepperName string) (*tmc2130Config, error) {
+	secName := "tmc2130 " + stepperName
+	sec, ok := cfg.sections[secName]
+	if !ok {
+		return nil, nil // No TMC2130 for this stepper
+	}
+
+	csPin := strings.TrimSpace(sec["cs_pin"])
+	if csPin == "" {
+		return nil, fmt.Errorf("missing cs_pin in [%s]", secName)
+	}
+
+	runCurrent := 0.5 // default
+	if v, ok := sec["run_current"]; ok {
+		var err error
+		runCurrent, err = strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid run_current in [%s]: %w", secName, err)
+		}
+	}
+
+	senseResistor := 0.110 // default
+	if v, ok := sec["sense_resistor"]; ok {
+		var err error
+		senseResistor, err = strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid sense_resistor in [%s]: %w", secName, err)
+		}
+	}
+
+	// Get microsteps from stepper section
+	stepperSec, ok := cfg.sections[stepperName]
+	if !ok {
+		return nil, fmt.Errorf("missing [%s] section for TMC2130", stepperName)
+	}
+	microsteps := 16 // default
+	if v, ok := stepperSec["microsteps"]; ok {
+		var err error
+		microsteps, err = strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return nil, fmt.Errorf("invalid microsteps in [%s]: %w", stepperName, err)
+		}
+	}
+
+	return &tmc2130Config{
+		csPin:         csPin,
+		runCurrent:    runCurrent,
+		senseResistor: senseResistor,
+		microsteps:    microsteps,
+	}, nil
+}
+
+// microstepsToMres converts microsteps value to mres register value
+func microstepsToMres(microsteps int) int {
+	switch microsteps {
+	case 256:
+		return 0
+	case 128:
+		return 1
+	case 64:
+		return 2
+	case 32:
+		return 3
+	case 16:
+		return 4
+	case 8:
+		return 5
+	case 4:
+		return 6
+	case 2:
+		return 7
+	case 1:
+		return 8
+	default:
+		return 4 // default to 16 microsteps
+	}
+}
+
+// generateTMC2130InitCommands generates spi_send commands for TMC2130 register initialization
+func generateTMC2130InitCommands(oid int, tmc *tmc2130Config) []string {
+	// Calculate current
+	holdCurrent := 2.0 // MAX_CURRENT default for hold
+	vsense, irun, ihold := tmc2130CalcCurrent(tmc.runCurrent, holdCurrent, tmc.senseResistor)
+
+	// Build register values
+	mres := microstepsToMres(tmc.microsteps)
+	vsenseInt := 0
+	if vsense {
+		vsenseInt = 1
+	}
+
+	chopconf := tmc2130BuildCHOPCONF(4, 0, 7, 1, vsenseInt, mres, true) // toff=4, hstrt=0, hend=7, tbl=1, intpol=true
+	iholdIrun := tmc2130BuildIHOLD_IRUN(ihold, irun, 8)                 // iholddelay=8
+	mslutsel := tmc2130BuildMSLUTSEL(2, 1, 1, 1, 128, 255, 255)         // w0=2, w1=1, w2=1, w3=1, x1=128, x2=255, x3=255
+	mslutstart := tmc2130BuildMSLUTSTART(0, 247)                        // start_sin=0, start_sin90=247
+	pwmconf := tmc2130BuildPWMCONF(128, 4, 1, true, 0)                  // pwm_ampl=128, pwm_grad=4, pwm_freq=1, pwm_autoscale=true
+
+	var cmds []string
+	// Order matches Python: CHOPCONF, IHOLD_IRUN, MSLUT0-7, MSLUTSEL, MSLUTSTART, TPWMTHRS, GCONF, TCOOLTHRS, THIGH, COOLCONF, PWMCONF, TPOWERDOWN
+	cmds = append(cmds, formatSPISend(oid, tmc2130CHOPCONF, chopconf))
+	cmds = append(cmds, formatSPISend(oid, tmc2130IHOLD_IRUN, iholdIrun))
+	for i := 0; i < 8; i++ {
+		cmds = append(cmds, formatSPISend(oid, byte(tmc2130MSLUT0+i), tmc2130DefaultMSLUT[i]))
+	}
+	cmds = append(cmds, formatSPISend(oid, tmc2130MSLUTSEL, mslutsel))
+	cmds = append(cmds, formatSPISend(oid, tmc2130MSLUTSTART, mslutstart))
+	cmds = append(cmds, formatSPISend(oid, tmc2130TPWMTHRS, 0x000FFFFF)) // default
+	cmds = append(cmds, formatSPISend(oid, tmc2130GCONF, 0))             // default
+	cmds = append(cmds, formatSPISend(oid, tmc2130TCOOLTHRS, 0))         // default
+	cmds = append(cmds, formatSPISend(oid, tmc2130THIGH, 0))             // default
+	cmds = append(cmds, formatSPISend(oid, tmc2130COOLCONF, 0))          // default
+	cmds = append(cmds, formatSPISend(oid, tmc2130PWMCONF, pwmconf))
+	cmds = append(cmds, formatSPISend(oid, tmc2130TPOWERDOWN, 0)) // default
+
+	return cmds
+}
+
+// CompileTMC2130CartesianConnectPhase compiles the connect-phase MCU command stream
+// for cartesian configs with TMC2130 stepper drivers (e.g., generic-einsy-rambo.cfg).
+func CompileTMC2130CartesianConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+	if err != nil {
+		return nil, err
+	}
+	adcMax, err := dictConfigFloat(dict, "ADC_MAX")
+	if err != nil {
+		return nil, err
+	}
+	mcuFreq := clockFreq
+
+	// Derived constants
+	const (
+		pwmCycleTime     = 0.100
+		fanCycleTime     = 0.010
+		heaterMaxHeatSec = 3.0
+		stepPulseSec     = 0.000002
+		adcSampleTime    = 0.001
+		adcSampleCount   = 8
+		adcReportTime    = 0.300
+		adcRangeChecks   = 4
+		pwmInitDelaySec  = 0.200
+	)
+	cycleTicks := secondsToClock(mcuFreq, pwmCycleTime)
+	fanCycleTicks := secondsToClock(mcuFreq, fanCycleTime)
+	mdurTicks := secondsToClock(mcuFreq, heaterMaxHeatSec)
+	// TMC2130 uses dedge mode (dual-edge stepping), so step_pulse_ticks=1
+	stepPulseTicks := 1
+	sampleTicks := secondsToClock(mcuFreq, adcSampleTime)
+	reportTicks := secondsToClock(mcuFreq, adcReportTime)
+	pwmInitClock := secondsToClock(mcuFreq, pwmInitDelaySec)
+
+	// Parse TMC2130 configs
+	tmcX, err := parseTMC2130(cfg, "stepper_x")
+	if err != nil {
+		return nil, err
+	}
+	tmcY, err := parseTMC2130(cfg, "stepper_y")
+	if err != nil {
+		return nil, err
+	}
+	tmcZ, err := parseTMC2130(cfg, "stepper_z")
+	if err != nil {
+		return nil, err
+	}
+	tmcE, err := parseTMC2130(cfg, "extruder")
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse stepper configs
+	stepperX, err := readStepper(cfg, "stepper_x")
+	if err != nil {
+		return nil, err
+	}
+	stepperY, err := readStepper(cfg, "stepper_y")
+	if err != nil {
+		return nil, err
+	}
+	stepperZ, err := readStepper(cfg, "stepper_z")
+	if err != nil {
+		return nil, err
+	}
+	extruder, err := readExtruder(cfg, "extruder")
+	if err != nil {
+		return nil, err
+	}
+	bed, err := readHeater(cfg, "heater_bed")
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for fan
+	fanSec, hasFan := cfg.sections["fan"]
+	var fanPin pin
+	if hasFan {
+		fanPin, err = parsePin(fanSec, "pin", true, false)
+		if err != nil {
+			return nil, fmt.Errorf("fan pin: %w", err)
+		}
+	}
+
+	// Check for temperature_sensor
+	var tempSensorPin string
+	for secName, secData := range cfg.sections {
+		if strings.HasPrefix(secName, "temperature_sensor ") {
+			if p, ok := secData["sensor_pin"]; ok {
+				tempSensorPin = strings.TrimSpace(p)
+				break
+			}
+		}
+	}
+
+	// Check for static_digital_output
+	var staticOutputPins []struct {
+		pin   string
+		value int
+	}
+	for secName, secData := range cfg.sections {
+		if strings.HasPrefix(secName, "static_digital_output ") {
+			if p, ok := secData["pins"]; ok {
+				pinStr := strings.TrimSpace(p)
+				invert := false
+				if strings.HasPrefix(pinStr, "!") {
+					invert = true
+					pinStr = pinStr[1:]
+				}
+				val := 0
+				if !invert {
+					val = 1
+				}
+				staticOutputPins = append(staticOutputPins, struct {
+					pin   string
+					value int
+				}{pinStr, val})
+			}
+		}
+	}
+
+	// OID allocation (matches Python)
+	// OID 0-3: SPI for TMC2130 (X, Y, Z, E)
+	// OID 4: endstop X
+	// OID 5: trsync X
+	// OID 6: stepper X
+	// OID 7: endstop Y
+	// OID 8: trsync Y
+	// OID 9: stepper Y
+	// OID 10: endstop Z
+	// OID 11: trsync Z
+	// OID 12: stepper Z
+	// OID 13: stepper E
+	// OID 14+: heaters, sensors, enables
+
+	oidSPI_X := 0
+	oidSPI_Y := 1
+	oidSPI_Z := 2
+	oidSPI_E := 3
+	oidEndstopX := 4
+	oidTrsyncX := 5
+	oidStepperX := 6
+	oidEndstopY := 7
+	oidTrsyncY := 8
+	oidStepperY := 9
+	oidEndstopZ := 10
+	oidTrsyncZ := 11
+	oidStepperZ := 12
+	oidStepperE := 13
+
+	nextOID := 14
+	oidADCBed := nextOID
+	nextOID++
+	oidPWMBed := nextOID
+	nextOID++
+
+	oidPWMFan := -1
+	if hasFan {
+		oidPWMFan = nextOID
+		nextOID++
+	}
+
+	oidADCTempSensor := -1
+	if tempSensorPin != "" {
+		oidADCTempSensor = nextOID
+		nextOID++
+	}
+
+	oidEnableX := nextOID
+	nextOID++
+	oidEnableY := nextOID
+	nextOID++
+	oidEnableZ := nextOID
+	nextOID++
+
+	oidADCE := nextOID
+	nextOID++
+	oidPWME := nextOID
+	nextOID++
+	oidEnableE := nextOID
+	nextOID++
+
+	totalOIDs := nextOID
+
+	// Build config commands
+	var configCmds []string
+
+	// SPI configs for TMC2130
+	if tmcX != nil {
+		configCmds = append(configCmds, fmt.Sprintf("config_spi oid=%d pin=%s cs_active_high=0", oidSPI_X, tmcX.csPin))
+	}
+	if tmcY != nil {
+		configCmds = append(configCmds, fmt.Sprintf("config_spi oid=%d pin=%s cs_active_high=0", oidSPI_Y, tmcY.csPin))
+	}
+	if tmcZ != nil {
+		configCmds = append(configCmds, fmt.Sprintf("config_spi oid=%d pin=%s cs_active_high=0", oidSPI_Z, tmcZ.csPin))
+	}
+	if tmcE != nil {
+		configCmds = append(configCmds, fmt.Sprintf("config_spi oid=%d pin=%s cs_active_high=0", oidSPI_E, tmcE.csPin))
+	}
+
+	// Static digital output (e.g., yellow LED)
+	for _, sop := range staticOutputPins {
+		configCmds = append(configCmds, fmt.Sprintf("set_digital_out pin=%s value=%d", sop.pin, sop.value))
+	}
+
+	// SPI bus setup
+	if tmcX != nil {
+		configCmds = append(configCmds, fmt.Sprintf("spi_set_bus oid=%d spi_bus=spi mode=3 rate=4000000", oidSPI_X))
+	}
+	if tmcY != nil {
+		configCmds = append(configCmds, fmt.Sprintf("spi_set_bus oid=%d spi_bus=spi mode=3 rate=4000000", oidSPI_Y))
+	}
+	if tmcZ != nil {
+		configCmds = append(configCmds, fmt.Sprintf("spi_set_bus oid=%d spi_bus=spi mode=3 rate=4000000", oidSPI_Z))
+	}
+	if tmcE != nil {
+		configCmds = append(configCmds, fmt.Sprintf("spi_set_bus oid=%d spi_bus=spi mode=3 rate=4000000", oidSPI_E))
+	}
+
+	// Heater bed
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", oidADCBed, bed.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=%d", oidPWMBed, bed.HeaterPin.pin, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", oidPWMBed, cycleTicks),
+	)
+
+	// Fan
+	if hasFan {
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=0", oidPWMFan, fanPin.pin),
+			fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", oidPWMFan, fanCycleTicks),
+		)
+	}
+
+	// Temperature sensor
+	if tempSensorPin != "" {
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_analog_in oid=%d pin=%s", oidADCTempSensor, tempSensorPin),
+		)
+	}
+
+	// Stepper X
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", oidEndstopX, stepperX.Endstop.pin, stepperX.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", oidTrsyncX),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperX, stepperX.Step.pin, stepperX.Dir.pin, boolToInt(stepperX.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=0",
+			oidEnableX, stepperX.Enable.pin, boolToInt(stepperX.Enable.invert), boolToInt(stepperX.Enable.invert)),
+	)
+
+	// Stepper Y
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", oidEndstopY, stepperY.Endstop.pin, stepperY.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", oidTrsyncY),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperY, stepperY.Step.pin, stepperY.Dir.pin, boolToInt(stepperY.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=0",
+			oidEnableY, stepperY.Enable.pin, boolToInt(stepperY.Enable.invert), boolToInt(stepperY.Enable.invert)),
+	)
+
+	// Stepper Z
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", oidEndstopZ, stepperZ.Endstop.pin, stepperZ.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", oidTrsyncZ),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperZ, stepperZ.Step.pin, stepperZ.Dir.pin, boolToInt(stepperZ.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=0",
+			oidEnableZ, stepperZ.Enable.pin, boolToInt(stepperZ.Enable.invert), boolToInt(stepperZ.Enable.invert)),
+	)
+
+	// Extruder heater/sensor
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", oidADCE, extruder.Heater.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=%d", oidPWME, extruder.Heater.HeaterPin.pin, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", oidPWME, cycleTicks),
+	)
+
+	// Extruder stepper
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperE, extruder.Step.pin, extruder.Dir.pin, boolToInt(extruder.Step.invert), stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=0",
+			oidEnableE, extruder.Enable.pin, boolToInt(extruder.Enable.invert), boolToInt(extruder.Enable.invert)),
+	)
+
+	// Build allocate_oids + config commands
+	withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", totalOIDs)}, configCmds...)
+
+	// Compute CRC
+	crcText := strings.Join(withAllocate, "\n")
+	crc := crc32.ChecksumIEEE([]byte(crcText))
+
+	// Build init commands
+	var initCmds []string
+
+	// ADC queries
+	bedMin, bedMax, err := thermistorMinMaxTicks(bed, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+	initCmds = append(initCmds,
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			oidADCBed, querySlotClock(mcuFreq, oidADCBed), sampleTicks, adcSampleCount, reportTicks, bedMin, bedMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", oidPWMBed, pwmInitClock),
+	)
+
+	if hasFan {
+		initCmds = append(initCmds,
+			fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", oidPWMFan, pwmInitClock),
+		)
+	}
+
+	if tempSensorPin != "" {
+		// Temperature sensor query - use different thermistor range
+		// For TDK NTCG104LH104JT1: min_temp=0, max_temp=50
+		// These correspond to different ADC values
+		tempMin := 7113  // approximate for 50C
+		tempMax := 8085  // approximate for 0C
+		initCmds = append(initCmds,
+			fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+				oidADCTempSensor, querySlotClock(mcuFreq, oidADCTempSensor), sampleTicks, adcSampleCount, reportTicks, tempMin, tempMax, adcRangeChecks),
+		)
+	}
+
+	extMin, extMax, err := thermistorMinMaxTicks(extruder.Heater, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+	initCmds = append(initCmds,
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			oidADCE, querySlotClock(mcuFreq, oidADCE), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", oidPWME, pwmInitClock),
+	)
+
+	// TMC2130 init commands (spi_send)
+	if tmcX != nil {
+		initCmds = append(initCmds, generateTMC2130InitCommands(oidSPI_X, tmcX)...)
+	}
+	if tmcY != nil {
+		initCmds = append(initCmds, generateTMC2130InitCommands(oidSPI_Y, tmcY)...)
+	}
+	if tmcZ != nil {
+		initCmds = append(initCmds, generateTMC2130InitCommands(oidSPI_Z, tmcZ)...)
+	}
+	if tmcE != nil {
+		initCmds = append(initCmds, generateTMC2130InitCommands(oidSPI_E, tmcE)...)
+	}
+
+	// Build final output
+	out := make([]string, 0)
+	out = append(out, withAllocate...)
+	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+	out = append(out, initCmds...)
+	return out, nil
+}

@@ -241,14 +241,8 @@ func reprBytes(b []byte) string {
             sb.WriteString("\\r")
         case '\t':
             sb.WriteString("\\t")
-        case '\a':
-            sb.WriteString("\\a")
-        case '\b':
-            sb.WriteString("\\b")
-        case '\f':
-            sb.WriteString("\\f")
-        case '\v':
-            sb.WriteString("\\v")
+        // Note: Python uses \x08, \x07, \x0c, \x0b for \b, \a, \f, \v
+        // so we don't handle those specially - they fall through to hex format
         case '\\':
             sb.WriteString("\\\\")
         default:

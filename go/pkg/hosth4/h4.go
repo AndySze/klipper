@@ -213,9 +213,23 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 	} else if kin == "cartesian" {
 		// Check for dual_carriage section
 		_, hasDualCarriage := cfg.section("dual_carriage")
+		// Check for TMC2130 sections
+		hasTMC2130 := false
+		for secName := range cfg.sections {
+			if strings.HasPrefix(secName, "tmc2130 ") {
+				hasTMC2130 = true
+				break
+			}
+		}
 		if hasDualCarriage {
 			// Use cartesian dual_carriage connect-phase compiler
 			initLines, err = hosth1.CompileCartesianDualCarriageConnectPhase(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		} else if hasTMC2130 && hasBedHeater {
+			// Use TMC2130 cartesian connect-phase compiler for configs with TMC drivers
+			initLines, err = hosth1.CompileTMC2130CartesianConnectPhase(cfgPath, dict)
 			if err != nil {
 				return nil, err
 			}
@@ -332,7 +346,9 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 			return nil, fmt.Errorf("failed to open gcode file %s: %w", gcodeFilePath, err)
 		}
 		gs := bufio.NewScanner(gf)
+		lineNum := 0
 		for gs.Scan() {
+			lineNum++
 			raw := gs.Text()
 			if idx := strings.IndexByte(raw, ';'); idx >= 0 {
 				raw = raw[:idx]
@@ -341,6 +357,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 			if line == "" {
 				continue
 			}
+			rt.tracef("GCODE[%d]: %s\n", lineNum, line)
 			if err := execGCodeWithMacros(rt, macros, line, 0); err != nil {
 				if shouldFail {
 					didFail = true
@@ -372,6 +389,10 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 			return nil, fmt.Errorf("expected failure but test completed successfully")
 		}
 	} else {
+		// Flush any remaining moves in the lookahead queue
+		if err := rt.toolhead.flushLookahead(false); err != nil {
+			return nil, err
+		}
 		for i := 0; i < 10000; i++ {
 			didWork, err := rt.motion.flushHandlerDebugOnce()
 			if err != nil {
