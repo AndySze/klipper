@@ -44,6 +44,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"out_of_bounds.cfg":                true,
 		"macros.cfg":                       true,
 		"bltouch.cfg":                      true,
+		"input_shaper.cfg":                 true,
 		"screws_tilt_adjust.cfg":           true,
 		"delta_calibrate.cfg":              true,
 		"load_cell.cfg":                    true,
@@ -53,6 +54,7 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"hybrid_corexy_dual_carriage.cfg":  true,
 		"dual_carriage.cfg":                true,
 		"rotary_delta_calibrate.cfg":       true,
+		"temperature.cfg":                  true,
 		// Generic board configs for MCU architecture tests
 		"generic-mightyboard.cfg":                  true, // atmega1280
 		"generic-melzi.cfg":                        true, // atmega1284p
@@ -221,7 +223,23 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 				break
 			}
 		}
-		if hasDualCarriage {
+		// Check for accelerometer sections (adxl345, mpu9250)
+		_, hasADXL345 := cfg.section("adxl345")
+		hasMPU9250 := false
+		for secName := range cfg.sections {
+			if secName == "mpu9250" || strings.HasPrefix(secName, "mpu9250 ") {
+				hasMPU9250 = true
+				break
+			}
+		}
+		hasAccelerometer := hasADXL345 || hasMPU9250
+		if hasAccelerometer && hasBedHeater {
+			// Use input shaper connect-phase compiler for configs with accelerometers
+			initLines, err = hosth1.CompileInputShaperConnectPhase(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		} else if hasDualCarriage {
 			// Use cartesian dual_carriage connect-phase compiler
 			initLines, err = hosth1.CompileCartesianDualCarriageConnectPhase(cfgPath, dict)
 			if err != nil {
