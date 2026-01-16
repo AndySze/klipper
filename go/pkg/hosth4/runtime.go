@@ -794,6 +794,25 @@ func (th *toolhead) move(newPos []float64, speed float64) error {
 	return nil
 }
 
+// manualMove performs a move without kinematic range checking.
+// This is used during manual calibration procedures like PROBE_CALIBRATE/TESTZ.
+func (th *toolhead) manualMove(newPos []float64, speed float64) error {
+	if th.err != nil {
+		return th.err
+	}
+	mv := newMove(th, th.commandedPos, newPos, speed)
+	if mv.moveD == 0.0 {
+		return nil
+	}
+	// Skip kinematic range checking entirely for manual moves
+	// Speed is already limited by the caller (typically 5mm/s for calibration)
+	th.commandedPos = append([]float64{}, mv.endPos...)
+	if th.lookahead.addMove(mv) {
+		return th.processLookahead(true)
+	}
+	return nil
+}
+
 // dripLoadTrapQ loads moves into the trapq for drip mode execution.
 // Returns (startTime, preDecelTime, endTime, error) where preDecelTime is the
 // end of the cruise phase (when deceleration starts).
@@ -1898,6 +1917,10 @@ type runtime struct {
 
 	// Probe system
 	probe *Probe
+	// Simple probe endstop (for configs with [probe] but not [bltouch])
+	// When set, Z homing uses this endstop without servo operations
+	simpleProbeEndstop *endstop
+	probeCalibrating   bool // True during PROBE_CALIBRATE mode
 
 	// TMC drivers (keyed by stepper name)
 	tmcDrivers map[string]interface{}
@@ -2253,6 +2276,17 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	_, hasBLTouch := cfg.section("bltouch")
 	_, hasFan := cfg.section("fan")
 
+	// Detect simple probe (non-BLTouch) with z_virtual_endstop
+	hasSimpleProbe := false
+	if _, hasProbe := cfg.section("probe"); hasProbe && !hasBLTouch {
+		if stepperZSec, ok := cfg.section("stepper_z"); ok {
+			endstopPin := stepperZSec["endstop_pin"]
+			if strings.Contains(strings.ToLower(endstopPin), "probe:z_virtual_endstop") {
+				hasSimpleProbe = true
+			}
+		}
+	}
+
 	// Detect filament sensors (buttons) - only relevant to the
 	// extruder_stepper connect-phase compiler.
 	hasButtons := false
@@ -2291,8 +2325,8 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	oidTrsyncX := uint32(1)
 	oidTrsyncY := uint32(4)
 	oidTrsyncZ := uint32(7)
-	if hasBLTouch {
-		// Match bltouch.cfg expected OID layout:
+	if hasBLTouch || hasSimpleProbe {
+		// Match probe-based Z homing OID layout (bltouch.cfg / z_virtual_endstop.cfg):
 		// - probe endstop=0 trsync=1, z stepper=8
 		// - X: endstop=2 trsync=3 stepper=4
 		// - Y: endstop=5 trsync=6 stepper=7
@@ -3098,6 +3132,24 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	if _, ok := cfg.section("bltouch"); ok {
 		pwm := newDigitalOut(12, false, sq, cqMain, formats, mcuFreq, "mcu")
 		rt.bltouch = newBLTouchController(rt, pwm, rt.endstops[2])
+	} else if _, hasProbe := cfg.section("probe"); hasProbe {
+		// Simple probe (not BLTouch) - check if Z uses probe:z_virtual_endstop
+		if stepperZSec, ok := cfg.section("stepper_z"); ok {
+			endstopPin := stepperZSec["endstop_pin"]
+			if strings.Contains(strings.ToLower(endstopPin), "probe:z_virtual_endstop") {
+				// Z uses probe as endstop - create a simple probe endstop
+				// The probe endstop is at OID 0, trsync at OID 1 (allocated first in CompileProbeConnectPhase)
+				probeTrsync := &trsync{oid: 1, rt: rt, mcuFreq: mcuFreq}
+				rt.simpleProbeEndstop = &endstop{
+					oid:        0, // probe endstop OID
+					stepperOID: oidStepperZ,
+					tr:         probeTrsync,
+					rt:         rt,
+					mcuFreq:    mcuFreq,
+				}
+				rt.tracef("Initialized simple probe endstop for Z homing (endstop OID=0, trsync OID=1)\n")
+			}
+		}
 	}
 
 	// Initialize screws_tilt_adjust if configured
@@ -5316,7 +5368,23 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 	case "QUERY_PROBE":
 		// Klippy prints probe state; no MCU output required in golden mode.
 		return nil
+	case "PROBE_CALIBRATE":
+		if err := r.cmdProbeCalibrate(cmd.Args); err != nil {
+			return err
+		}
+	case "TESTZ":
+		if err := r.cmdTestZ(cmd.Args); err != nil {
+			return err
+		}
 	case "ACCEPT", "ADJUSTED", "ABORT":
+		// Handle probe calibration mode
+		if r.probeCalibrating {
+			if cmd.Name == "ACCEPT" || cmd.Name == "ABORT" {
+				r.probeCalibrating = false
+			}
+			// No MCU output needed - just state tracking
+			return nil
+		}
 		// Dynamic commands for bed_screws tool
 		if r.bedScrews == nil {
 			return fmt.Errorf("bed_screws not configured for %s", cmd.Name)
@@ -5432,15 +5500,18 @@ func (r *runtime) toolheadMoveXYZ(x, y, z float64, speed float64) error {
 }
 
 func (r *runtime) runSingleProbe(probeSpeed float64) error {
-	if r.bltouch == nil {
+	if r.bltouch == nil && r.simpleProbeEndstop == nil {
 		return fmt.Errorf("probe not configured")
 	}
-	if err := r.bltouch.lowerProbe(); err != nil {
-		return err
-	}
-	// Match Klippy: probe_prepare syncs time after lowering.
-	if err := r.bltouch.syncPrintTime(); err != nil {
-		return err
+	// BLTouch needs servo control to deploy probe
+	if r.bltouch != nil {
+		if err := r.bltouch.lowerProbe(); err != nil {
+			return err
+		}
+		// Match Klippy: probe_prepare syncs time after lowering.
+		if err := r.bltouch.syncPrintTime(); err != nil {
+			return err
+		}
 	}
 	// probing_move targets the configured z_min position
 	target := append([]float64{}, r.toolhead.commandedPos...)
@@ -5448,16 +5519,19 @@ func (r *runtime) runSingleProbe(probeSpeed float64) error {
 	if err := r.homingMove(2, target, probeSpeed); err != nil {
 		return err
 	}
-	// Match BLTouch behavior for stow_on_each_sample=True (default).
-	if err := r.bltouch.raiseProbe(); err != nil {
-		return err
-	}
-	if err := r.bltouch.verifyRaiseProbe(); err != nil {
-		return err
-	}
-	// Match Klippy: probe_finish syncs time after verifying raise.
-	if err := r.bltouch.syncPrintTime(); err != nil {
-		return err
+	// BLTouch needs servo control to retract probe
+	if r.bltouch != nil {
+		// Match BLTouch behavior for stow_on_each_sample=True (default).
+		if err := r.bltouch.raiseProbe(); err != nil {
+			return err
+		}
+		if err := r.bltouch.verifyRaiseProbe(); err != nil {
+			return err
+		}
+		// Match Klippy: probe_finish syncs time after verifying raise.
+		if err := r.bltouch.syncPrintTime(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -5750,6 +5824,86 @@ func (r *runtime) cmdProbeAccuracy(args map[string]string) error {
 
 	r.tracef("probe accuracy results: maximum %.6f, minimum %.6f, range %.6f, average %.6f, median %.6f, standard deviation %.6f\n",
 		result.Maximum, result.Minimum, result.Range, result.Average, result.Median, result.StdDev)
+
+	return nil
+}
+
+// cmdProbeCalibrate starts the manual Z offset calibration procedure.
+// PROBE_CALIBRATE [SPEED=<speed>]
+func (r *runtime) cmdProbeCalibrate(args map[string]string) error {
+	if r.bltouch == nil && r.simpleProbeEndstop == nil {
+		return fmt.Errorf("probe not configured")
+	}
+
+	// Get probe speed (default 5mm/s)
+	probeSpeed := 5.0
+	if raw := strings.TrimSpace(args["SPEED"]); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("bad SPEED=%q", raw)
+		}
+		probeSpeed = v
+	}
+
+	// Run probe to find the bed
+	if err := r.runSingleProbe(probeSpeed); err != nil {
+		return err
+	}
+
+	// Enter calibration mode - TESTZ commands can now adjust Z position
+	r.probeCalibrating = true
+	r.tracef("PROBE_CALIBRATE: entered calibration mode at Z=%.3f\n", r.toolhead.commandedPos[2])
+
+	return nil
+}
+
+// cmdTestZ adjusts Z position during manual probe calibration.
+// TESTZ Z=<adjustment>
+// Supports: Z=-.1, Z=+.1, Z=++, Z=--, Z=+, Z=-
+func (r *runtime) cmdTestZ(args map[string]string) error {
+	if !r.probeCalibrating {
+		return fmt.Errorf("TESTZ outside of manual probe command")
+	}
+
+	zArg := strings.TrimSpace(args["Z"])
+	if zArg == "" {
+		return fmt.Errorf("TESTZ requires Z parameter")
+	}
+
+	// Parse the Z adjustment
+	var adjustment float64
+	switch zArg {
+	case "++":
+		// Larger up movement (typically 1mm)
+		adjustment = 1.0
+	case "--":
+		// Larger down movement
+		adjustment = -1.0
+	case "+":
+		// Small up movement (typically 0.05mm)
+		adjustment = 0.05
+	case "-":
+		// Small down movement
+		adjustment = -0.05
+	default:
+		// Parse as float
+		v, err := strconv.ParseFloat(zArg, 64)
+		if err != nil {
+			return fmt.Errorf("bad Z=%q", zArg)
+		}
+		adjustment = v
+	}
+
+	// Move Z by the adjustment amount
+	target := append([]float64{}, r.toolhead.commandedPos...)
+	target[2] += adjustment
+
+	r.tracef("TESTZ: adjusting Z by %.3f to %.3f\n", adjustment, target[2])
+
+	// Use slow speed for TESTZ moves - bypass range checking during calibration
+	if err := r.toolhead.manualMove(target, 5.0); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -6278,8 +6432,11 @@ func (r *runtime) homeAxis(axis int) error {
 			r.steppers[i].setPosition(forcepos[0], forcepos[1], forcepos[2])
 		}
 	}
-	isProbeZ := axis == 2 && strings.ToLower(rail.endstopPin.chip) == "probe" && r.bltouch != nil
-	if isProbeZ {
+	// Detect probe-based Z homing (BLTouch or simple probe)
+	isProbeZ := axis == 2 && strings.ToLower(rail.endstopPin.chip) == "probe" && (r.bltouch != nil || r.simpleProbeEndstop != nil)
+	isBLTouchProbeZ := isProbeZ && r.bltouch != nil
+	if isBLTouchProbeZ {
+		// BLTouch needs servo control to deploy probe
 		if err := r.bltouch.lowerProbe(); err != nil {
 			return err
 		}
@@ -6290,7 +6447,8 @@ func (r *runtime) homeAxis(axis int) error {
 	if err := r.homingMove(axis, homepos, rail.homingSpeed); err != nil {
 		return err
 	}
-	if isProbeZ {
+	if isBLTouchProbeZ {
+		// BLTouch needs servo control to retract probe
 		if err := r.bltouch.raiseProbe(); err != nil {
 			return err
 		}
@@ -6345,7 +6503,8 @@ func (r *runtime) homeAxis(axis int) error {
 			r.steppers[i].setPosition(start2pos[0], start2pos[1], start2pos[2])
 		}
 	}
-	if isProbeZ {
+	if isBLTouchProbeZ {
+		// BLTouch needs servo control to deploy probe for second homing pass
 		if err := r.bltouch.lowerProbe(); err != nil {
 			return err
 		}
@@ -6356,7 +6515,8 @@ func (r *runtime) homeAxis(axis int) error {
 	if err := r.homingMove(axis, homepos, rail.secondHomingSpeed); err != nil {
 		return err
 	}
-	if isProbeZ {
+	if isBLTouchProbeZ {
+		// BLTouch needs servo control to retract probe
 		if err := r.bltouch.raiseProbe(); err != nil {
 			return err
 		}

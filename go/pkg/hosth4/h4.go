@@ -55,6 +55,13 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		"dual_carriage.cfg":                true,
 		"rotary_delta_calibrate.cfg":       true,
 		"temperature.cfg":                  true,
+		"led.cfg":                          true,
+		"manual_stepper.cfg":               true,
+		"multi_z.cfg":                      true,
+		"pwm.cfg":                          true,
+		"z_tilt.cfg":                       true,
+		"tmc.cfg":                          true,
+		"z_virtual_endstop.cfg":            true,
 		// Generic board configs for MCU architecture tests
 		"generic-mightyboard.cfg":                  true, // atmega1280
 		"generic-melzi.cfg":                        true, // atmega1284p
@@ -250,6 +257,21 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 			initLines, err = hosth1.CompileTMC2130CartesianConnectPhase(cfgPath, dict)
 			if err != nil {
 				return nil, err
+			}
+		} else if _, hasProbe := cfg.section("probe"); hasProbe && hasBedHeater {
+			// Use probe-based connect-phase compiler for configs with [probe] and probe:z_virtual_endstop
+			_, hasBLTouch := cfg.section("bltouch")
+			if !hasBLTouch {
+				initLines, err = hosth1.CompileProbeConnectPhase(cfgPath, dict)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				// BLTouch is handled by CompileBLTouchConnectPhase above
+				initLines, err = hosth1.CompileExampleCartesianConnectPhase(cfgPath, dict)
+				if err != nil {
+					return nil, err
+				}
 			}
 		} else if hasBedHeater {
 			// Use the full connect-phase compiler for configs with heater_bed
