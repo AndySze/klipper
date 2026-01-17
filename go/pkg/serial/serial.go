@@ -163,7 +163,7 @@ func Open(cfg Config) (*Port, error) {
 	termios.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
 
 	// Set baud rate
-	speed, err := baudRateToSpeed(cfg.BaudRate)
+	speed, customBaud, err := baudRateToSpeed(cfg.BaudRate)
 	if err != nil {
 		unix.Close(fd)
 		return nil, err
@@ -178,6 +178,14 @@ func Open(cfg Config) (*Port, error) {
 	if err := unix.IoctlSetTermios(fd, ioctlSetTermios, &termios); err != nil {
 		unix.Close(fd)
 		return nil, fmt.Errorf("serial: set termios: %w", err)
+	}
+
+	// On macOS, set custom baud rate using IOSSIOSPEED if needed
+	if customBaud > 0 && runtime.GOOS == "darwin" {
+		if err := setCustomBaudRate(fd, customBaud); err != nil {
+			unix.Close(fd)
+			return nil, fmt.Errorf("serial: set custom baud rate: %w", err)
+		}
 	}
 
 	// Clear non-blocking flag after configuration
@@ -377,8 +385,18 @@ func (p *Port) SendBreak() error {
 	return unix.IoctlSetInt(fd, ioctlTCSBrk, 0)
 }
 
+// setCustomBaudRate sets a custom baud rate on macOS using IOSSIOSPEED.
+func setCustomBaudRate(fd int, baud int) error {
+	// IOSSIOSPEED is macOS-specific ioctl for setting custom baud rates
+	// Value: 0x80045402 (_IOW('T', 2, speed_t))
+	const IOSSIOSPEED = 0x80045402
+	speed := uint32(baud)
+	return unix.IoctlSetPointerInt(fd, IOSSIOSPEED, int(speed))
+}
+
 // baudRateToSpeed converts a baud rate to a speed constant.
-func baudRateToSpeed(baud int) (uint32, error) {
+// Returns (speed, customBaud, error) where customBaud > 0 means use IOSSIOSPEED on macOS.
+func baudRateToSpeed(baud int) (uint32, int, error) {
 	speeds := map[int]uint32{
 		50:      unix.B50,
 		75:      unix.B75,
@@ -419,16 +437,22 @@ func baudRateToSpeed(baud int) (uint32, error) {
 	}
 
 	if speed, ok := speeds[baud]; ok {
-		return speed, nil
+		return speed, 0, nil
 	}
 
 	// For non-standard baud rates on Linux, we can try to set it directly
 	if runtime.GOOS == "linux" {
 		// Use BOTHER to set arbitrary baud rate
-		return 0x1000 | uint32(baud), nil // BOTHER
+		return 0x1000 | uint32(baud), 0, nil // BOTHER
 	}
 
-	return 0, fmt.Errorf("serial: unsupported baud rate %d", baud)
+	// For macOS, use a standard rate then set custom via IOSSIOSPEED
+	if runtime.GOOS == "darwin" {
+		// Use 9600 as base, then set custom baud rate
+		return unix.B9600, baud, nil
+	}
+
+	return 0, 0, fmt.Errorf("serial: unsupported baud rate %d", baud)
 }
 
 // Detect attempts to detect and open an MCU on any available port.
