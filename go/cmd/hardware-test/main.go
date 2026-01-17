@@ -8,18 +8,32 @@
 //
 // Options:
 //
-//	-device string    Serial device path (required)
+//	-device string    Serial device path (required, or use -config)
+//	-config string    Printer config file (optional, extracts device from [mcu] section)
 //	-baud int         Baud rate (default: 250000)
 //	-timeout duration Connection timeout (default: 60s)
 //	-trace            Enable debug tracing
-//	-test string      Test to run: "connect", "clock", "temp", "all" (default: "connect")
+//	-test string      Test to run: "connect", "clock", "temp", "query", "all" (default: "connect")
+//
+// Examples:
+//
+//	# Basic connection test with device path
+//	hardware-test -device /dev/ttyUSB0 -test connect
+//
+//	# Use printer.cfg to get device path
+//	hardware-test -config ~/printer.cfg -test connect
+//
+//	# Query MCU capabilities
+//	hardware-test -device /dev/ttyUSB0 -test query -trace
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,15 +43,33 @@ import (
 func main() {
 	// Command line flags
 	device := flag.String("device", "", "Serial device path (e.g., /dev/ttyUSB0)")
+	configFile := flag.String("config", "", "Printer config file (optional)")
 	baud := flag.Int("baud", 250000, "Baud rate")
 	timeout := flag.Duration("timeout", 60*time.Second, "Connection timeout")
 	trace := flag.Bool("trace", false, "Enable debug tracing")
-	test := flag.String("test", "connect", "Test to run: connect, clock, temp, all")
+	test := flag.String("test", "connect", "Test to run: connect, clock, temp, query, all")
 
 	flag.Parse()
 
+	// If config file provided, extract device from it
+	if *configFile != "" && *device == "" {
+		extractedDevice, extractedBaud, err := parseConfigFile(*configFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing config: %v\n", err)
+			os.Exit(1)
+		}
+		if extractedDevice != "" {
+			*device = extractedDevice
+			fmt.Printf("Using device from config: %s\n", *device)
+		}
+		if extractedBaud > 0 && *baud == 250000 {
+			*baud = extractedBaud
+			fmt.Printf("Using baud rate from config: %d\n", *baud)
+		}
+	}
+
 	if *device == "" {
-		fmt.Fprintf(os.Stderr, "Error: -device is required\n")
+		fmt.Fprintf(os.Stderr, "Error: -device is required (or provide -config with [mcu] section)\n")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -77,6 +109,8 @@ func main() {
 		err = testClock(ri, *timeout)
 	case "temp":
 		err = testTemp(ri, *timeout)
+	case "query":
+		err = testQuery(ri, *timeout)
 	case "all":
 		err = testAll(ri, *timeout)
 	default:
@@ -230,4 +264,97 @@ func testAll(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 	}
 
 	return nil
+}
+
+// testQuery queries and displays MCU capabilities from the data dictionary.
+func testQuery(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
+	fmt.Println("=== Test: Query MCU Capabilities ===")
+
+	// Connect to MCU
+	fmt.Println("Connecting to MCU...")
+	if err := ri.Connect(); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer ri.Disconnect()
+
+	// Wait for ready
+	if err := ri.WaitReady(timeout); err != nil {
+		return fmt.Errorf("wait ready: %w", err)
+	}
+
+	// Get MCU info
+	mgr := ri.MCUManager()
+	mcu := mgr.PrimaryMCU()
+	if mcu == nil {
+		return fmt.Errorf("no primary MCU")
+	}
+
+	fmt.Println("\n--- MCU Information ---")
+	fmt.Printf("MCU Frequency: %.0f Hz\n", mcu.MCUFreq())
+	fmt.Printf("Connected: %v\n", mcu.IsConnected())
+
+	// Get status
+	status := ri.GetStatus()
+	fmt.Printf("\nStatus: %v\n", status)
+
+	fmt.Println("\nNote: Full command list is available in the MCU's data dictionary.")
+	fmt.Println("      Use -trace flag to see the dictionary during connection.")
+
+	return nil
+}
+
+// parseConfigFile extracts MCU serial device from a Klipper printer.cfg file.
+func parseConfigFile(path string) (device string, baud int, err error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	inMCUSection := false
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip comments and empty lines
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Check for section headers
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section := strings.ToLower(strings.Trim(line, "[]"))
+			inMCUSection = (section == "mcu")
+			continue
+		}
+
+		// Parse settings in [mcu] section
+		if inMCUSection {
+			if strings.HasPrefix(line, "serial:") || strings.HasPrefix(line, "serial =") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) < 2 {
+					parts = strings.SplitN(line, "=", 2)
+				}
+				if len(parts) == 2 {
+					device = strings.TrimSpace(parts[1])
+				}
+			}
+			if strings.HasPrefix(line, "baud:") || strings.HasPrefix(line, "baud =") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) < 2 {
+					parts = strings.SplitN(line, "=", 2)
+				}
+				if len(parts) == 2 {
+					fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &baud)
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", 0, err
+	}
+
+	return device, baud, nil
 }
