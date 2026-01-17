@@ -3,7 +3,7 @@ package protocol
 import "testing"
 
 func TestCRC16CCITT_KnownVector(t *testing.T) {
-    // msgproto.py's crc16_ccitt bitwise algorithm.
+    // Klipper's optimized CRC-CCITT algorithm (matches crc16_ccitt.c and msgproto.py)
     hi, lo := CRC16CCITT([]byte("123456789"))
     got := uint16(hi)<<8 | uint16(lo)
     const want uint16 = 0x6f91
