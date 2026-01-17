@@ -50,6 +50,12 @@ func NewFromConfig(cfg Config) (Kinematics, error) {
 	case "polar":
 		return NewPolarKinematics(cfg.Rails, cfg.MaxZVelocity, cfg.MaxZAccel), nil
 
+	case "hybrid_corexy":
+		return NewHybridCoreXYKinematics(cfg.Rails, cfg.MaxZVelocity, cfg.MaxZAccel), nil
+
+	case "hybrid_corexz":
+		return NewHybridCoreXZKinematics(cfg.Rails, cfg.MaxZVelocity, cfg.MaxZAccel), nil
+
 	case "deltesian":
 		// Deltesian uses similar bounds checking to cartesian
 		// The actual stepper kinematics are handled separately via chelper
@@ -259,7 +265,8 @@ func LoadFromPrinterConfig(printerCfg map[string]map[string]string) (Kinematics,
 func IsSupported(kinType string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(kinType))
 	switch normalized {
-	case "cartesian", "corexy", "corexz", "delta", "deltesian", "polar", "winch":
+	case "cartesian", "corexy", "corexz", "delta", "deltesian", "polar", "winch",
+		"hybrid_corexy", "hybrid_corexz":
 		return true
 	default:
 		return false
@@ -268,5 +275,6 @@ func IsSupported(kinType string) bool {
 
 // SupportedTypes returns a list of supported kinematic types.
 func SupportedTypes() []string {
-	return []string{"cartesian", "corexy", "corexz", "delta", "deltesian", "polar", "winch"}
+	return []string{"cartesian", "corexy", "corexz", "delta", "deltesian", "polar", "winch",
+		"hybrid_corexy", "hybrid_corexz"}
 }
