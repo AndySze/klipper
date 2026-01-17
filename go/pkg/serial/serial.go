@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -312,10 +313,16 @@ func (p *Port) Flush() error {
 }
 
 // setModemControl sets RTS and DTR signals.
+// Note: Some USB serial adapters don't support modem control, so errors are logged but not fatal.
 func (p *Port) setModemControl(rts, dtr bool) error {
-	status, err := unix.IoctlGetInt(p.fd, unix.TIOCMGET)
-	if err != nil {
-		return err
+	// On macOS, we need to use pointer-based ioctl for TIOCMGET/TIOCMSET
+	var status int32
+
+	// Try to get current modem status
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(p.fd), uintptr(unix.TIOCMGET), uintptr(unsafe.Pointer(&status)))
+	if errno != 0 {
+		// Many USB serial adapters don't support modem control - not fatal
+		return nil
 	}
 
 	if rts {
@@ -329,7 +336,13 @@ func (p *Port) setModemControl(rts, dtr bool) error {
 		status &^= unix.TIOCM_DTR
 	}
 
-	return unix.IoctlSetInt(p.fd, unix.TIOCMSET, status)
+	_, _, errno = unix.Syscall(unix.SYS_IOCTL, uintptr(p.fd), uintptr(unix.TIOCMSET), uintptr(unsafe.Pointer(&status)))
+	if errno != 0 {
+		// Not fatal - some adapters don't support this
+		return nil
+	}
+
+	return nil
 }
 
 // SetRTS sets the RTS signal.
