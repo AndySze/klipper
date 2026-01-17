@@ -42,6 +42,10 @@ type MCUConnectionConfig struct {
 	ClockSyncInterval time.Duration // Default: 100ms
 	ClockSyncSamples  int           // Default: 8
 
+	// ResetOnConnect toggles DTR to reset the MCU before handshake (default: true)
+	// This is needed if the MCU may be in a previously-configured state
+	ResetOnConnect bool
+
 	// Debugging
 	Trace io.Writer
 }
@@ -51,10 +55,11 @@ func DefaultMCUConnectionConfig() MCUConnectionConfig {
 	return MCUConnectionConfig{
 		BaudRate:          250000,
 		ConnectTimeout:    60 * time.Second,
-		HandshakeTimeout:  5 * time.Second,
-		ResponseTimeout:   2 * time.Second,
+		HandshakeTimeout:  15 * time.Second, // Allow time for reset, drain, and identify
+		ResponseTimeout:   2 * time.Second, // Match testSerial timeout
 		ClockSyncInterval: 100 * time.Millisecond,
 		ClockSyncSamples:  8,
+		ResetOnConnect:    false, // Disable reset - may cause issues with some serial adapters
 	}
 }
 
@@ -105,9 +110,16 @@ type MCUConnection struct {
 	cmdSeq     uint8
 	cmdSeqLock sync.Mutex
 
-	// Pending responses
-	pendingMu sync.Mutex
-	pending   map[uint8]chan *mcupkg.Message
+	// Pending responses - indexed by response name
+	pendingMu       sync.Mutex
+	pending         map[uint8]chan *mcupkg.Message // legacy: by seq
+	pendingByName   map[string]pendingResp         // by response name
+}
+
+// pendingResp tracks a pending response request
+type pendingResp struct {
+	oid      *int                   // Expected OID (nil for any)
+	respChan chan *mcupkg.Message
 }
 
 // clockSample records a single clock synchronization measurement.
@@ -133,14 +145,15 @@ type MCUMessageHandler func(params map[string]interface{}, receiveTime time.Time
 func NewMCUConnection(name string, cfg MCUConnectionConfig) *MCUConnection {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &MCUConnection{
-		name:        name,
-		config:      cfg,
-		handlers:    make(map[string]MCUMessageHandler),
-		oidHandlers: make(map[int]map[string]MCUMessageHandler),
-		ctx:         ctx,
-		cancel:      cancel,
-		cmdQueue:    make(chan mcuCmd, 100),
-		pending:     make(map[uint8]chan *mcupkg.Message),
+		name:          name,
+		config:        cfg,
+		handlers:      make(map[string]MCUMessageHandler),
+		oidHandlers:   make(map[int]map[string]MCUMessageHandler),
+		ctx:           ctx,
+		cancel:        cancel,
+		cmdQueue:      make(chan mcuCmd, 100),
+		pending:       make(map[uint8]chan *mcupkg.Message),
+		pendingByName: make(map[string]pendingResp),
 	}
 }
 
@@ -152,9 +165,8 @@ func NewMCUConnection(name string, cfg MCUConnectionConfig) *MCUConnection {
 // 4. Clock synchronization initialization
 func (mc *MCUConnection) Connect() error {
 	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
 	if mc.connected {
+		mc.mu.Unlock()
 		return nil // Already connected
 	}
 
@@ -182,6 +194,7 @@ func (mc *MCUConnection) Connect() error {
 	handshakeCfg := mcupkg.DefaultHandshakeConfig()
 	handshakeCfg.Timeout = mc.config.HandshakeTimeout
 	handshakeCfg.Trace = mc.config.Trace
+	handshakeCfg.ResetBeforeIdentify = mc.config.ResetOnConnect
 	identifyData, err := mcupkg.Handshake(port, handshakeCfg)
 	if err != nil {
 		port.Close()
@@ -223,13 +236,19 @@ func (mc *MCUConnection) Connect() error {
 	mc.wg.Add(1)
 	go mc.clockSyncLoop()
 
+	// Release lock before waiting for clock sync to avoid deadlock
+	// (encodeCommand needs RLock)
+	mc.mu.Unlock()
+
 	// Wait for initial clock sync
 	if err := mc.waitForClockSync(mc.config.HandshakeTimeout); err != nil {
-		mc.disconnectLocked()
+		mc.Disconnect() // Use public method since we don't hold lock
 		return fmt.Errorf("mcu %s: clock sync: %w", mc.name, err)
 	}
 
+	mc.mu.Lock()
 	mc.connected = true
+	mc.mu.Unlock()
 	mc.tracef("MCU %s: Connected successfully\n", mc.name)
 
 	return nil
@@ -451,10 +470,14 @@ func (mc *MCUConnection) sendCommandDirect(cmd mcuCmd) {
 	mc.cmdSeq = (mc.cmdSeq + 1) & protocol.MESSAGE_SEQ_MASK
 	mc.cmdSeqLock.Unlock()
 
-	// If expecting a response, register pending
+	// If expecting a response, register pending by name
 	if cmd.response != "" && cmd.respChan != nil {
 		mc.pendingMu.Lock()
 		mc.pending[seq] = cmd.respChan
+		mc.pendingByName[cmd.response] = pendingResp{
+			oid:      cmd.oid,
+			respChan: cmd.respChan,
+		}
 		mc.pendingMu.Unlock()
 
 		// Set up timeout cleanup
@@ -465,6 +488,7 @@ func (mc *MCUConnection) sendCommandDirect(cmd mcuCmd) {
 				delete(mc.pending, seq)
 				close(ch)
 			}
+			delete(mc.pendingByName, cmd.response)
 			mc.pendingMu.Unlock()
 		}()
 	}
@@ -478,11 +502,14 @@ func (mc *MCUConnection) sendCommandDirect(cmd mcuCmd) {
 
 // encodeCommand encodes a command with parameters.
 func (mc *MCUConnection) encodeCommand(cmdName string, params map[string]interface{}) ([]byte, error) {
+	mc.tracef("MCU %s: encodeCommand %s params=%v\n", mc.name, cmdName, params)
+
 	mc.mu.RLock()
 	dict := mc.dict
 	mc.mu.RUnlock()
 
 	if dict == nil {
+		mc.tracef("MCU %s: encodeCommand - no dictionary\n", mc.name)
 		return nil, ErrMCUNotConnected
 	}
 
@@ -499,21 +526,34 @@ func (mc *MCUConnection) encodeCommand(cmdName string, params map[string]interfa
 	}
 
 	if cmdFormat == "" {
+		mc.tracef("MCU %s: encodeCommand - unknown command %s\n", mc.name, cmdName)
 		return nil, fmt.Errorf("mcu: unknown command %s", cmdName)
 	}
 
+	mc.tracef("MCU %s: encodeCommand - found format=%s id=%d\n", mc.name, cmdFormat, cmdID)
+
 	// Build command line string
 	cmdLine := buildCommandLine(cmdName, cmdFormat, params)
+	mc.tracef("MCU %s: encodeCommand - cmdLine=%s\n", mc.name, cmdLine)
 
 	// Use protocol's EncodeCommand which takes command formats map
 	// We need to create a temporary formats map with just this command
+	mc.tracef("MCU %s: encodeCommand - building message formats\n", mc.name)
 	formats, err := buildMessageFormats(dict)
 	if err != nil {
+		mc.tracef("MCU %s: encodeCommand - buildMessageFormats error: %v\n", mc.name, err)
 		return nil, err
 	}
+	mc.tracef("MCU %s: encodeCommand - encoding with %d formats\n", mc.name, len(formats))
 
 	_ = cmdID // Used in message encoding
-	return protocol.EncodeCommand(formats, cmdLine)
+	result, err := protocol.EncodeCommand(formats, cmdLine)
+	if err != nil {
+		mc.tracef("MCU %s: encodeCommand - EncodeCommand error: %v\n", mc.name, err)
+		return nil, err
+	}
+	mc.tracef("MCU %s: encodeCommand - result: %x\n", mc.name, result)
+	return result, nil
 }
 
 // buildCommandLine builds a command line string from name and params.
@@ -602,6 +642,26 @@ func (mc *MCUConnection) handleUnknownMessage(msg *mcupkg.Message) {
 
 // dispatchMessage dispatches a message to registered handlers.
 func (mc *MCUConnection) dispatchMessage(msg *mcupkg.Message) {
+	// First, check for pending response waiters
+	mc.pendingMu.Lock()
+	if pending, ok := mc.pendingByName[msg.Name]; ok {
+		// Check OID match if specified
+		oidMatch := pending.oid == nil || (msg.OID != nil && *pending.oid == *msg.OID)
+		if oidMatch {
+			delete(mc.pendingByName, msg.Name)
+			mc.pendingMu.Unlock()
+
+			// Send response to waiting channel (non-blocking)
+			select {
+			case pending.respChan <- msg:
+			default:
+			}
+			return
+		}
+	}
+	mc.pendingMu.Unlock()
+
+	// Then check handlers
 	mc.handlersMu.RLock()
 	defer mc.handlersMu.RUnlock()
 

@@ -95,11 +95,16 @@ func (m *MCUManager) Connect() error {
 		return nil
 	}
 
-	m.tracef("MCUManager: Connecting to %d MCUs\n", len(m.mcus))
+	// Note: Don't use m.tracef() here - it would cause deadlock (RLock while holding Lock)
+	if m.trace != nil {
+		fmt.Fprintf(m.trace, "MCUManager: Connecting to %d MCUs\n", len(m.mcus))
+	}
 
 	// Connect to each MCU
 	for name, mcu := range m.mcus {
-		m.tracef("MCUManager: Connecting to MCU %s\n", name)
+		if m.trace != nil {
+			fmt.Fprintf(m.trace, "MCUManager: Connecting to MCU %s\n", name)
+		}
 		if err := mcu.Connect(); err != nil {
 			// Disconnect any already-connected MCUs
 			for n, mc := range m.mcus {
@@ -117,7 +122,9 @@ func (m *MCUManager) Connect() error {
 	m.connected = true
 	m.startTime = m.reactor.Monotonic()
 
-	m.tracef("MCUManager: All MCUs connected\n")
+	if m.trace != nil {
+		fmt.Fprintf(m.trace, "MCUManager: All MCUs connected\n")
+	}
 	return nil
 }
 
