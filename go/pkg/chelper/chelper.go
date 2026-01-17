@@ -7,6 +7,7 @@ package chelper
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "msgblock.h"
 #include "serialqueue.h"
 #include "itersolve.h"
 #include "steppersync.h"
@@ -113,6 +114,25 @@ type SerialStats struct {
 	ReadyBytes    uint64
 	UpcomingBytes uint64
 	Raw           string
+}
+
+// PullQueueMessage represents a message received from the MCU.
+// This corresponds to C's struct pull_queue_message.
+type PullQueueMessage struct {
+	Msg         [64]byte // MESSAGE_MAX = 64
+	Len         int
+	SentTime    float64
+	ReceiveTime float64
+	NotifyID    uint64
+}
+
+// ClockEstimate holds the clock synchronization parameters.
+// This corresponds to C's struct clock_estimate.
+type ClockEstimate struct {
+	LastClock uint64
+	ConvClock uint64
+	ConvTime  float64
+	EstFreq   float64
 }
 
 func NewSerialQueue(fd int, fdType byte, clientID int, name string) (*SerialQueue, error) {
@@ -251,6 +271,67 @@ func (sq *SerialQueue) Send(cq *CommandQueue, msg []byte, minClock uint64, reqCl
 		0,
 	)
 	return nil
+}
+
+// Pull retrieves the next received message from the serial queue.
+// This blocks until a message is available.
+// Returns the message data, timing information, and any error.
+func (sq *SerialQueue) Pull() (PullQueueMessage, error) {
+	if sq == nil || sq.ptr == nil {
+		return PullQueueMessage{}, fmt.Errorf("serialqueue is nil")
+	}
+	var pqm C.struct_pull_queue_message
+	C.serialqueue_pull(sq.ptr, &pqm)
+	var result PullQueueMessage
+	result.Len = int(pqm.len)
+	if result.Len > 0 && result.Len <= 64 {
+		for i := 0; i < result.Len; i++ {
+			result.Msg[i] = byte(pqm.msg[i])
+		}
+	}
+	result.SentTime = float64(pqm.sent_time)
+	result.ReceiveTime = float64(pqm.receive_time)
+	result.NotifyID = uint64(pqm.notify_id)
+	return result, nil
+}
+
+// Exit signals the serial queue to stop processing and unblocks any Pull calls.
+func (sq *SerialQueue) Exit() {
+	if sq == nil || sq.ptr == nil {
+		return
+	}
+	C.serialqueue_exit(sq.ptr)
+}
+
+// SetReceiveWindow sets the receive window size for flow control.
+func (sq *SerialQueue) SetReceiveWindow(receiveWindow int) {
+	if sq == nil || sq.ptr == nil {
+		return
+	}
+	C.serialqueue_set_receive_window(sq.ptr, C.int(receiveWindow))
+}
+
+// SetWireFrequency sets the baud rate for timing calculations.
+func (sq *SerialQueue) SetWireFrequency(frequency float64) {
+	if sq == nil || sq.ptr == nil {
+		return
+	}
+	C.serialqueue_set_wire_frequency(sq.ptr, C.double(frequency))
+}
+
+// GetClockEst retrieves the current clock estimation parameters.
+func (sq *SerialQueue) GetClockEst() (ClockEstimate, error) {
+	if sq == nil || sq.ptr == nil {
+		return ClockEstimate{}, fmt.Errorf("serialqueue is nil")
+	}
+	var ce C.struct_clock_estimate
+	C.serialqueue_get_clock_est(sq.ptr, &ce)
+	return ClockEstimate{
+		LastClock: uint64(ce.last_clock),
+		ConvClock: uint64(ce.conv_clock),
+		ConvTime:  float64(ce.conv_time),
+		EstFreq:   float64(ce.est_freq),
+	}, nil
 }
 
 func (sq *SerialQueue) Ptr() *C.struct_serialqueue { return sq.ptr }
