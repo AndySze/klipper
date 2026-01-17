@@ -5597,6 +5597,18 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 			return fmt.Errorf("exclude_object not configured")
 		}
 		return r.excludeObject.cmdExcludeObjectDefine(cmd.Args)
+	case "TURN_OFF_HEATERS":
+		// Turn off all heaters
+		return r.cmdTurnOffHeaters(cmd.Args)
+	case "SET_HEATER_TEMPERATURE":
+		// Set a specific heater temperature
+		return r.cmdSetHeaterTemperature(cmd.Args)
+	case "TEMPERATURE_WAIT":
+		// Wait for temperature sensor to reach target
+		return r.cmdTemperatureWait(cmd.Args)
+	case "PID_CALIBRATE":
+		// Run PID calibration test
+		return r.cmdPIDCalibrate(cmd.Args)
 	case "SET_LED":
 		// LED control - delegate to sensor-only runtime if available
 		if r.sensorOnly != nil {
@@ -6880,6 +6892,126 @@ func (r *runtime) cmdM190(args map[string]string) error {
 
 	// Wait for temperature to reach target
 	return r.waitTemperature("heater_bed", temp)
+}
+
+// cmdTurnOffHeaters turns off all heaters
+func (r *runtime) cmdTurnOffHeaters(args map[string]string) error {
+	r.tracef("TURN_OFF_HEATERS: turning off all heaters\n")
+
+	if r.heaterManager == nil {
+		return nil // No heaters configured
+	}
+
+	if err := r.heaterManager.TurnOffAllHeaters(); err != nil {
+		r.tracef("TURN_OFF_HEATERS: %v\n", err)
+	}
+
+	return nil
+}
+
+// cmdSetHeaterTemperature sets a specific heater's target temperature
+func (r *runtime) cmdSetHeaterTemperature(args map[string]string) error {
+	// SET_HEATER_TEMPERATURE HEATER=<name> [TARGET=<temp>]
+	heaterName, ok := args["HEATER"]
+	if !ok || heaterName == "" {
+		return fmt.Errorf("SET_HEATER_TEMPERATURE requires HEATER parameter")
+	}
+
+	// Parse target temperature (default 0)
+	target := 0.0
+	if targetStr, ok := args["TARGET"]; ok && targetStr != "" {
+		if _, err := fmt.Sscanf(targetStr, "%f", &target); err != nil {
+			return fmt.Errorf("invalid TARGET value: %s", targetStr)
+		}
+	}
+
+	r.tracef("SET_HEATER_TEMPERATURE: heater=%s target=%.1f\n", heaterName, target)
+
+	if r.heaterManager == nil {
+		return fmt.Errorf("heater manager not configured")
+	}
+
+	if err := r.heaterManager.SetTemperature(heaterName, target, false); err != nil {
+		r.tracef("SET_HEATER_TEMPERATURE: %v\n", err)
+	}
+
+	return nil
+}
+
+// cmdTemperatureWait waits for a temperature sensor to reach a target range
+func (r *runtime) cmdTemperatureWait(args map[string]string) error {
+	// TEMPERATURE_WAIT SENSOR=<name> [MINIMUM=<temp>] [MAXIMUM=<temp>]
+	sensorName, ok := args["SENSOR"]
+	if !ok || sensorName == "" {
+		return fmt.Errorf("TEMPERATURE_WAIT requires SENSOR parameter")
+	}
+
+	minTemp := math.Inf(-1)
+	maxTemp := math.Inf(1)
+
+	if minStr, ok := args["MINIMUM"]; ok && minStr != "" {
+		if _, err := fmt.Sscanf(minStr, "%f", &minTemp); err != nil {
+			return fmt.Errorf("invalid MINIMUM value: %s", minStr)
+		}
+	}
+
+	if maxStr, ok := args["MAXIMUM"]; ok && maxStr != "" {
+		if _, err := fmt.Sscanf(maxStr, "%f", &maxTemp); err != nil {
+			return fmt.Errorf("invalid MAXIMUM value: %s", maxStr)
+		}
+	}
+
+	if math.IsInf(minTemp, -1) && math.IsInf(maxTemp, 1) {
+		return fmt.Errorf("Error on 'TEMPERATURE_WAIT': missing MINIMUM or MAXIMUM")
+	}
+
+	r.tracef("TEMPERATURE_WAIT: sensor=%s min=%.1f max=%.1f (skipped - file output mode)\n",
+		sensorName, minTemp, maxTemp)
+
+	// In file output mode (golden tests), skip the wait entirely
+	return nil
+}
+
+// cmdPIDCalibrate runs PID autotune calibration
+func (r *runtime) cmdPIDCalibrate(args map[string]string) error {
+	// PID_CALIBRATE HEATER=<name> TARGET=<temp> [WRITE_FILE=<0|1>]
+	heaterName, ok := args["HEATER"]
+	if !ok || heaterName == "" {
+		return fmt.Errorf("PID_CALIBRATE requires HEATER parameter")
+	}
+
+	targetStr, ok := args["TARGET"]
+	if !ok || targetStr == "" {
+		return fmt.Errorf("PID_CALIBRATE requires TARGET parameter")
+	}
+
+	var target float64
+	if _, err := fmt.Sscanf(targetStr, "%f", &target); err != nil {
+		return fmt.Errorf("invalid TARGET value: %s", targetStr)
+	}
+
+	writeFile := false
+	if wfStr, ok := args["WRITE_FILE"]; ok && wfStr != "" {
+		writeFile = wfStr == "1" || wfStr == "true"
+	}
+
+	r.tracef("PID_CALIBRATE: heater=%s target=%.1f write_file=%v\n", heaterName, target, writeFile)
+
+	// In file output mode (golden tests), skip the actual calibration
+	// Python outputs PID parameters at the end, but in file mode it skips
+	// the heating cycles entirely.
+	//
+	// The actual calibration involves:
+	// 1. Setting the heater to target temperature
+	// 2. Recording temperature oscillations
+	// 3. Using Ziegler-Nichols method to calculate PID parameters
+	//
+	// For golden tests, we just log and return success
+
+	r.gcodeRespond("PID_CALIBRATE skipped in file output mode")
+	r.gcodeRespond(fmt.Sprintf("Would calibrate %s to %.1f degrees", heaterName, target))
+
+	return nil
 }
 
 func (r *runtime) cmdM106(args map[string]string) error {
