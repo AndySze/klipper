@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"klipper-go-migration/pkg/hosth4"
+	"klipper-go-migration/pkg/serial"
 )
 
 func main() {
@@ -47,7 +48,7 @@ func main() {
 	baud := flag.Int("baud", 250000, "Baud rate")
 	timeout := flag.Duration("timeout", 60*time.Second, "Connection timeout")
 	trace := flag.Bool("trace", false, "Enable debug tracing")
-	test := flag.String("test", "connect", "Test to run: connect, clock, temp, query, all")
+	test := flag.String("test", "connect", "Test to run: serial, connect, clock, temp, query, all")
 
 	flag.Parse()
 
@@ -100,30 +101,153 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Run the requested test
-	var err error
-	switch *test {
-	case "connect":
-		err = testConnect(ri, *timeout)
-	case "clock":
-		err = testClock(ri, *timeout)
-	case "temp":
-		err = testTemp(ri, *timeout)
-	case "query":
-		err = testQuery(ri, *timeout)
-	case "all":
-		err = testAll(ri, *timeout)
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown test: %s\n", *test)
-		os.Exit(1)
+	// Run test in a goroutine so we can handle signals
+	doneCh := make(chan error, 1)
+	go func() {
+		var err error
+		switch *test {
+		case "serial":
+			// Direct serial test - doesn't need full integration
+			err = testSerial(*device, *baud, *timeout, *trace)
+		case "connect":
+			err = testConnect(ri, *timeout)
+		case "clock":
+			err = testClock(ri, *timeout)
+		case "temp":
+			err = testTemp(ri, *timeout)
+		case "query":
+			err = testQuery(ri, *timeout)
+		case "all":
+			err = testAll(ri, *timeout)
+		default:
+			err = fmt.Errorf("unknown test: %s", *test)
+		}
+		doneCh <- err
+	}()
+
+	// Wait for completion or signal
+	select {
+	case err := <-doneCh:
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Test failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\nAll tests passed!")
+	case sig := <-sigCh:
+		fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
+		ri.Disconnect()
+		os.Exit(130) // Standard exit code for SIGINT
+	}
+}
+
+// testSerial performs direct serial port testing without full MCU handshake.
+// This is useful for debugging connection issues.
+func testSerial(device string, baud int, timeout time.Duration, trace bool) error {
+	fmt.Println("=== Test: Direct Serial Port ===")
+	fmt.Printf("Device: %s\n", device)
+	fmt.Printf("Baud rate: %d\n", baud)
+
+	// Open serial port
+	fmt.Println("\nOpening serial port...")
+	cfg := serial.Config{
+		Device:         device,
+		BaudRate:       baud,
+		ConnectTimeout: timeout,
+		ReadTimeout:    2 * time.Second,
+		RTSOnConnect:   true,
+		DTROnConnect:   true,
 	}
 
+	port, err := serial.Open(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Test failed: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("open serial: %w", err)
+	}
+	defer port.Close()
+
+	fmt.Println("Serial port opened successfully!")
+
+	// Send a simple identify command (offset=0, count=40)
+	// This is the first thing Klipper sends to detect MCU
+	fmt.Println("\nSending identify command...")
+	identifyCmd := []byte{
+		0x0a,                   // length
+		0x00,                   // seq
+		0x00,                   // cmd id (identify)
+		0x00,                   // offset VLQ (0)
+		0x28,                   // count VLQ (40)
+		0x00, 0x00,             // CRC placeholder (will be calculated)
+		0x7e,                   // sync byte
+	}
+	// Calculate CRC
+	crc := crc16ccitt(identifyCmd[:5])
+	identifyCmd[5] = byte(crc >> 8)
+	identifyCmd[6] = byte(crc & 0xff)
+
+	if trace {
+		fmt.Printf("TX: %x\n", identifyCmd)
 	}
 
-	fmt.Println("\nAll tests passed!")
+	_, err = port.Write(identifyCmd)
+	if err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	// Wait for response
+	fmt.Println("Waiting for response (2 second timeout)...")
+	resp := make([]byte, 256)
+	n, err := port.Read(resp)
+	if err != nil {
+		if err.Error() == "serial: operation timed out" {
+			fmt.Println("\nNo response from MCU (timeout)")
+			fmt.Println("\nPossible causes:")
+			fmt.Println("  1. MCU is not running Klipper firmware")
+			fmt.Println("  2. Wrong serial device (check with: ls /dev/tty*)")
+			fmt.Println("  3. Wrong baud rate (default: 250000)")
+			fmt.Println("  4. MCU is in DFU/bootloader mode")
+			fmt.Println("  5. Serial cable or connection issue")
+			return fmt.Errorf("no response from MCU")
+		}
+		return fmt.Errorf("read: %w", err)
+	}
+
+	fmt.Printf("\nReceived %d bytes!\n", n)
+	if trace {
+		fmt.Printf("RX: %x\n", resp[:n])
+	}
+
+	// Try to parse as identify_response
+	if n >= 8 && resp[n-1] == 0x7e {
+		fmt.Println("Response has valid sync byte (0x7e) - MCU is responding!")
+
+		// Check message length
+		msgLen := int(resp[0])
+		if msgLen >= 5 && msgLen <= n {
+			fmt.Printf("Message length: %d bytes\n", msgLen)
+
+			// Check if it's identify_response (msg id = 0)
+			if resp[2] == 0 {
+				fmt.Println("Response is identify_response - MCU handshake working!")
+			}
+		}
+	}
+
+	return nil
+}
+
+// crc16ccitt calculates the CRC16-CCITT checksum.
+func crc16ccitt(data []byte) uint16 {
+	crc := uint16(0xFFFF)
+	for _, b := range data {
+		crc ^= uint16(b) << 8
+		for i := 0; i < 8; i++ {
+			if crc&0x8000 != 0 {
+				crc = (crc << 1) ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
 }
 
 // testConnect verifies basic connectivity to the MCU.
