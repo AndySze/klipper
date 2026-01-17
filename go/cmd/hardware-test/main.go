@@ -177,22 +177,41 @@ func testSerial(device string, baud int, timeout time.Duration, trace bool) erro
 
 	fmt.Println("Serial port opened successfully!")
 
-	// Send a simple identify command (offset=0, count=40)
-	// This is the first thing Klipper sends to detect MCU
+	// Send identify command (offset=0, count=40)
+	// Message format: len=8, seq=0, cmd_id=1, offset=0, count=40, CRC, sync
 	fmt.Println("\nSending identify command...")
-	identifyCmd := []byte{
-		0x0a,                   // length
-		0x00,                   // seq
-		0x00,                   // cmd id (identify)
-		0x00,                   // offset VLQ (0)
-		0x28,                   // count VLQ (40)
-		0x00, 0x00,             // CRC placeholder (will be calculated)
-		0x7e,                   // sync byte
+	// CORRECT format: message ID 1 for identify
+	// seq byte = 0x10 (MESSAGE_DEST set, seq# = 0)
+	correctCmd := []byte{
+		0x08,       // length (8 bytes total)
+		0x10,       // seq = MESSAGE_DEST | 0 (host-to-MCU direction)
+		0x01,       // cmd id (1 = identify)
+		0x00,       // offset VLQ (0)
+		0x28,       // count VLQ (40)
+		0x00, 0x00, // CRC placeholder
+		0x7e,       // sync byte
 	}
-	// Calculate CRC
-	crc := crc16ccitt(identifyCmd[:5])
-	identifyCmd[5] = byte(crc >> 8)
-	identifyCmd[6] = byte(crc & 0xff)
+	crcCorrect := crc16ccitt(correctCmd[:5])
+	correctCmd[5] = byte(crcCorrect >> 8)
+	correctCmd[6] = byte(crcCorrect & 0xff)
+
+	// OLD format (wrong but was getting a response)
+	oldCmd := []byte{
+		0x0a,       // length (WRONG - says 10 but only 8 bytes)
+		0x00,       // seq
+		0x00,       // cmd id (WRONG - 0 is identify_response)
+		0x00,       // offset VLQ (0)
+		0x28,       // count VLQ (40)
+		0x00, 0x00, // CRC placeholder
+		0x7e,       // sync byte
+	}
+	crcOld := crc16ccitt(oldCmd[:5])
+	oldCmd[5] = byte(crcOld >> 8)
+	oldCmd[6] = byte(crcOld & 0xff)
+
+	// Try correct command first
+	fmt.Println("Trying CORRECT identify command (msg_id=1, len=8)...")
+	identifyCmd := correctCmd
 
 	if trace {
 		fmt.Printf("TX: %x\n", identifyCmd)
@@ -203,60 +222,69 @@ func testSerial(device string, baud int, timeout time.Duration, trace bool) erro
 		return fmt.Errorf("write: %w", err)
 	}
 
-	// Wait for response
-	fmt.Println("Waiting for response (2 second timeout)...")
-	resp := make([]byte, 256)
-	n, err := port.Read(resp)
-	if err != nil {
-		if err.Error() == "serial: operation timed out" {
-			fmt.Println("\nNo response from MCU (timeout)")
-			fmt.Println("\nPossible causes:")
-			fmt.Println("  1. MCU is not running Klipper firmware")
-			fmt.Println("  2. Wrong serial device (check with: ls /dev/tty*)")
-			fmt.Println("  3. Wrong baud rate (default: 250000)")
-			fmt.Println("  4. MCU is in DFU/bootloader mode")
-			fmt.Println("  5. Serial cable or connection issue")
-			return fmt.Errorf("no response from MCU")
+	// Send multiple times and read responses
+	fmt.Println("Sending identify command multiple times...")
+	for i := 0; i < 5; i++ {
+		if trace {
+			fmt.Printf("\n--- Attempt %d ---\n", i+1)
+			fmt.Printf("TX: %x\n", identifyCmd)
 		}
-		return fmt.Errorf("read: %w", err)
-	}
 
-	fmt.Printf("\nReceived %d bytes!\n", n)
-	if trace {
-		fmt.Printf("RX: %x\n", resp[:n])
-	}
+		_, err = port.Write(identifyCmd)
+		if err != nil {
+			fmt.Printf("Write error: %v\n", err)
+			continue
+		}
 
-	// Try to parse as identify_response
-	if n >= 8 && resp[n-1] == 0x7e {
-		fmt.Println("Response has valid sync byte (0x7e) - MCU is responding!")
+		// Read response with timeout
+		resp := make([]byte, 256)
+		n, err := port.Read(resp)
+		if err != nil {
+			if err.Error() == "serial: operation timed out" {
+				fmt.Printf("Attempt %d: timeout (no response)\n", i+1)
+			} else {
+				fmt.Printf("Attempt %d: read error: %v\n", i+1, err)
+			}
+			continue
+		}
 
-		// Check message length
-		msgLen := int(resp[0])
-		if msgLen >= 5 && msgLen <= n {
-			fmt.Printf("Message length: %d bytes\n", msgLen)
+		fmt.Printf("Attempt %d: received %d bytes\n", i+1, n)
+		if trace && n > 0 {
+			fmt.Printf("RX: %x\n", resp[:n])
+		}
 
-			// Check if it's identify_response (msg id = 0)
-			if resp[2] == 0 {
-				fmt.Println("Response is identify_response - MCU handshake working!")
+		// Parse response
+		if n >= 5 && resp[n-1] == 0x7e {
+			msgLen := int(resp[0])
+			if msgLen >= 5 && msgLen <= n {
+				// Get message ID from payload
+				if msgLen > 5 {
+					msgID := resp[2]
+					fmt.Printf("  Message ID: %d (0x%02x)\n", msgID, msgID)
+					if msgID == 0 {
+						fmt.Println("  -> This is identify_response!")
+					}
+				} else {
+					fmt.Println("  -> Empty message (ACK)")
+				}
 			}
 		}
+
+		// Small delay between attempts
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	return nil
 }
 
-// crc16ccitt calculates the CRC16-CCITT checksum.
+// crc16ccitt calculates the CRC16-CCITT checksum using Klipper's optimized algorithm.
+// This matches the algorithm in klippy/chelper/crc16_ccitt.c
 func crc16ccitt(data []byte) uint16 {
 	crc := uint16(0xFFFF)
 	for _, b := range data {
-		crc ^= uint16(b) << 8
-		for i := 0; i < 8; i++ {
-			if crc&0x8000 != 0 {
-				crc = (crc << 1) ^ 0x1021
-			} else {
-				crc <<= 1
-			}
-		}
+		d := b ^ uint8(crc&0xff)
+		d ^= d << 4 // 8-bit overflow intentional
+		crc = ((uint16(d) << 8) | (crc >> 8)) ^ uint16(d>>4) ^ (uint16(d) << 3)
 	}
 	return crc
 }
@@ -332,26 +360,11 @@ func testClock(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 	return nil
 }
 
-// testTemp tests temperature sensor reading (if available).
+// testTemp tests temperature sensor reading by configuring MCU ADC.
 func testTemp(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 	fmt.Println("=== Test: Temperature Sensor ===")
 
-	// Add a test temperature sensor
-	// Note: This requires proper pin configuration for your specific printer
-	err := ri.AddTempSensor(hosth4.TempSensorConfig{
-		Name:           "test_temp",
-		MCUName:        "mcu",
-		Pullup:         4700,     // Common pullup value
-		ThermistorType: "Generic 3950",
-		SampleTime:     0.001,
-		SampleCount:    8,
-		ReportTime:     0.3,
-	})
-	if err != nil {
-		return fmt.Errorf("add temp sensor: %w", err)
-	}
-
-	// Connect to MCU
+	// Connect to MCU first
 	fmt.Println("Connecting to MCU...")
 	if err := ri.Connect(); err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -363,11 +376,171 @@ func testTemp(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 		return fmt.Errorf("wait ready: %w", err)
 	}
 
-	fmt.Println("MCU connected. Temperature sensor added.")
-	fmt.Println("Note: To actually read temperature, you need to configure the ADC OID")
-	fmt.Println("      and send config commands to the MCU during the config phase.")
+	mcu := ri.MCUManager().PrimaryMCU()
+	if mcu == nil {
+		return fmt.Errorf("no MCU connected")
+	}
 
-	return nil
+	fmt.Println("MCU connected!")
+	fmt.Printf("MCU frequency: %.0f Hz\n", mcu.MCUFreq())
+
+	// Check if MCU is already configured
+	resp, err := mcu.SendCommandWithResponse("get_config", nil, "config", 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("get_config: %w", err)
+	}
+
+	isConfig := 0
+	if v, ok := resp["is_config"].(int); ok {
+		isConfig = v
+	}
+
+	if isConfig != 0 {
+		fmt.Println("MCU is already configured (from previous session)")
+		fmt.Println("Cannot send new config commands. MCU needs reset.")
+		return nil
+	}
+
+	fmt.Println("MCU is NOT configured - proceeding with ADC setup")
+
+	// Debug: show enumerations
+	dict := mcu.Dictionary()
+	fmt.Printf("\nAvailable enumerations (%d total):\n", len(dict.Enumerations))
+	for name, vals := range dict.Enumerations {
+		fmt.Printf("  %s: %d values\n", name, len(vals))
+	}
+
+	// Check for pin-related enumerations
+	if pins, ok := dict.Enumerations["pin"]; ok && len(pins) > 0 {
+		fmt.Println("\nPin enumeration (first 10):")
+		count := 0
+		for name, val := range pins {
+			fmt.Printf("  %s = %d\n", name, val)
+			count++
+			if count >= 10 {
+				fmt.Printf("  ... and %d more\n", len(pins)-10)
+				break
+			}
+		}
+	} else {
+		fmt.Println("\nNo 'pin' enumeration found")
+	}
+
+	// Configure ADC for temperature reading
+	// Pin PF0 is the extruder thermistor (from printer.cfg: sensor_pin: PF0)
+	oid := 0
+	pin := "PF0" // Pin name from MCU's pin enumeration
+
+	fmt.Println("\n--- Configuring ADC ---")
+
+	// Step 1: Allocate OID
+	if err := mcu.SendCommand("allocate_oids", map[string]interface{}{"count": 1}); err != nil {
+		return fmt.Errorf("allocate_oids: %w", err)
+	}
+	fmt.Println("  allocate_oids count=1")
+	time.Sleep(10 * time.Millisecond) // Small delay between commands
+
+	// Step 2: Configure analog input
+	fmt.Println("  sending config_analog_in...")
+	if err := mcu.SendCommand("config_analog_in", map[string]interface{}{
+		"oid": oid,
+		"pin": pin,
+	}); err != nil {
+		return fmt.Errorf("config_analog_in: %w", err)
+	}
+	fmt.Printf("  config_analog_in oid=%d pin=%s - done\n", oid, pin)
+	time.Sleep(10 * time.Millisecond)
+
+	// Step 3: Finalize config (crc=0 for simple test)
+	if err := mcu.SendCommand("finalize_config", map[string]interface{}{"crc": 0}); err != nil {
+		return fmt.Errorf("finalize_config: %w", err)
+	}
+	fmt.Println("  finalize_config crc=0")
+	time.Sleep(50 * time.Millisecond) // More time for finalize
+
+	// Verify config is finalized
+	resp, err = mcu.SendCommandWithResponse("get_config", nil, "config", 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("verify config: %w", err)
+	}
+	fmt.Printf("  Config state: %v\n", resp)
+
+	// Step 4: Register handler for analog_in_state responses
+	tempReadings := make(chan int, 10)
+	mcu.RegisterOIDHandler("analog_in_state", oid, func(params map[string]interface{}, receiveTime time.Time) {
+		if value, ok := params["value"].(int); ok {
+			select {
+			case tempReadings <- value:
+			default:
+			}
+		}
+	})
+
+	// Step 5: Start querying temperature
+	mcuClock := mcu.PrintTime(0)                  // Current MCU clock
+	sampleTicks := int(mcu.MCUFreq() * 0.001)     // 1ms sample time
+	restTicks := int(mcu.MCUFreq() * 0.3)         // 300ms between reports
+
+	fmt.Printf("\n--- Starting ADC Query ---\n")
+	fmt.Printf("  MCU clock: %d, sample_ticks: %d, rest_ticks: %d\n", mcuClock, sampleTicks, restTicks)
+
+	if err := mcu.SendCommand("query_analog_in", map[string]interface{}{
+		"oid":               oid,
+		"clock":             uint32(mcuClock + 100000), // Start shortly in the future
+		"sample_ticks":      sampleTicks,
+		"sample_count":      8,
+		"rest_ticks":        restTicks,
+		"min_value":         0,
+		"max_value":         4095, // 10-bit ADC max (ATmega uses 10-bit ADC: 0-1023)
+		"range_check_count": 0,
+	}); err != nil {
+		return fmt.Errorf("query_analog_in: %w", err)
+	}
+	fmt.Println("  query_analog_in started")
+
+	// Read temperature values for a few seconds
+	fmt.Println("\n--- Reading Temperature ---")
+
+	// Create thermistor using hosth4's built-in profile
+	// Printer config: sensor_type: ATC Semitec 104GT-2, pullup: 4700 ohms
+	thermistor, err := hosth4.NewThermistorFromProfile("ATC Semitec 104GT-2", 4700, 0)
+	if err != nil {
+		return fmt.Errorf("create thermistor: %w", err)
+	}
+
+	// With sample_count=8, the value is sum of 8 samples, range 0-8184
+	sampleCount := 8
+	maxADC := 1023 * sampleCount // 8184 for 8 samples of 10-bit ADC
+	fmt.Printf("    (Thermistor: ATC Semitec 104GT-2, Pullup: 4700Ω)\n")
+	fmt.Printf("    (ADC: 10-bit × %d samples, range 0-%d)\n", sampleCount, maxADC)
+
+	readTimeout := time.After(5 * time.Second)
+	readCount := 0
+
+	for {
+		select {
+		case value := <-tempReadings:
+			readCount++
+			if value > 0 && value < maxADC {
+				// Normalize to 0.0-1.0 range for thermistor calculation
+				adcNormalized := float64(value) / float64(maxADC)
+				tempC := thermistor.CalcTemp(adcNormalized)
+				fmt.Printf("  [%d] ADC: %5d (%.3f) -> %.1f°C\n", readCount, value, adcNormalized, tempC)
+			} else if value >= maxADC {
+				fmt.Printf("  [%d] ADC: %5d (max - open circuit/no thermistor)\n", readCount, value)
+			} else {
+				fmt.Printf("  [%d] ADC: %5d (min - short circuit)\n", readCount, value)
+			}
+		case <-readTimeout:
+			if readCount == 0 {
+				fmt.Println("  No temperature readings received")
+				fmt.Println("  (Check thermistor connection on pin PF0)")
+			} else {
+				fmt.Printf("\nReceived %d temperature readings\n", readCount)
+			}
+			return nil
+		}
+	}
 }
 
 // testAll runs all tests.
