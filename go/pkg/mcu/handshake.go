@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"time"
 
 	"klipper-go-migration/pkg/protocol"
@@ -38,6 +39,9 @@ type HandshakeConfig struct {
 
 	// ExpectedCRC if set, verify dictionary CRC matches
 	ExpectedCRC uint32
+
+	// ResetBeforeIdentify toggles DTR to reset the MCU before identify (default: false)
+	ResetBeforeIdentify bool
 
 	// Trace writer for debug output (optional)
 	Trace io.Writer
@@ -89,23 +93,115 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 
 	deadline := time.Now().Add(cfg.Timeout)
 
+	// Step 0: Wait for MCU to stabilize after port open
+	// Some serial adapters need time to settle
+	if cfg.Trace != nil {
+		fmt.Fprintf(cfg.Trace, "Handshake: Waiting for serial port to stabilize\n")
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Step 1: Flush any pending data in the serial buffer
+	if cfg.Trace != nil {
+		fmt.Fprintf(cfg.Trace, "Handshake: Flushing serial buffer\n")
+	}
+	if err := port.Flush(); err != nil {
+		if cfg.Trace != nil {
+			fmt.Fprintf(cfg.Trace, "Handshake: Flush error (non-fatal): %v\n", err)
+		}
+	}
+
+	// Step 2: Optionally reset the MCU using DTR toggle and/or break signal
+	if cfg.ResetBeforeIdentify {
+		if cfg.Trace != nil {
+			fmt.Fprintf(cfg.Trace, "Handshake: Attempting MCU reset\n")
+		}
+
+		// Try DTR toggle first (works on many Arduino-style boards)
+		dtrWorked := false
+		if err := port.SetDTR(true); err == nil {
+			time.Sleep(100 * time.Millisecond)
+			if err := port.SetDTR(false); err == nil {
+				dtrWorked = true
+				time.Sleep(100 * time.Millisecond)
+				port.SetDTR(true)
+			}
+		}
+		if cfg.Trace != nil {
+			fmt.Fprintf(cfg.Trace, "Handshake: DTR toggle %s\n", map[bool]string{true: "succeeded", false: "failed (not supported)"}[dtrWorked])
+		}
+
+		// Also try sending a break signal (some boards reset on this)
+		if err := port.SendBreak(); err != nil {
+			if cfg.Trace != nil {
+				fmt.Fprintf(cfg.Trace, "Handshake: SendBreak error (non-fatal): %v\n", err)
+			}
+		} else {
+			if cfg.Trace != nil {
+				fmt.Fprintf(cfg.Trace, "Handshake: Break signal sent\n")
+			}
+		}
+
+		// Wait a bit for MCU to boot/reset
+		time.Sleep(100 * time.Millisecond)
+
+		// Flush again after reset
+		port.Flush()
+	}
+
+	// Step 3: Drain any pending messages from the MCU
+	// The MCU may send startup messages or status updates that we need to clear
+	// Do a quick drain - just read whatever is immediately available
+	if cfg.Trace != nil {
+		fmt.Fprintf(cfg.Trace, "Handshake: Draining pending messages\n")
+	}
+	drainBuf := make([]byte, protocol.MESSAGE_MAX)
+	drainCount := 0
+	for drainCount < 10 { // Max 10 reads
+		n, err := port.Read(drainBuf)
+		if err != nil || n == 0 {
+			break // No more data available, stop draining
+		}
+		if cfg.Trace != nil {
+			fmt.Fprintf(cfg.Trace, "Handshake: Drained %d bytes: %x\n", n, drainBuf[:n])
+		}
+		drainCount++
+	}
+	if cfg.Trace != nil {
+		fmt.Fprintf(cfg.Trace, "Handshake: Drain complete after %d reads\n", drainCount)
+	}
+
 	// Collect identify data by querying chunks
 	var identifyData []byte
 	seq := 0
 	iteration := 0
+	unexpectedCount := 0
+	const maxUnexpected = 50 // Allow many unexpected messages (MCU may be sending status)
+
+	if cfg.Trace != nil {
+		remaining := time.Until(deadline)
+		fmt.Fprintf(cfg.Trace, "Handshake: Starting identify phase, %.1fs remaining\n", remaining.Seconds())
+	}
 
 	for time.Now().Before(deadline) {
 		iteration++
 		offset := len(identifyData)
-		cmd := encodeIdentifyCommand(offset, cfg.ReadChunkSize)
+
+		// Build identify command manually for debugging
+		// Format: identify offset=%u count=%c (message ID 1)
+		var cmd []byte
+		protocol.EncodeUint32(&cmd, 1) // Message ID 1
+		protocol.EncodeUint32(&cmd, int32(offset))
+		protocol.EncodeUint32(&cmd, int32(cfg.ReadChunkSize))
+		// Use EncodeMsgblock which sets MESSAGE_DEST - required for MCU to process the message
 		msgBlock := protocol.EncodeMsgblock(seq, cmd)
-		seq = (seq + 1) & protocol.MESSAGE_SEQ_MASK
+		// Don't increment seq yet - only do so on valid response
 
 		if cfg.Trace != nil {
-			fmt.Fprintf(cfg.Trace, "Handshake[%d]: TX offset=%d len=%d: %x\n", iteration, offset, len(msgBlock), msgBlock)
+			fmt.Fprintf(cfg.Trace, "Handshake[%d]: TX offset=%d seq=%d: %x (cmd: %x)\n",
+				iteration, offset, seq, msgBlock, cmd)
 		}
 
-		resp, err := sendWithRetry(port, msgBlock, cfg.MaxRetries, cfg.RetryDelay, deadline)
+		resp, err := sendWithRetry(port, msgBlock, cfg.MaxRetries, cfg.RetryDelay, deadline, cfg.Trace)
 		if err != nil {
 			if cfg.Trace != nil {
 				fmt.Fprintf(cfg.Trace, "Handshake[%d]: sendWithRetry error: %v\n", iteration, err)
@@ -124,11 +220,22 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 		// Parse identify_response
 		respOffset, data, err := parseIdentifyResponse(resp)
 		if err != nil {
+			unexpectedCount++
 			if cfg.Trace != nil {
-				fmt.Fprintf(cfg.Trace, "Handshake[%d]: parse error: %v\n", iteration, err)
+				fmt.Fprintf(cfg.Trace, "Handshake[%d]: parse error: %v (unexpected #%d, retrying)\n",
+					iteration, err, unexpectedCount)
 			}
-			return nil, fmt.Errorf("mcu: parse identify response: %w", err)
+			// If we got a message but it wasn't identify_response, retry
+			// This can happen if the MCU sends startup messages after reset
+			// But don't retry forever
+			if unexpectedCount >= maxUnexpected {
+				return nil, fmt.Errorf("mcu: too many unexpected messages (%d), MCU may be in configured state", unexpectedCount)
+			}
+			continue
 		}
+
+		// Got valid identify_response - now increment seq for next request
+		seq = (seq + 1) & protocol.MESSAGE_SEQ_MASK
 
 		// Verify offset matches what we requested
 		if respOffset != offset {
@@ -255,7 +362,7 @@ func parseIdentifyResponse(msg []byte) (offset int, data []byte, err error) {
 }
 
 // sendWithRetry sends a command and waits for response with retries.
-func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay time.Duration, deadline time.Time) ([]byte, error) {
+func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay time.Duration, deadline time.Time, trace io.Writer) ([]byte, error) {
 	delay := retryDelay
 	var lastErr error
 
@@ -265,36 +372,78 @@ func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay tim
 		}
 
 		// Send command
-		_, err := port.Write(cmd)
+		n, err := port.Write(cmd)
+		if trace != nil {
+			fmt.Fprintf(trace, "  sendWithRetry[%d]: Write returned n=%d, err=%v\n", retry, n, err)
+		}
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
-		// Read response
-		resp := make([]byte, protocol.MESSAGE_MAX)
-		port.SetReadTimeout(500 * time.Millisecond)
-		n, err := port.Read(resp)
-		if err != nil {
-			// Check for timeout - handle both error types
-			if errors.Is(err, serial.ErrTimeout) || err.Error() == "serial: operation timed out" {
-				lastErr = ErrTimeout
-				// Retry with exponential backoff
-				if retry < maxRetries {
-					time.Sleep(delay)
-					delay *= 2
+		// Read response, accumulating bytes until we have a complete message
+		resp := make([]byte, 0, protocol.MESSAGE_MAX)
+		buf := make([]byte, protocol.MESSAGE_MAX)
+		expectedLen := 0
+
+		for time.Now().Before(deadline) {
+			n, err = port.Read(buf)
+			if trace != nil {
+				fmt.Fprintf(trace, "  sendWithRetry[%d]: Read returned n=%d, err=%v\n", retry, n, err)
+				if n > 0 {
+					fmt.Fprintf(trace, "  sendWithRetry[%d]: RX chunk: %x\n", retry, buf[:n])
 				}
-				continue
 			}
-			lastErr = err
-			continue
+
+			if n > 0 {
+				resp = append(resp, buf[:n]...)
+
+				// Once we have the length byte, we know expected message size
+				if expectedLen == 0 && len(resp) >= 1 {
+					expectedLen = int(resp[0])
+					if trace != nil {
+						fmt.Fprintf(trace, "  sendWithRetry[%d]: Expected msg len: %d\n", retry, expectedLen)
+					}
+				}
+
+				// Check if we have a complete message
+				if expectedLen > 0 && len(resp) >= expectedLen {
+					// Verify sync byte
+					if resp[expectedLen-1] == protocol.MESSAGE_SYNC {
+						return resp[:expectedLen], nil
+					}
+					// Bad sync - try to find next valid message start
+					if trace != nil {
+						fmt.Fprintf(trace, "  sendWithRetry[%d]: Bad sync at pos %d, got 0x%02x\n",
+							retry, expectedLen-1, resp[expectedLen-1])
+					}
+				}
+			}
+
+			if err != nil {
+				if errors.Is(err, serial.ErrTimeout) || err.Error() == "serial: operation timed out" {
+					if len(resp) == 0 {
+						break // No data at all, retry
+					}
+					// Got partial data, keep waiting if we haven't hit deadline
+					continue
+				}
+				lastErr = err
+				break
+			}
 		}
 
-		if n > 0 {
-			return resp[:n], nil
+		if len(resp) > 0 && trace != nil {
+			fmt.Fprintf(trace, "  sendWithRetry[%d]: Accumulated: %x (len=%d, expected=%d)\n",
+				retry, resp, len(resp), expectedLen)
 		}
 
-		lastErr = ErrNoResponse
+		if len(resp) == 0 {
+			lastErr = ErrTimeout
+		} else {
+			lastErr = ErrNoResponse
+		}
+
 		if retry < maxRetries {
 			time.Sleep(delay)
 			delay *= 2
@@ -365,14 +514,40 @@ func parseDictionaryJSON(data []byte) (*protocol.Dictionary, error) {
 		dict.Config = cfg
 	}
 
-	// Parse enumerations
+	// Parse enumerations (supports both simple values and ranges like [start,count])
 	if enums, ok := raw["enumerations"].(map[string]interface{}); ok {
 		for enumName, enumVals := range enums {
 			if vals, ok := enumVals.(map[string]interface{}); ok {
 				dict.Enumerations[enumName] = make(map[string]int)
 				for k, v := range vals {
-					if id, ok := v.(float64); ok {
-						dict.Enumerations[enumName][k] = int(id)
+					switch tv := v.(type) {
+					case float64:
+						// Simple value
+						dict.Enumerations[enumName][k] = int(tv)
+					case []interface{}:
+						// Range format: [start, count]
+						if len(tv) == 2 {
+							start, ok1 := tv[0].(float64)
+							count, ok2 := tv[1].(float64)
+							if ok1 && ok2 {
+								// Extract the root (e.g., "PF" from "PF0")
+								keyRoot := k
+								for len(keyRoot) > 0 && keyRoot[len(keyRoot)-1] >= '0' && keyRoot[len(keyRoot)-1] <= '9' {
+									keyRoot = keyRoot[:len(keyRoot)-1]
+								}
+								startEnum := 0
+								if len(keyRoot) != len(k) {
+									if n, err := strconv.Atoi(k[len(keyRoot):]); err == nil {
+										startEnum = n
+									}
+								}
+								// Generate all values in range
+								for i := 0; i < int(count); i++ {
+									enumKey := fmt.Sprintf("%s%d", keyRoot, startEnum+i)
+									dict.Enumerations[enumName][enumKey] = int(start) + i
+								}
+							}
+						}
 					}
 				}
 			}
