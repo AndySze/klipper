@@ -582,7 +582,7 @@ func (th *toolhead) printTimeToClock(printTime float64) uint64 {
 	if printTime <= 0.0 {
 		return 0
 	}
-	return uint64(int64(printTime * th.mcuFreq))
+	return uint64(printTime * th.mcuFreq)
 }
 
 func (th *toolhead) advanceMoveTime(nextPrintTime float64) {
@@ -1636,6 +1636,7 @@ type enableTracking struct {
 	stepper   *stepper
 	enablePin *stepperEnablePin
 	isEnabled bool
+	tmcDriver *tmc2130Driver // Optional TMC driver for runtime re-init
 }
 
 func newEnableTracking(stepper *stepper, pin *stepperEnablePin) *enableTracking {
@@ -1650,6 +1651,7 @@ func (et *enableTracking) motorEnable(printTime float64) {
 	if et.isEnabled {
 		return
 	}
+	fmt.Fprintf(os.Stderr, "TMC: motorEnable for axis=%c, hasTMC=%v\n", et.stepper.axis, et.tmcDriver != nil)
 	if et.stepper.motion != nil && et.stepper.motion.deferEnablePins {
 		et.enablePin.setEnableDeferred(printTime)
 		et.isEnabled = true
@@ -1658,6 +1660,14 @@ func (et *enableTracking) motorEnable(printTime float64) {
 	if err := et.enablePin.setEnable(printTime); err != nil {
 		et.stepper.motion.setCallbackError(err)
 		return
+	}
+	// TMC2130 runtime re-initialization (matches Python's _do_enable)
+	if et.tmcDriver != nil {
+		fmt.Fprintf(os.Stderr, "TMC: calling doEnable for axis=%c, spiOID=%d\n", et.stepper.axis, et.tmcDriver.spiOID)
+		if err := et.tmcDriver.doEnable(); err != nil {
+			et.stepper.motion.setCallbackError(err)
+			return
+		}
 	}
 	et.isEnabled = true
 }
@@ -1685,6 +1695,15 @@ func newStepperEnable(th *toolhead) *stepperEnable {
 
 func (se *stepperEnable) registerStepper(name string, stepper *stepper, pin *stepperEnablePin) {
 	se.lines[name] = newEnableTracking(stepper, pin)
+}
+
+// setTMCDriver associates a TMC driver with a stepper for runtime re-initialization.
+// The TMC driver's doEnable() will be called when the stepper is first used.
+func (se *stepperEnable) setTMCDriver(name string, driver *tmc2130Driver) {
+	fmt.Fprintf(os.Stderr, "TMC: setTMCDriver for %s, spiOID=%d, et=%v\n", name, driver.spiOID, se.lines[name] != nil)
+	if et := se.lines[name]; et != nil {
+		et.tmcDriver = driver
+	}
 }
 
 func (se *stepperEnable) motorOffOrdered(names []string) error {
@@ -1972,6 +1991,10 @@ type runtime struct {
 
 	// Servo controllers (keyed by servo name, e.g., "my_servo")
 	servos map[string]*servoController
+
+	// Sensor-only runtime (for kinematics: none configs)
+	sensorOnly     *sensorOnlyRuntime
+	kinematicsNone bool
 }
 
 type pressureAdvanceState struct {
@@ -2110,6 +2133,12 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	isGenericCartesian := kinType == "generic_cartesian"
 	isHybridCoreXY := kinType == "hybrid_corexy"
 	isHybridCoreXZ := kinType == "hybrid_corexz"
+	fmt.Fprintf(os.Stderr, "DEBUG newRuntime ENTRY: kinType=%s cfgPath=%s\n", kinType, cfgPath)
+
+	// For kinematics: none (sensor-only configs like LED, manual_stepper, load_cell)
+	if kinType == "none" {
+		return newSensorOnlyRuntime(cfgPath, cfg, dict, formats, mcuFreq)
+	}
 
 	// For generic_cartesian, use separate initialization path
 	if isGenericCartesian {
@@ -2890,10 +2919,13 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 			se.registerStepper("my_extra_stepper", extraStepper, extraStepperEn)
 		}
 
-		// Determine extruder stepper OID based on whether there's an extra_stepper
+		// Determine extruder stepper OID based on config type
+		// With TMC2130: oid=13 (matches hosth1 OID layout)
 		// With extra_stepper: oid=10, without extra_stepper: oid=9
 		oidStepperE := uint32(9)
-		if hasExtraStepperSection {
+		if hasTMC2130Enable {
+			oidStepperE = 13 // TMC2130: OID 0-3=SPI, 4-12=steppers X/Y/Z, 13=extruder
+		} else if hasExtraStepperSection {
 			oidStepperE = 10
 		}
 
@@ -3149,6 +3181,64 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 				}
 				rt.tracef("Initialized simple probe endstop for Z homing (endstop OID=0, trsync OID=1)\n")
 			}
+		}
+	}
+
+	// Initialize TMC2130 drivers if configured
+	if hasTMC2130Enable {
+		// TMC2130 SPI OIDs: 0=stepper_x, 1=stepper_y, 2=stepper_z, 3=extruder
+		tmcSteppers := []struct {
+			name   string
+			spiOID int
+		}{
+			{stepperNames[0], 0},
+			{stepperNames[1], 1},
+			{stepperNames[2], 2},
+		}
+		if hasExtruder {
+			tmcSteppers = append(tmcSteppers, struct {
+				name   string
+				spiOID int
+			}{"extruder", 3})
+		}
+
+		for _, ts := range tmcSteppers {
+			secName := "tmc2130 " + ts.name
+			sec, ok := cfg.section(secName)
+			if !ok {
+				continue
+			}
+
+			// Parse TMC2130 config
+			runCurrent := 0.5 // default
+			if v, ok := sec["run_current"]; ok {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+					runCurrent = f
+				}
+			}
+
+			senseResistor := 0.110 // default
+			if v, ok := sec["sense_resistor"]; ok {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+					senseResistor = f
+				}
+			}
+
+			// Get microsteps from stepper section
+			microsteps := 16 // default
+			if stepperSec, ok := cfg.section(ts.name); ok {
+				if v, ok := stepperSec["microsteps"]; ok {
+					if i, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+						microsteps = i
+					}
+				}
+			}
+
+			// Create TMC driver and associate with stepper
+			driver := newTMC2130Driver(rt, ts.spiOID, runCurrent, senseResistor, microsteps)
+			se.setTMCDriver(ts.name, driver)
+			rt.tracef("TMC2130 driver initialized for %s: spiOID=%d, runCurrent=%.2f, senseResistor=%.3f, microsteps=%d\n",
+				ts.name, ts.spiOID, runCurrent, senseResistor, microsteps)
 		}
 	}
 
@@ -5163,9 +5253,22 @@ func (r *runtime) sendLine(line string, cq *chelper.CommandQueue, minClock uint6
 	}
 	b, err := protocol.EncodeCommand(r.formats, line)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "sendLine encode error: %v line=%s\n", err, line)
 		return err
 	}
-	return r.sq.Send(cq, b, minClock, reqClock)
+	if r.sq == nil {
+		fmt.Fprintf(os.Stderr, "sendLine: sq is nil!\n")
+		return fmt.Errorf("serialqueue is nil")
+	}
+	// Debug: log spi_send commands to trace where they go
+	if strings.HasPrefix(line, "spi_send") {
+		fmt.Fprintf(os.Stderr, "DEBUG sendLine: sq=%p cq=%p line=%s\n", r.sq, cq, line[:min(len(line), 50)])
+	}
+	err = r.sq.Send(cq, b, minClock, reqClock)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sendLine sq.Send error: %v\n", err)
+	}
+	return err
 }
 
 // sendConfigLine sends a configuration command during initialization
@@ -5445,6 +5548,16 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		}
 	case "QUERY_ENDSTOPS":
 		// Query endstops - just a status report, no MCU output needed
+		return nil
+	case "SET_LED":
+		// LED control - delegate to sensor-only runtime if available
+		if r.sensorOnly != nil {
+			return r.sensorOnly.cmdSetLED(r, cmd.Args)
+		}
+		return fmt.Errorf("SET_LED requires LED configuration")
+	case "SET_LED_TEMPLATE":
+		// SET_LED_TEMPLATE is a display template feature - not implemented yet
+		// For now, ignore it (Python outputs nothing for basic template changes)
 		return nil
 	default:
 		return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
@@ -6389,11 +6502,6 @@ func (r *runtime) homingMovePolar(movepos []float64, speed float64) error {
 		return err
 	}
 	r.tracef("HOMING polar arm: after homeStop\n")
-
-	// Flush remaining decel steps
-	if err := r.toolhead.flushStepGeneration(); err != nil {
-		return err
-	}
 
 	// Set final position
 	if err := r.toolhead.setPosition(movepos, "xy"); err != nil {
