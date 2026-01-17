@@ -22,7 +22,7 @@ type VirtualSDCard struct {
 
 // loopFrame tracks a single loop context
 type loopFrame struct {
-	count    int   // remaining iterations (0 means exit loop)
+	count    int   // remaining iterations (0 means infinite loop, >0 means finite)
 	position int64 // file position to seek back to
 }
 
@@ -126,6 +126,8 @@ func (sd *VirtualSDCard) LoopBegin(count int) error {
 
 // LoopEnd handles end of loop. Decrements counter and seeks back if needed.
 // Called from SDCARD_LOOP_END command.
+// COUNT=0 means infinite loop (keeps looping until SDCARD_LOOP_DESIST is called).
+// COUNT>0 means finite loop (decrements and exits when reaches 0).
 func (sd *VirtualSDCard) LoopEnd() error {
 	if sd.file == nil {
 		return fmt.Errorf("SDCARD_LOOP_END called outside SD card print")
@@ -136,21 +138,31 @@ func (sd *VirtualSDCard) LoopEnd() error {
 		return nil
 	}
 
-	// Get top frame
+	// Pop top frame
 	idx := len(sd.loopStack) - 1
-	frame := &sd.loopStack[idx]
+	frame := sd.loopStack[idx]
+	sd.loopStack = sd.loopStack[:idx]
 
-	frame.count--
-	if frame.count > 0 {
-		// Seek back to loop start
+	if frame.count == 0 {
+		// Infinite loop (COUNT=0) - keep looping
 		if _, err := sd.file.Seek(frame.position, io.SeekStart); err != nil {
 			return fmt.Errorf("seek loop start: %w", err)
 		}
-		// Reset reader buffer after seek
 		sd.reader.Reset(sd.file)
+		// Push frame back with count=0 (infinite)
+		sd.loopStack = append(sd.loopStack, frame)
+	} else if frame.count == 1 {
+		// Last iteration - don't loop back, just continue
+		// Frame already popped above
 	} else {
-		// Loop done - pop stack
-		sd.loopStack = sd.loopStack[:idx]
+		// More iterations remaining - decrement and loop back
+		if _, err := sd.file.Seek(frame.position, io.SeekStart); err != nil {
+			return fmt.Errorf("seek loop start: %w", err)
+		}
+		sd.reader.Reset(sd.file)
+		// Push frame back with decremented count
+		frame.count--
+		sd.loopStack = append(sd.loopStack, frame)
 	}
 	return nil
 }

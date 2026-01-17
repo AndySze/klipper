@@ -24,10 +24,13 @@ func NewFromConfig(cfg Config) (Kinematics, error) {
 	// Normalize the kinematic type
 	kinType := strings.ToLower(strings.TrimSpace(cfg.Type))
 
-	// Polar requires at least 2 rails (arm, z), others require 3
+	// Polar requires at least 2 rails (arm, z), winch requires 3+, others require 3
 	minRails := 3
 	if kinType == "polar" {
 		minRails = 2
+	}
+	if kinType == "winch" {
+		minRails = 3 // Winch can have more, but minimum is 3
 	}
 	if len(cfg.Rails) < minRails {
 		return nil, fmt.Errorf("kinematics %s requires at least %d rails, got %d", kinType, minRails, len(cfg.Rails))
@@ -83,6 +86,26 @@ func NewFromConfig(cfg Config) (Kinematics, error) {
 			MaxZAccel:    cfg.MaxZAccel,
 		}
 		return NewDeltaKinematics(deltaCfg)
+
+	case "winch":
+		// Winch kinematics uses cable lengths from anchor points.
+		// Anchors should be configured in the stepper sections as anchor_x, anchor_y, anchor_z.
+		// For now, use placeholder anchors based on rail bounds.
+		anchors := make([][3]float64, len(cfg.Rails))
+		for i, rail := range cfg.Rails {
+			// Use position_max as a rough approximation of anchor position
+			anchors[i] = [3]float64{
+				rail.PositionMax,
+				rail.PositionMax,
+				rail.PositionMax,
+			}
+		}
+		winchCfg := WinchConfig{
+			Anchors:      anchors,
+			MaxZVelocity: cfg.MaxZVelocity,
+			MaxZAccel:    cfg.MaxZAccel,
+		}
+		return NewWinchKinematics(winchCfg)
 
 	default:
 		return nil, fmt.Errorf("unsupported kinematics type: %s", cfg.Type)
@@ -236,7 +259,7 @@ func LoadFromPrinterConfig(printerCfg map[string]map[string]string) (Kinematics,
 func IsSupported(kinType string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(kinType))
 	switch normalized {
-	case "cartesian", "corexy", "corexz", "delta", "deltesian", "polar":
+	case "cartesian", "corexy", "corexz", "delta", "deltesian", "polar", "winch":
 		return true
 	default:
 		return false
@@ -245,5 +268,5 @@ func IsSupported(kinType string) bool {
 
 // SupportedTypes returns a list of supported kinematic types.
 func SupportedTypes() []string {
-	return []string{"cartesian", "corexy", "corexz", "delta", "deltesian", "polar"}
+	return []string{"cartesian", "corexy", "corexz", "delta", "deltesian", "polar", "winch"}
 }

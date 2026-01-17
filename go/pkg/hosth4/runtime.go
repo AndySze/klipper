@@ -1989,6 +1989,12 @@ type runtime struct {
 	// Fan control
 	fanManager *fanManager
 
+	// Output pin control (PWM and digital)
+	outputPinManager *outputPinManager
+
+	// Exclude object support
+	excludeObject *excludeObjectManager
+
 	// Servo controllers (keyed by servo name, e.g., "my_servo")
 	servos map[string]*servoController
 
@@ -3117,6 +3123,18 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		return nil, fmt.Errorf("initialize fan manager: %w", err)
 	} else if fm != nil {
 		rt.fanManager = fm
+	}
+
+	// Initialize output pin manager
+	if opm, err := newOutputPinManager(rt, cfg); err != nil {
+		return nil, fmt.Errorf("initialize output pin manager: %w", err)
+	} else if opm != nil {
+		rt.outputPinManager = opm
+	}
+
+	// Initialize exclude_object manager if [exclude_object] section exists
+	if _, hasExcludeObject := cfg.section("exclude_object"); hasExcludeObject {
+		rt.excludeObject = newExcludeObjectManager(rt)
 	}
 
 	// Initialize bed_screws if [bed_screws] section exists
@@ -5549,6 +5567,36 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 	case "QUERY_ENDSTOPS":
 		// Query endstops - just a status report, no MCU output needed
 		return nil
+	case "SET_PIN":
+		if r.outputPinManager == nil {
+			return fmt.Errorf("no output pins configured")
+		}
+		// Get print time for the PWM command
+		printTime, err := r.toolhead.getLastMoveTime()
+		if err != nil {
+			return err
+		}
+		return r.outputPinManager.cmdSetPin(cmd.Args, printTime)
+	case "EXCLUDE_OBJECT_START":
+		if r.excludeObject == nil {
+			return fmt.Errorf("exclude_object not configured")
+		}
+		return r.excludeObject.cmdExcludeObjectStart(cmd.Args)
+	case "EXCLUDE_OBJECT_END":
+		if r.excludeObject == nil {
+			return fmt.Errorf("exclude_object not configured")
+		}
+		return r.excludeObject.cmdExcludeObjectEnd(cmd.Args)
+	case "EXCLUDE_OBJECT":
+		if r.excludeObject == nil {
+			return fmt.Errorf("exclude_object not configured")
+		}
+		return r.excludeObject.cmdExcludeObject(cmd.Args)
+	case "EXCLUDE_OBJECT_DEFINE":
+		if r.excludeObject == nil {
+			return fmt.Errorf("exclude_object not configured")
+		}
+		return r.excludeObject.cmdExcludeObjectDefine(cmd.Args)
 	case "SET_LED":
 		// LED control - delegate to sensor-only runtime if available
 		if r.sensorOnly != nil {
