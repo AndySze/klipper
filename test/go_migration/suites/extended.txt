@@ -1,0 +1,49 @@
+# Extended suite for Go migration testing
+#
+# Includes all cartesian-based tests that should work with current Go host
+
+# === From minimal suite (known working) ===
+test/klippy/commands.test
+test/klippy/out_of_bounds.test
+test/klippy/gcode_arcs.test
+test/klippy/bed_screws.test
+test/klippy/extruders.test
+test/klippy/pressure_advance.test
+test/klippy/manual_stepper.test
+test/klippy/bltouch.test
+test/klippy/screws_tilt_adjust.test
+test/klippy/linuxtest.test
+test/klippy/macros.test
+
+# === New cartesian tests ===
+
+# Input shaping (motion planning)
+test/klippy/input_shaper.test
+
+# Temperature sensors and control
+test/klippy/temperature.test
+
+# Z-axis leveling
+test/klippy/z_tilt.test
+test/klippy/quad_gantry_level.test
+
+# PWM output
+test/klippy/pwm.test
+
+# LED control
+test/klippy/led.test
+
+# Multi-Z axis
+test/klippy/multi_z.test
+
+# Object exclusion
+test/klippy/exclude_object.test
+
+# TMC driver tests
+test/klippy/tmc.test
+
+# Virtual endstop (BLTouch-style)
+test/klippy/z_virtual_endstop.test
+
+# Dual carriage (IDEX)
+test/klippy/dual_carriage.test

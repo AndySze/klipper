@@ -155,10 +155,25 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 
 	var initLines []string
 	if kin == "none" {
-		// Load cell sensors - no steppers, no motion
-		initLines, err = hosth1.CompileLoadCellConnectPhase(cfgPath, dict)
-		if err != nil {
-			return nil, err
+		// Sensor-only configs (no steppers, no motion)
+		// Detect which type of sensor config
+		_, hasLoadCell := cfg.section("load_cell my_ads1220")
+		_, hasLED := cfg.section("led lled")
+		_, hasNeopixel := cfg.section("neopixel nled")
+		if hasLED || hasNeopixel {
+			// LED config
+			initLines, err = hosth1.CompileLEDConnectPhase(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		} else if hasLoadCell {
+			// Load cell sensors
+			initLines, err = hosth1.CompileLoadCellConnectPhase(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, fmt.Errorf("unsupported kinematics: none config type")
 		}
 	} else if base == "bltouch.cfg" || base == "screws_tilt_adjust.cfg" {
 		initLines, err = hosth1.CompileBLTouchConnectPhase(cfgPath, dict)
@@ -330,6 +345,13 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		}
 	}
 
+	// Initialize LEDs (for kinematics:none with LED configs)
+	if rt.sensorOnly != nil && len(rt.sensorOnly.leds) > 0 {
+		if err := rt.sensorOnly.initLEDs(rt); err != nil {
+			return nil, err
+		}
+	}
+
 	shouldFail := false
 	didFail := false
 	// The upstream Klipper regression `test/klippy/commands.test` is used as a
@@ -429,17 +451,21 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 			return nil, fmt.Errorf("expected failure but test completed successfully")
 		}
 	} else {
-		// Flush any remaining moves in the lookahead queue
-		if err := rt.toolhead.flushLookahead(false); err != nil {
-			return nil, err
-		}
-		for i := 0; i < 10000; i++ {
-			didWork, err := rt.motion.flushHandlerDebugOnce()
-			if err != nil {
+		// Flush any remaining moves in the lookahead queue (skip for kinematics:none)
+		if rt.toolhead != nil {
+			if err := rt.toolhead.flushLookahead(false); err != nil {
 				return nil, err
 			}
-			if !didWork {
-				break
+		}
+		if rt.motion != nil {
+			for i := 0; i < 10000; i++ {
+				didWork, err := rt.motion.flushHandlerDebugOnce()
+				if err != nil {
+					return nil, err
+				}
+				if !didWork {
+					break
+				}
 			}
 		}
 		// Some upstream regressions end with motors disabled in debugoutput.

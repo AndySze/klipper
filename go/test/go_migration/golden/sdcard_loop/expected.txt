@@ -1,0 +1,7 @@
+# Source: test/klippy/sdcard_loop.test
+# Config: sdcard_loop.cfg
+# Expected failure: False
+# Return code: 0
+
+## MCU: mcu (dict: atmega2560.dict)
+

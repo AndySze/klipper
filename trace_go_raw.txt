@@ -1,0 +1,2 @@
+go: GOPATH entry is relative; must be absolute path: "../out/go-path".
+For more details see: 'go help gopath'

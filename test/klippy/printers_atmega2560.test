@@ -1,0 +1,13 @@
+# Subset of printers.test for atmega2560 boards (Go migration)
+# Tests example kinematic configs with atmega2560
+DICTIONARY atmega2560.dict
+CONFIG ../../config/example-cartesian.cfg
+CONFIG ../../config/example-corexy.cfg
+CONFIG ../../config/example-corexz.cfg
+CONFIG ../../config/example-hybrid-corexy.cfg
+CONFIG ../../config/example-hybrid-corexz.cfg
+CONFIG ../../config/example-delta.cfg
+CONFIG ../../config/example-deltesian.cfg
+CONFIG ../../config/example-rotary-delta.cfg
+CONFIG ../../config/example-winch.cfg
+GCODE move.gcode

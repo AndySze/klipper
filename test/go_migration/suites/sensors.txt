@@ -1,0 +1,2 @@
+# Test new sensor types
+test/klippy/printers_ramps.test

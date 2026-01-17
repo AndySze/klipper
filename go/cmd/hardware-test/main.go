@@ -135,8 +135,19 @@ func main() {
 		fmt.Println("\nAll tests passed!")
 	case sig := <-sigCh:
 		fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
-		ri.Disconnect()
-		os.Exit(130) // Standard exit code for SIGINT
+		// Don't wait for disconnect - just exit on second signal
+		go func() {
+			ri.Disconnect()
+		}()
+		// Wait for second signal to force quit
+		select {
+		case <-sigCh:
+			fmt.Println("\nForce quit")
+			os.Exit(1)
+		case <-time.After(2 * time.Second):
+			fmt.Println("\nClean shutdown")
+			os.Exit(130)
+		}
 	}
 }
 

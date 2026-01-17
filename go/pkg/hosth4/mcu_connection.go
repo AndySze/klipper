@@ -181,6 +181,7 @@ func (mc *MCUConnection) Connect() error {
 	// Perform MCU identification handshake
 	handshakeCfg := mcupkg.DefaultHandshakeConfig()
 	handshakeCfg.Timeout = mc.config.HandshakeTimeout
+	handshakeCfg.Trace = mc.config.Trace
 	identifyData, err := mcupkg.Handshake(port, handshakeCfg)
 	if err != nil {
 		port.Close()

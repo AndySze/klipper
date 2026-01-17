@@ -1,0 +1,2 @@
+# Test fan support
+test/klippy/printers_ramps.test

@@ -1,0 +1,2 @@
+# Bed screws adjustment tool test
+test/klippy/bed_screws.test

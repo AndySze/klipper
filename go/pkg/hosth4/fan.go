@@ -21,6 +21,10 @@ type fan struct {
 	lastFanValue    float64
 	lastFanTime     float64
 	enabledFromTime float64
+	// PWM output control
+	out        *digitalOut // PWM output for sending commands to MCU
+	cycleTicks uint64      // PWM cycle in MCU ticks
+	mcuFreq    float64     // MCU frequency for time conversion
 }
 
 // fanConfig holds configuration for a fan.
@@ -133,13 +137,22 @@ func (f *fan) setSpeed(printTime float64, value float64) error {
 	if value > 0 && f.lastFanValue == 0 && f.kickStartTime > 0 {
 		// Run at kick start power first
 		f.enabledFromTime = printTime
-		// In real implementation, would schedule a callback to reduce power
+		// TODO: In full implementation, would schedule a callback to reduce power
+		// after kickStartTime elapses
 	}
 
 	f.lastFanValue = value
 	f.lastFanTime = printTime
 
-	// In real implementation, would send PWM command to MCU
+	// Send PWM command to MCU if output is configured
+	if f.out != nil && f.cycleTicks > 0 {
+		// Convert value (0.0-1.0) to on_ticks
+		onTicks := uint32(value*float64(f.cycleTicks) + 0.5)
+		if err := f.out.setOnTicks(printTime, onTicks); err != nil {
+			return err
+		}
+	}
+
 	f.rt.tracef("Fan %s: set speed to %.2f at time %.3f\n", f.name, value, printTime)
 
 	return nil
@@ -193,6 +206,17 @@ func newFanManager(rt *runtime, cfg *configWrapper) (*fanManager, error) {
 	if err != nil {
 		return nil, err
 	}
+	if partFan != nil {
+		// Set up PWM output for the main fan
+		// OID 12 is used for fan when [fan] section is present (see hosth1/h1.go)
+		const fanOID = 12
+		const fanCycleTime = 0.010 // 10ms default cycle time
+		cycleTicks := uint64(fanCycleTime * rt.mcuFreq)
+		fanOut := newDigitalOut(fanOID, false, rt.sq, rt.cqMain, rt.formats, rt.mcuFreq, "mcu")
+		partFan.out = fanOut
+		partFan.cycleTicks = cycleTicks
+		partFan.mcuFreq = rt.mcuFreq
+	}
 	fm.partFan = partFan
 
 	// Load [fan_generic xxx] sections
@@ -204,6 +228,8 @@ func newFanManager(rt *runtime, cfg *configWrapper) (*fanManager, error) {
 		if f != nil {
 			fanName := name[len("fan_generic "):]
 			fm.namedFans[fanName] = f
+			// Note: fan_generic fans would need their own OID allocation
+			// which is not yet implemented
 		}
 	}
 

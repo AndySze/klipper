@@ -1,0 +1,4 @@
+# Test new sensor types
+DICTIONARY atmega2560.dict
+CONFIG ../../config/printer-lulzbot-mini2-2018.cfg
+GCODE move.gcode

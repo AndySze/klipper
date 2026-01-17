@@ -38,6 +38,9 @@ type HandshakeConfig struct {
 
 	// ExpectedCRC if set, verify dictionary CRC matches
 	ExpectedCRC uint32
+
+	// Trace writer for debug output (optional)
+	Trace io.Writer
 }
 
 // DefaultHandshakeConfig returns a HandshakeConfig with default values.
@@ -89,15 +92,24 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 	// Collect identify data by querying chunks
 	var identifyData []byte
 	seq := 0
+	iteration := 0
 
 	for time.Now().Before(deadline) {
+		iteration++
 		offset := len(identifyData)
 		cmd := encodeIdentifyCommand(offset, cfg.ReadChunkSize)
 		msgBlock := protocol.EncodeMsgblock(seq, cmd)
 		seq = (seq + 1) & protocol.MESSAGE_SEQ_MASK
 
+		if cfg.Trace != nil {
+			fmt.Fprintf(cfg.Trace, "Handshake[%d]: TX offset=%d len=%d: %x\n", iteration, offset, len(msgBlock), msgBlock)
+		}
+
 		resp, err := sendWithRetry(port, msgBlock, cfg.MaxRetries, cfg.RetryDelay, deadline)
 		if err != nil {
+			if cfg.Trace != nil {
+				fmt.Fprintf(cfg.Trace, "Handshake[%d]: sendWithRetry error: %v\n", iteration, err)
+			}
 			if errors.Is(err, ErrTimeout) && len(identifyData) == 0 {
 				// No response at all - MCU might not be connected
 				return nil, ErrNoResponse
@@ -105,9 +117,16 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 			return nil, fmt.Errorf("mcu: identify failed: %w", err)
 		}
 
+		if cfg.Trace != nil {
+			fmt.Fprintf(cfg.Trace, "Handshake[%d]: RX len=%d: %x\n", iteration, len(resp), resp)
+		}
+
 		// Parse identify_response
 		respOffset, data, err := parseIdentifyResponse(resp)
 		if err != nil {
+			if cfg.Trace != nil {
+				fmt.Fprintf(cfg.Trace, "Handshake[%d]: parse error: %v\n", iteration, err)
+			}
 			return nil, fmt.Errorf("mcu: parse identify response: %w", err)
 		}
 
@@ -257,7 +276,8 @@ func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay tim
 		port.SetReadTimeout(500 * time.Millisecond)
 		n, err := port.Read(resp)
 		if err != nil {
-			if errors.Is(err, serial.ErrTimeout) {
+			// Check for timeout - handle both error types
+			if errors.Is(err, serial.ErrTimeout) || err.Error() == "serial: operation timed out" {
 				lastErr = ErrTimeout
 				// Retry with exponential backoff
 				if retry < maxRetries {
