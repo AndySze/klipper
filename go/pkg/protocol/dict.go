@@ -316,3 +316,64 @@ func (d *Dictionary) BuildCommandFormats() (map[string]*MessageFormat, error) {
     }
     return out, nil
 }
+
+// BuildResponseFormats builds response formats indexed by message ID.
+// This is used for decoding incoming messages from the MCU.
+func (d *Dictionary) BuildResponseFormats() (map[int]*MessageFormat, error) {
+    out := make(map[int]*MessageFormat, len(d.Responses))
+    for fmtStr, id := range d.Responses {
+        names, types := parseFormat(fmtStr, d.Enumerations)
+        m := &MessageFormat{
+            Name:        strings.Fields(fmtStr)[0],
+            Format:      fmtStr,
+            ID:          id,
+            ParamNames:  names,
+            ParamTypes:  types,
+            DebugFormat: convertDebugFormat(fmtStr, types),
+        }
+        out[id] = m
+    }
+    return out, nil
+}
+
+// DecodeVLQ decodes a VLQ-encoded integer from the buffer.
+// Returns the decoded value and number of bytes consumed.
+func DecodeVLQ(buf []byte) (int32, int) {
+    if len(buf) == 0 {
+        return 0, 0
+    }
+    return DecodeUint32(buf, 0)
+}
+
+// DecodeParams decodes message parameters according to the message format.
+// Returns a map of parameter names to values.
+func DecodeParams(format *MessageFormat, data []byte) (map[string]interface{}, error) {
+    params := make(map[string]interface{}, len(format.ParamNames))
+    pos := 0
+    for i, pt := range format.ParamTypes {
+        if pos >= len(data) {
+            break
+        }
+        name := format.ParamNames[i]
+        switch t := pt.(type) {
+        case ptBuffer:
+            b, np := t.DecodeBytes(data, pos)
+            pos = np
+            params[name] = b
+        case ptEnum:
+            v, np := pt.DecodeInt(data, pos)
+            pos = np
+            // Try to resolve enum name
+            if enumName, ok := t.Rev[int(v)]; ok {
+                params[name] = enumName
+            } else {
+                params[name] = int(v)
+            }
+        default:
+            v, np := pt.DecodeInt(data, pos)
+            pos = np
+            params[name] = int(v)
+        }
+    }
+    return params, nil
+}

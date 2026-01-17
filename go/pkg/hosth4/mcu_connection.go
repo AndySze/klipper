@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"klipper-go-migration/pkg/chelper"
 	mcupkg "klipper-go-migration/pkg/mcu"
 	"klipper-go-migration/pkg/protocol"
 	"klipper-go-migration/pkg/reactor"
@@ -46,6 +47,11 @@ type MCUConnectionConfig struct {
 	// This is needed if the MCU may be in a previously-configured state
 	ResetOnConnect bool
 
+	// UseSerialQueue enables the chelper serialqueue for MCU communication.
+	// This provides better retransmission handling and timing accuracy.
+	// When false (default), uses the pure Go serial I/O implementation.
+	UseSerialQueue bool
+
 	// Debugging
 	Trace io.Writer
 }
@@ -76,8 +82,11 @@ type MCUConnection struct {
 	// Protocol dictionary (from handshake)
 	dict *protocol.Dictionary
 
-	// Message reader for background reception
+	// Message reader for background reception (used when UseSerialQueue=false)
 	reader *mcupkg.Reader
+
+	// SerialQueue adapter (used when UseSerialQueue=true)
+	sqAdapter *chelper.SerialQueueAdapter
 
 	// Reactor for timing and scheduling
 	reactor *reactor.Reactor
@@ -217,15 +226,52 @@ func (mc *MCUConnection) Connect() error {
 	// Initialize clock conversion factor (MCU clocks per second)
 	mc.clockConv = mc.mcuFreq
 
-	// Create message reader
-	mc.reader = mcupkg.NewReader(port, mc.dict)
-	mc.reader.SetDefaultHandler(mc.handleUnknownMessage)
+	// Initialize communication layer based on configuration
+	if mc.config.UseSerialQueue {
+		// Use chelper serialqueue for communication
+		mc.tracef("MCU %s: Using chelper serialqueue for communication\n", mc.name)
 
-	// Register standard message handlers
-	mc.registerStandardHandlers()
+		sq, err := chelper.NewSerialQueue(port.Fd(), 'u', 0, mc.name)
+		if err != nil {
+			port.Close()
+			mc.mu.Unlock()
+			return fmt.Errorf("mcu %s: create serialqueue: %w", mc.name, err)
+		}
 
-	// Start reader background goroutine
-	mc.reader.Start()
+		// Configure serialqueue
+		sq.SetWireFrequency(float64(mc.config.BaudRate) * 10) // bits per second
+		sq.SetReceiveWindow(25) // Default receive window
+
+		adapter, err := chelper.NewSerialQueueAdapter(sq, mc.dict)
+		if err != nil {
+			sq.Free()
+			port.Close()
+			mc.mu.Unlock()
+			return fmt.Errorf("mcu %s: create adapter: %w", mc.name, err)
+		}
+
+		// Register handlers on adapter
+		mc.sqAdapter = adapter
+		mc.registerSerialQueueHandlers()
+
+		// Start adapter receive loop
+		if err := adapter.Start(); err != nil {
+			adapter.Close()
+			port.Close()
+			mc.mu.Unlock()
+			return fmt.Errorf("mcu %s: start adapter: %w", mc.name, err)
+		}
+	} else {
+		// Use traditional mcupkg.Reader
+		mc.reader = mcupkg.NewReader(port, mc.dict)
+		mc.reader.SetDefaultHandler(mc.handleUnknownMessage)
+
+		// Register standard message handlers
+		mc.registerStandardHandlers()
+
+		// Start reader background goroutine
+		mc.reader.Start()
+	}
 
 	// Start command sender goroutine
 	mc.wg.Add(1)
@@ -276,9 +322,13 @@ func (mc *MCUConnection) disconnectLocked() error {
 	// Cancel context
 	mc.cancel()
 
-	// Stop reader
+	// Stop reader or SerialQueueAdapter
 	if mc.reader != nil {
 		mc.reader.Stop()
+	}
+	if mc.sqAdapter != nil {
+		mc.sqAdapter.Close()
+		mc.sqAdapter = nil
 	}
 
 	// Wait for goroutines
@@ -464,16 +514,9 @@ func (mc *MCUConnection) sendCommandDirect(cmd mcuCmd) {
 		return
 	}
 
-	// Get sequence number
-	mc.cmdSeqLock.Lock()
-	seq := mc.cmdSeq
-	mc.cmdSeq = (mc.cmdSeq + 1) & protocol.MESSAGE_SEQ_MASK
-	mc.cmdSeqLock.Unlock()
-
 	// If expecting a response, register pending by name
 	if cmd.response != "" && cmd.respChan != nil {
 		mc.pendingMu.Lock()
-		mc.pending[seq] = cmd.respChan
 		mc.pendingByName[cmd.response] = pendingResp{
 			oid:      cmd.oid,
 			respChan: cmd.respChan,
@@ -484,19 +527,38 @@ func (mc *MCUConnection) sendCommandDirect(cmd mcuCmd) {
 		go func() {
 			time.Sleep(cmd.timeout)
 			mc.pendingMu.Lock()
-			if ch, ok := mc.pending[seq]; ok {
-				delete(mc.pending, seq)
-				close(ch)
-			}
 			delete(mc.pendingByName, cmd.response)
 			mc.pendingMu.Unlock()
 		}()
 	}
 
-	// Encode and send message
-	msg := protocol.EncodeMsgblock(int(seq), cmd.data)
-	if mc.port != nil {
-		mc.port.Write(msg)
+	mc.mu.RLock()
+	useSerialQueue := mc.config.UseSerialQueue
+	sqAdapter := mc.sqAdapter
+	port := mc.port
+	mc.mu.RUnlock()
+
+	if useSerialQueue && sqAdapter != nil {
+		// Send via SerialQueueAdapter (handles msgblock encoding internally)
+		if err := sqAdapter.SendImmediate(cmd.data); err != nil {
+			mc.tracef("MCU %s: send error: %v\n", mc.name, err)
+		}
+	} else if port != nil {
+		// Traditional send via serial port
+		mc.cmdSeqLock.Lock()
+		seq := mc.cmdSeq
+		mc.cmdSeq = (mc.cmdSeq + 1) & protocol.MESSAGE_SEQ_MASK
+		mc.cmdSeqLock.Unlock()
+
+		// Register pending by seq for legacy mode
+		if cmd.response != "" && cmd.respChan != nil {
+			mc.pendingMu.Lock()
+			mc.pending[seq] = cmd.respChan
+			mc.pendingMu.Unlock()
+		}
+
+		msg := protocol.EncodeMsgblock(int(seq), cmd.data)
+		port.Write(msg)
 	}
 }
 
@@ -632,6 +694,148 @@ func (mc *MCUConnection) registerStandardHandlers() {
 	mc.reader.RegisterHandler("endstop_state", nil, func(msg *mcupkg.Message) {
 		mc.dispatchMessage(msg)
 	})
+}
+
+// registerSerialQueueHandlers sets up handlers on the SerialQueueAdapter.
+func (mc *MCUConnection) registerSerialQueueHandlers() {
+	// Set default handler for unknown messages
+	mc.sqAdapter.SetDefaultHandler(func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.tracef("MCU %s: Unknown message %s: %v\n", mc.name, name, params)
+		mc.dispatchSQMessage(name, params, receiveTime)
+	})
+
+	// Shutdown response
+	mc.sqAdapter.RegisterHandler("shutdown", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.handleShutdownSQ(params)
+	})
+
+	// Clock response for synchronization
+	mc.sqAdapter.RegisterHandler("clock", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.handleClockResponseSQ(params, receiveTime)
+	})
+
+	// Status message
+	mc.sqAdapter.RegisterHandler("status", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.tracef("MCU %s: Status: %v\n", mc.name, params)
+	})
+
+	// Config CRC response
+	mc.sqAdapter.RegisterHandler("config", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.dispatchSQMessage(name, params, receiveTime)
+	})
+
+	// Thermocouple/temperature responses
+	mc.sqAdapter.RegisterHandler("thermocouple_result", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.dispatchSQMessage(name, params, receiveTime)
+	})
+
+	// ADC responses
+	mc.sqAdapter.RegisterHandler("analog_in_state", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.dispatchSQMessage(name, params, receiveTime)
+	})
+
+	// Endstop responses
+	mc.sqAdapter.RegisterHandler("endstop_state", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.dispatchSQMessage(name, params, receiveTime)
+	})
+}
+
+// dispatchSQMessage dispatches a message received via SerialQueueAdapter.
+func (mc *MCUConnection) dispatchSQMessage(name string, params map[string]interface{}, receiveTime float64) {
+	// First, check for pending response waiters
+	mc.pendingMu.Lock()
+	if pending, ok := mc.pendingByName[name]; ok {
+		// Check OID match if specified
+		var oidMatch bool
+		if pending.oid == nil {
+			oidMatch = true
+		} else if oid, ok := params["oid"].(int); ok && *pending.oid == oid {
+			oidMatch = true
+		}
+		if oidMatch {
+			delete(mc.pendingByName, name)
+			mc.pendingMu.Unlock()
+
+			// Create mcupkg.Message for compatibility
+			msg := &mcupkg.Message{
+				Name:        name,
+				Params:      params,
+				ReceiveTime: time.Unix(0, int64(receiveTime*1e9)),
+			}
+			if oid, ok := params["oid"].(int); ok {
+				msg.OID = &oid
+			}
+
+			select {
+			case pending.respChan <- msg:
+			default:
+			}
+			return
+		}
+	}
+	mc.pendingMu.Unlock()
+
+	// Then check handlers
+	mc.handlersMu.RLock()
+	defer mc.handlersMu.RUnlock()
+
+	recvTime := time.Unix(0, int64(receiveTime*1e9))
+
+	// Check for OID-specific handler first
+	if oid, ok := params["oid"].(int); ok {
+		if oidHandlers, ok := mc.oidHandlers[oid]; ok {
+			if handler, ok := oidHandlers[name]; ok {
+				handler(params, recvTime)
+				return
+			}
+		}
+	}
+
+	// Check for global handler
+	if handler, ok := mc.handlers[name]; ok {
+		handler(params, recvTime)
+	}
+}
+
+// handleShutdownSQ handles MCU shutdown notification via SerialQueueAdapter.
+func (mc *MCUConnection) handleShutdownSQ(params map[string]interface{}) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	mc.shutdown = true
+	if reason, ok := params["static_string_id"].(int); ok {
+		mc.shutdownReason = fmt.Sprintf("static_string_id=%d", reason)
+	}
+
+	mc.tracef("MCU %s: Shutdown received: %s\n", mc.name, mc.shutdownReason)
+}
+
+// handleClockResponseSQ handles clock synchronization response via SerialQueueAdapter.
+func (mc *MCUConnection) handleClockResponseSQ(params map[string]interface{}, receiveTime float64) {
+	clock, ok := params["clock"].(int)
+	if !ok {
+		return
+	}
+
+	mc.clockSyncMu.Lock()
+	defer mc.clockSyncMu.Unlock()
+
+	// Record sample
+	sample := clockSample{
+		hostTime: receiveTime,
+		mcuClock: uint64(clock),
+	}
+
+	mc.clockSamples = append(mc.clockSamples, sample)
+	if len(mc.clockSamples) > mc.config.ClockSyncSamples {
+		mc.clockSamples = mc.clockSamples[1:]
+	}
+
+	// Update clock offset if we have enough samples
+	if len(mc.clockSamples) >= 3 {
+		mc.updateClockOffset()
+		mc.clockSynced = true
+	}
 }
 
 // handleUnknownMessage handles messages without specific handlers.

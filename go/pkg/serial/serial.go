@@ -292,6 +292,15 @@ func (p *Port) Device() string {
 	return p.device
 }
 
+// Fd returns the underlying file descriptor.
+// This is used to pass the fd to chelper serialqueue.
+// The caller must not close the fd - use Port.Close() instead.
+func (p *Port) Fd() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fd
+}
+
 // SetReadTimeout sets the read timeout.
 func (p *Port) SetReadTimeout(d time.Duration) {
 	p.mu.Lock()
