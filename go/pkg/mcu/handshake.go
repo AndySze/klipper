@@ -237,6 +237,11 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 		// Got valid identify_response - now increment seq for next request
 		seq = (seq + 1) & protocol.MESSAGE_SEQ_MASK
 
+		if cfg.Trace != nil {
+			fmt.Fprintf(cfg.Trace, "Handshake[%d]: parsed OK, respOffset=%d, dataLen=%d\n",
+				iteration, respOffset, len(data))
+		}
+
 		// Verify offset matches what we requested
 		if respOffset != offset {
 			return nil, fmt.Errorf("mcu: identify offset mismatch: got %d, expected %d", respOffset, offset)
@@ -244,10 +249,17 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 
 		// Empty data means we're done
 		if len(data) == 0 {
+			if cfg.Trace != nil {
+				fmt.Fprintf(cfg.Trace, "Handshake[%d]: empty data, breaking loop\n", iteration)
+			}
 			break
 		}
 
 		identifyData = append(identifyData, data...)
+		if cfg.Trace != nil {
+			fmt.Fprintf(cfg.Trace, "Handshake[%d]: identifyData now %d bytes, looping\n",
+				iteration, len(identifyData))
+		}
 	}
 
 	if len(identifyData) == 0 {

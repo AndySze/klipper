@@ -56,12 +56,13 @@ func DefaultConfig() Config {
 
 // Port represents a serial port connection.
 type Port struct {
-	mu       sync.Mutex
-	fd       int
-	device   string
-	config   Config
-	closed   bool
+	mu         sync.Mutex
+	fd         int
+	device     string
+	config     Config
+	closed     bool
 	oldTermios *unix.Termios
+	isSocket   bool // true if connected via Unix socket (e.g., Linux MCU simulator)
 }
 
 // ListPorts returns a list of available serial port device paths.
@@ -211,6 +212,64 @@ func Open(cfg Config) (*Port, error) {
 	return port, nil
 }
 
+// OpenSocket connects to a Unix socket at the given path.
+// This is used to connect to the Linux MCU simulator which communicates
+// via a pseudo-tty exposed as a Unix socket.
+func OpenSocket(socketPath string, timeout time.Duration) (*Port, error) {
+	if socketPath == "" {
+		return nil, errors.New("serial: socket path required")
+	}
+	if timeout == 0 {
+		timeout = 60 * time.Second
+	}
+
+	// Create Unix socket
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, fmt.Errorf("serial: create socket: %w", err)
+	}
+
+	// Set up socket address
+	addr := &unix.SockaddrUnix{Name: socketPath}
+
+	// Try to connect with timeout
+	deadline := time.Now().Add(timeout)
+	var connectErr error
+	for time.Now().Before(deadline) {
+		connectErr = unix.Connect(fd, addr)
+		if connectErr == nil {
+			break
+		}
+		// Socket might not exist yet, wait and retry
+		if errors.Is(connectErr, unix.ENOENT) || errors.Is(connectErr, unix.ECONNREFUSED) {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: connect to %s: %w", socketPath, connectErr)
+	}
+	if connectErr != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: connect timeout to %s: %w", socketPath, connectErr)
+	}
+
+	port := &Port{
+		fd:       fd,
+		device:   socketPath,
+		config:   Config{ReadTimeout: 5 * time.Second},
+		isSocket: true,
+	}
+
+	return port, nil
+}
+
+// IsSocket returns true if this port is connected via Unix socket.
+func (p *Port) IsSocket() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.isSocket
+}
+
 // Read reads up to len(buf) bytes from the port.
 // Returns the number of bytes read and any error.
 func (p *Port) Read(buf []byte) (int, error) {
@@ -269,7 +328,7 @@ func (p *Port) Write(buf []byte) (int, error) {
 	return n, nil
 }
 
-// Close closes the serial port.
+// Close closes the serial port or socket.
 func (p *Port) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -279,8 +338,8 @@ func (p *Port) Close() error {
 	}
 	p.closed = true
 
-	// Restore original settings if possible
-	if p.oldTermios != nil {
+	// Restore original settings if possible (only for serial ports, not sockets)
+	if p.oldTermios != nil && !p.isSocket {
 		_ = unix.IoctlSetTermios(p.fd, ioctlSetTermios, p.oldTermios)
 	}
 

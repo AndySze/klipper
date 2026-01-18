@@ -31,8 +31,12 @@ var (
 // MCUConnectionConfig holds configuration for connecting to an MCU.
 type MCUConnectionConfig struct {
 	// Serial port configuration
-	Device   string // Device path (e.g., /dev/ttyUSB0)
+	Device   string // Device path (e.g., /dev/ttyUSB0) or Unix socket path
 	BaudRate int    // Default: 250000
+
+	// UseSocket indicates the Device is a Unix socket path (e.g., for Linux MCU simulator)
+	// When true, connects via Unix socket instead of serial port
+	UseSocket bool
 
 	// Connection timeouts
 	ConnectTimeout   time.Duration // Default: 60s
@@ -179,31 +183,48 @@ func (mc *MCUConnection) Connect() error {
 		return nil // Already connected
 	}
 
-	mc.tracef("MCU %s: Connecting to %s at %d baud\n", mc.name, mc.config.Device, mc.config.BaudRate)
-
-	// Open serial port
-	serialCfg := serial.Config{
-		Device:         mc.config.Device,
-		BaudRate:       mc.config.BaudRate,
-		ConnectTimeout: mc.config.ConnectTimeout,
-		ReadTimeout:    mc.config.ResponseTimeout,
-		RTSOnConnect:   true,
-		DTROnConnect:   true,
+	if mc.config.UseSocket {
+		mc.tracef("MCU %s: Connecting to socket %s\n", mc.name, mc.config.Device)
+	} else {
+		mc.tracef("MCU %s: Connecting to %s at %d baud\n", mc.name, mc.config.Device, mc.config.BaudRate)
 	}
 
-	port, err := serial.Open(serialCfg)
-	if err != nil {
-		return fmt.Errorf("mcu %s: open serial: %w", mc.name, err)
+	// Open serial port or Unix socket
+	var port *serial.Port
+	var err error
+	if mc.config.UseSocket {
+		// Connect via Unix socket (e.g., Linux MCU simulator)
+		port, err = serial.OpenSocket(mc.config.Device, mc.config.ConnectTimeout)
+		if err != nil {
+			mc.mu.Unlock()
+			return fmt.Errorf("mcu %s: connect socket: %w", mc.name, err)
+		}
+	} else {
+		// Connect via serial port
+		serialCfg := serial.Config{
+			Device:         mc.config.Device,
+			BaudRate:       mc.config.BaudRate,
+			ConnectTimeout: mc.config.ConnectTimeout,
+			ReadTimeout:    mc.config.ResponseTimeout,
+			RTSOnConnect:   true,
+			DTROnConnect:   true,
+		}
+		port, err = serial.Open(serialCfg)
+		if err != nil {
+			mc.mu.Unlock()
+			return fmt.Errorf("mcu %s: open serial: %w", mc.name, err)
+		}
 	}
 	mc.port = port
 
-	mc.tracef("MCU %s: Serial port opened, performing handshake\n", mc.name)
+	mc.tracef("MCU %s: Connection opened, performing handshake\n", mc.name)
 
 	// Perform MCU identification handshake
 	handshakeCfg := mcupkg.DefaultHandshakeConfig()
 	handshakeCfg.Timeout = mc.config.HandshakeTimeout
 	handshakeCfg.Trace = mc.config.Trace
-	handshakeCfg.ResetBeforeIdentify = mc.config.ResetOnConnect
+	// Disable reset for socket connections (no DTR signal on Unix sockets)
+	handshakeCfg.ResetBeforeIdentify = mc.config.ResetOnConnect && !mc.config.UseSocket
 	identifyData, err := mcupkg.Handshake(port, handshakeCfg)
 	if err != nil {
 		port.Close()
