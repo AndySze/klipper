@@ -1960,6 +1960,12 @@ type runtime struct {
 	// Virtual SD card with loop support
 	sdcard *VirtualSDCard
 
+	// Print statistics tracking
+	printStats *PrintStats
+
+	// Pause/Resume support
+	pauseResume *PauseResume
+
 	// Generic cartesian kinematics state (for SET_DUAL_CARRIAGE etc.)
 	genericCartesianKin *GenericCartesianKinematics
 

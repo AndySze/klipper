@@ -12,6 +12,18 @@ const (
 	arcPlaneYZ = 2
 )
 
+// gcodeState holds a saved gcode state for SAVE/RESTORE_GCODE_STATE.
+type gcodeState struct {
+	absoluteCoord   bool
+	absoluteExtrude bool
+	basePosition    []float64
+	lastPosition    []float64
+	speed           float64
+	speedFactor     float64
+	extrudeFactor   float64
+	arcPlane        int
+}
+
 type gcodeMove struct {
 	toolhead *toolhead
 
@@ -30,6 +42,9 @@ type gcodeMove struct {
 
 	arcPlane        int
 	mmPerArcSegment float64
+
+	// Saved gcode states by name
+	savedStates map[string]*gcodeState
 }
 
 func newGCodeMove(th *toolhead, mmPerArcSegment float64) *gcodeMove {
@@ -48,6 +63,7 @@ func newGCodeMove(th *toolhead, mmPerArcSegment float64) *gcodeMove {
 		extrudeFactor:   1.0,
 		arcPlane:        arcPlaneXY,
 		mmPerArcSegment: mmPerArcSegment,
+		savedStates:     make(map[string]*gcodeState),
 	}
 	gm.basePosition = make([]float64, len(th.commandedPos))
 	gm.lastPosition = append([]float64{}, th.commandedPos...)
@@ -352,4 +368,81 @@ func floatArgOr(args map[string]string, key string, def float64) float64 {
 		return def
 	}
 	return v
+}
+
+// saveState saves the current gcode state with the given name.
+func (gm *gcodeMove) saveState(name string) {
+	if name == "" {
+		name = "default"
+	}
+	state := &gcodeState{
+		absoluteCoord:   gm.absoluteCoord,
+		absoluteExtrude: gm.absoluteExtrude,
+		basePosition:    append([]float64{}, gm.basePosition...),
+		lastPosition:    append([]float64{}, gm.lastPosition...),
+		speed:           gm.speed,
+		speedFactor:     gm.speedFactor,
+		extrudeFactor:   gm.extrudeFactor,
+		arcPlane:        gm.arcPlane,
+	}
+	gm.savedStates[name] = state
+}
+
+// restoreState restores a previously saved gcode state.
+// If move is true, moves to the saved position at the given speed.
+func (gm *gcodeMove) restoreState(name string, move bool, moveSpeed float64) error {
+	if name == "" {
+		name = "default"
+	}
+	state, ok := gm.savedStates[name]
+	if !ok {
+		return fmt.Errorf("gcode state '%s' not found", name)
+	}
+
+	gm.absoluteCoord = state.absoluteCoord
+	gm.absoluteExtrude = state.absoluteExtrude
+	gm.speed = state.speed
+	gm.speedFactor = state.speedFactor
+	gm.extrudeFactor = state.extrudeFactor
+	gm.arcPlane = state.arcPlane
+
+	// Copy positions
+	gm.basePosition = append([]float64{}, state.basePosition...)
+
+	if move && moveSpeed > 0 {
+		// Move to saved position
+		targetPos := append([]float64{}, state.lastPosition...)
+		// Restore XYZ but not E
+		if len(targetPos) > 3 {
+			targetPos[3] = gm.lastPosition[3]
+		}
+		gm.lastPosition = targetPos
+		if gm.moveWithTransform != nil {
+			if err := gm.moveWithTransform(targetPos, moveSpeed); err != nil {
+				return err
+			}
+		} else if gm.toolhead != nil {
+			if err := gm.toolhead.move(targetPos, moveSpeed); err != nil {
+				return err
+			}
+		}
+	} else {
+		gm.lastPosition = append([]float64{}, state.lastPosition...)
+	}
+
+	return nil
+}
+
+// GetStatus returns the current gcode move status for API queries.
+func (gm *gcodeMove) GetStatus() map[string]any {
+	gcodePos := gm.getGcodePosition()
+	return map[string]any{
+		"speed_factor":       gm.speedFactor * 60.0,
+		"speed":              gm.speed,
+		"extrude_factor":     gm.extrudeFactor,
+		"absolute_coordinates": gm.absoluteCoord,
+		"absolute_extrude":   gm.absoluteExtrude,
+		"position":           gcodePos,
+		"gcode_position":     gcodePos,
+	}
 }
