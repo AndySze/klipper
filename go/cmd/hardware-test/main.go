@@ -8,13 +8,14 @@
 //
 // Options:
 //
-//	-device string    Serial device path or Unix socket path (required, or use -config)
+//	-device string    Serial device path, Unix socket path, or TCP address (required, or use -config)
 //	-config string    Printer config file (optional, extracts device from [mcu] section)
 //	-baud int         Baud rate (default: 250000)
 //	-timeout duration Connection timeout (default: 60s)
 //	-trace            Enable debug tracing
 //	-test string      Test to run: "connect", "clock", "temp", "query", "all" (default: "connect")
 //	-socket           Connect via Unix socket instead of serial port (for Linux MCU simulator)
+//	-tcp              Connect via TCP (e.g., -device localhost:5555 -tcp)
 //
 // Examples:
 //
@@ -47,13 +48,14 @@ import (
 
 func main() {
 	// Command line flags
-	device := flag.String("device", "", "Serial device path (e.g., /dev/ttyUSB0) or Unix socket path")
+	device := flag.String("device", "", "Serial device path, Unix socket path, or TCP address (host:port)")
 	configFile := flag.String("config", "", "Printer config file (optional)")
 	baud := flag.Int("baud", 250000, "Baud rate")
 	timeout := flag.Duration("timeout", 60*time.Second, "Connection timeout")
 	trace := flag.Bool("trace", false, "Enable debug tracing")
 	test := flag.String("test", "connect", "Test to run: serial, connect, clock, temp, query, all")
 	socket := flag.Bool("socket", false, "Connect via Unix socket instead of serial port (for Linux MCU simulator)")
+	tcp := flag.Bool("tcp", false, "Connect via TCP (e.g., -device localhost:5555 -tcp)")
 
 	flag.Parse()
 
@@ -86,12 +88,15 @@ func main() {
 	cfg.BaudRate = *baud
 	cfg.ConnectTimeout = *timeout
 	cfg.UseSocket = *socket
+	cfg.UseTCP = *tcp
 
 	if *trace {
 		cfg.Trace = os.Stdout
 	}
 
-	if *socket {
+	if *tcp {
+		fmt.Printf("Using TCP mode for device: %s\n", *device)
+	} else if *socket {
 		fmt.Printf("Using Unix socket mode for device: %s\n", *device)
 	}
 

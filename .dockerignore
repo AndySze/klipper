@@ -1,0 +1,26 @@
+# Ignore build artifacts and caches
+out/
+.git/
+
+# Go caches
+go/out/
+
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.hex
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local configs (will be regenerated)
+.config

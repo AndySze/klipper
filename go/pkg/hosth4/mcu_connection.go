@@ -31,12 +31,16 @@ var (
 // MCUConnectionConfig holds configuration for connecting to an MCU.
 type MCUConnectionConfig struct {
 	// Serial port configuration
-	Device   string // Device path (e.g., /dev/ttyUSB0) or Unix socket path
+	Device   string // Device path (e.g., /dev/ttyUSB0), Unix socket path, or TCP address (host:port)
 	BaudRate int    // Default: 250000
 
 	// UseSocket indicates the Device is a Unix socket path (e.g., for Linux MCU simulator)
 	// When true, connects via Unix socket instead of serial port
 	UseSocket bool
+
+	// UseTCP indicates the Device is a TCP address (e.g., "localhost:5555")
+	// Used for connecting to Docker-based Linux MCU simulator
+	UseTCP bool
 
 	// Connection timeouts
 	ConnectTimeout   time.Duration // Default: 60s
@@ -183,16 +187,25 @@ func (mc *MCUConnection) Connect() error {
 		return nil // Already connected
 	}
 
-	if mc.config.UseSocket {
+	if mc.config.UseTCP {
+		mc.tracef("MCU %s: Connecting to TCP %s\n", mc.name, mc.config.Device)
+	} else if mc.config.UseSocket {
 		mc.tracef("MCU %s: Connecting to socket %s\n", mc.name, mc.config.Device)
 	} else {
 		mc.tracef("MCU %s: Connecting to %s at %d baud\n", mc.name, mc.config.Device, mc.config.BaudRate)
 	}
 
-	// Open serial port or Unix socket
+	// Open serial port, Unix socket, or TCP connection
 	var port *serial.Port
 	var err error
-	if mc.config.UseSocket {
+	if mc.config.UseTCP {
+		// Connect via TCP (e.g., Docker-based Linux MCU simulator)
+		port, err = serial.OpenTCP(mc.config.Device, mc.config.ConnectTimeout)
+		if err != nil {
+			mc.mu.Unlock()
+			return fmt.Errorf("mcu %s: connect TCP: %w", mc.name, err)
+		}
+	} else if mc.config.UseSocket {
 		// Connect via Unix socket (e.g., Linux MCU simulator)
 		port, err = serial.OpenSocket(mc.config.Device, mc.config.ConnectTimeout)
 		if err != nil {
@@ -223,8 +236,8 @@ func (mc *MCUConnection) Connect() error {
 	handshakeCfg := mcupkg.DefaultHandshakeConfig()
 	handshakeCfg.Timeout = mc.config.HandshakeTimeout
 	handshakeCfg.Trace = mc.config.Trace
-	// Disable reset for socket connections (no DTR signal on Unix sockets)
-	handshakeCfg.ResetBeforeIdentify = mc.config.ResetOnConnect && !mc.config.UseSocket
+	// Disable reset for socket/TCP connections (no DTR signal)
+	handshakeCfg.ResetBeforeIdentify = mc.config.ResetOnConnect && !mc.config.UseSocket && !mc.config.UseTCP
 	identifyData, err := mcupkg.Handshake(port, handshakeCfg)
 	if err != nil {
 		port.Close()

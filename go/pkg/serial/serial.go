@@ -263,7 +263,135 @@ func OpenSocket(socketPath string, timeout time.Duration) (*Port, error) {
 	return port, nil
 }
 
-// IsSocket returns true if this port is connected via Unix socket.
+// OpenTCP connects to a TCP server at the given address (host:port).
+// This is used to connect to the Linux MCU simulator running in Docker
+// which exposes a TCP port for communication.
+func OpenTCP(address string, timeout time.Duration) (*Port, error) {
+	if address == "" {
+		return nil, errors.New("serial: TCP address required")
+	}
+	if timeout == 0 {
+		timeout = 60 * time.Second
+	}
+
+	// Create TCP socket
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, fmt.Errorf("serial: create TCP socket: %w", err)
+	}
+
+	// Parse address
+	host, portStr, err := splitHostPort(address)
+	if err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: parse address %s: %w", address, err)
+	}
+
+	port, err := parsePort(portStr)
+	if err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: parse port %s: %w", portStr, err)
+	}
+
+	// Resolve host to IP
+	ip, err := resolveHost(host)
+	if err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: resolve host %s: %w", host, err)
+	}
+
+	// Set up socket address
+	addr := &unix.SockaddrInet4{Port: port}
+	copy(addr.Addr[:], ip)
+
+	// Try to connect with timeout
+	deadline := time.Now().Add(timeout)
+	var connectErr error
+	for time.Now().Before(deadline) {
+		connectErr = unix.Connect(fd, addr)
+		if connectErr == nil {
+			break
+		}
+		// Server might not be ready yet, wait and retry
+		if errors.Is(connectErr, unix.ECONNREFUSED) {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: connect to %s: %w", address, connectErr)
+	}
+	if connectErr != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("serial: connect timeout to %s: %w", address, connectErr)
+	}
+
+	p := &Port{
+		fd:       fd,
+		device:   address,
+		config:   Config{ReadTimeout: 5 * time.Second},
+		isSocket: true, // Treat TCP same as socket for I/O purposes
+	}
+
+	return p, nil
+}
+
+// splitHostPort splits an address of the form "host:port" into host and port.
+func splitHostPort(address string) (string, string, error) {
+	for i := len(address) - 1; i >= 0; i-- {
+		if address[i] == ':' {
+			return address[:i], address[i+1:], nil
+		}
+	}
+	return "", "", errors.New("missing port in address")
+}
+
+// parsePort parses a port string to an integer.
+func parsePort(s string) (int, error) {
+	var port int
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, errors.New("invalid port number")
+		}
+		port = port*10 + int(c-'0')
+	}
+	if port == 0 || port > 65535 {
+		return 0, errors.New("port out of range")
+	}
+	return port, nil
+}
+
+// resolveHost resolves a hostname to an IPv4 address.
+func resolveHost(host string) ([]byte, error) {
+	// Handle localhost specially
+	if host == "localhost" || host == "127.0.0.1" {
+		return []byte{127, 0, 0, 1}, nil
+	}
+
+	// Try to parse as IP address
+	ip := make([]byte, 4)
+	parts := 0
+	val := 0
+	for i := 0; i <= len(host); i++ {
+		if i == len(host) || host[i] == '.' {
+			if val > 255 {
+				return nil, errors.New("invalid IP address")
+			}
+			ip[parts] = byte(val)
+			parts++
+			val = 0
+		} else if host[i] >= '0' && host[i] <= '9' {
+			val = val*10 + int(host[i]-'0')
+		} else {
+			return nil, errors.New("hostname resolution not supported, use IP address")
+		}
+	}
+	if parts != 4 {
+		return nil, errors.New("invalid IP address format")
+	}
+	return ip, nil
+}
+
+// IsSocket returns true if this port is connected via Unix socket or TCP.
 func (p *Port) IsSocket() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()

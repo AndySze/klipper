@@ -397,6 +397,7 @@ func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay tim
 		resp := make([]byte, 0, protocol.MESSAGE_MAX)
 		buf := make([]byte, protocol.MESSAGE_MAX)
 		expectedLen := 0
+		msgStart := 0 // Start position of current message in resp
 
 		for time.Now().Before(deadline) {
 			n, err = port.Read(buf)
@@ -410,24 +411,29 @@ func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay tim
 			if n > 0 {
 				resp = append(resp, buf[:n]...)
 
+				// Skip leading sync bytes (may be from previous messages)
+				for msgStart < len(resp) && resp[msgStart] == protocol.MESSAGE_SYNC {
+					msgStart++
+				}
+
 				// Once we have the length byte, we know expected message size
-				if expectedLen == 0 && len(resp) >= 1 {
-					expectedLen = int(resp[0])
+				if expectedLen == 0 && len(resp) > msgStart {
+					expectedLen = int(resp[msgStart])
 					if trace != nil {
-						fmt.Fprintf(trace, "  sendWithRetry[%d]: Expected msg len: %d\n", retry, expectedLen)
+						fmt.Fprintf(trace, "  sendWithRetry[%d]: Expected msg len: %d (msgStart=%d)\n", retry, expectedLen, msgStart)
 					}
 				}
 
 				// Check if we have a complete message
-				if expectedLen > 0 && len(resp) >= expectedLen {
+				if expectedLen > 0 && len(resp) >= msgStart+expectedLen {
 					// Verify sync byte
-					if resp[expectedLen-1] == protocol.MESSAGE_SYNC {
-						return resp[:expectedLen], nil
+					if resp[msgStart+expectedLen-1] == protocol.MESSAGE_SYNC {
+						return resp[msgStart : msgStart+expectedLen], nil
 					}
 					// Bad sync - try to find next valid message start
 					if trace != nil {
 						fmt.Fprintf(trace, "  sendWithRetry[%d]: Bad sync at pos %d, got 0x%02x\n",
-							retry, expectedLen-1, resp[expectedLen-1])
+							retry, msgStart+expectedLen-1, resp[msgStart+expectedLen-1])
 					}
 				}
 			}
@@ -446,8 +452,8 @@ func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay tim
 		}
 
 		if len(resp) > 0 && trace != nil {
-			fmt.Fprintf(trace, "  sendWithRetry[%d]: Accumulated: %x (len=%d, expected=%d)\n",
-				retry, resp, len(resp), expectedLen)
+			fmt.Fprintf(trace, "  sendWithRetry[%d]: Accumulated: %x (len=%d, msgStart=%d, expected=%d)\n",
+				retry, resp, len(resp), msgStart, expectedLen)
 		}
 
 		if len(resp) == 0 {
