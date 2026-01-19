@@ -1813,6 +1813,21 @@ type endstop struct {
 	tr         *trsync
 	rt         *runtime
 	mcuFreq    float64
+	invert     bool // Pin inversion state (true = active low)
+}
+
+// QueryEndstop queries the current state of this endstop.
+// In file output mode (golden testing), always returns false (not triggered).
+// When real hardware support is added, this will send endstop_query_state
+// to the MCU and return (pin_value ^ invert).
+func (e *endstop) QueryEndstop(printTime float64) (bool, error) {
+	// In file output mode (golden testing), Python returns 0
+	// See klippy/mcu.py MCU_endstop.query_endstop():
+	//   if self._mcu.is_fileoutput():
+	//       return 0
+	// The Go implementation is currently file-output only, so return false.
+	_ = printTime // Would be used to calculate minclock for MCU query
+	return false, nil
 }
 
 func (e *endstop) homeStart(printTime float64, restTime float64, triggered bool) error {
@@ -1953,9 +1968,10 @@ type runtime struct {
 	testStem string
 
 	// Homing override: if set, G28 executes this gcode instead of normal homing
-	homingOverrideGcode []string
-	homingOverridePos   [3]*float64 // set_position_x/y/z (nil if not set)
-	homingOverrideAxes  string      // axes to mark as homed (e.g., "xyz")
+	homingOverrideGcode   []string
+	homingOverridePos     [3]*float64 // set_position_x/y/z (nil if not set)
+	homingOverrideAxes    string      // axes to mark as homed (e.g., "xyz")
+	homingOverrideHandler *HomingOverrideHandler
 
 	// Virtual SD card with loop support
 	sdcard *VirtualSDCard
@@ -3175,6 +3191,10 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		if ho.SetPositionZ != nil {
 			rt.homingOverridePos[2] = ho.SetPositionZ
 		}
+		// Create the handler for selective axis override support
+		if handler, err := newHomingOverrideHandler(rt, ho); err == nil {
+			rt.homingOverrideHandler = handler
+		}
 	}
 
 	trX.rt = rt
@@ -3598,11 +3618,16 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 		}
 	}
 
+	// Calculate step distances from rotation_distance and microsteps
+	stepDistX := rails[0].rotationDistance / float64(rails[0].fullSteps*rails[0].microsteps)
+	stepDistY := rails[1].rotationDistance / float64(rails[1].fullSteps*rails[1].microsteps)
+	stepDistZ := rails[2].rotationDistance / float64(rails[2].fullSteps*rails[2].microsteps)
+
 	// Create kinematics rails for bounds checking
 	kinRails := []kinematics.Rail{
 		{
 			Name:            "carriage_x",
-			StepDist:        0.0001, // Placeholder
+			StepDist:        stepDistX,
 			PositionMin:     rails[0].positionMin,
 			PositionMax:     rails[0].positionMax,
 			HomingSpeed:     rails[0].homingSpeed,
@@ -3611,7 +3636,7 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 		},
 		{
 			Name:            "carriage_y",
-			StepDist:        0.0001,
+			StepDist:        stepDistY,
 			PositionMin:     rails[1].positionMin,
 			PositionMax:     rails[1].positionMax,
 			HomingSpeed:     rails[1].homingSpeed,
@@ -3620,7 +3645,7 @@ func newGenericCartesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, f
 		},
 		{
 			Name:            "carriage_z",
-			StepDist:        0.0001,
+			StepDist:        stepDistZ,
 			PositionMin:     rails[2].positionMin,
 			PositionMax:     rails[2].positionMax,
 			HomingSpeed:     rails[2].homingSpeed,
@@ -4097,24 +4122,28 @@ func newCartesianDualCarriageRuntime(cfg *configWrapper, dict *protocol.Dictiona
 	if err != nil {
 		return nil, fmt.Errorf("dual_carriage: %w", err)
 	}
-	dcRotDist := 40.0
-	if v := dcSec["rotation_distance"]; v != "" {
-		dcRotDist, _ = strconv.ParseFloat(v, 64)
+	dcRotDistDefault := 40.0
+	dcRotDist, err := parseFloat(dcSec, "rotation_distance", &dcRotDistDefault)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
 	}
-	dcMicrosteps := 16
-	if v := dcSec["microsteps"]; v != "" {
-		dcMicrosteps, _ = strconv.Atoi(v)
+	dcMicrostepsDefault := 16
+	dcMicrosteps, err := parseInt(dcSec, "microsteps", &dcMicrostepsDefault)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
 	}
 	dcStepDist := dcRotDist / float64(200*dcMicrosteps)
 
 	// Parse dual_carriage position limits
-	dcPositionMin := 0.0
-	dcPositionMax := 200.0
-	if v := dcSec["position_min"]; v != "" {
-		dcPositionMin, _ = strconv.ParseFloat(v, 64)
+	dcPositionMinDefault := 0.0
+	dcPositionMin, err := parseFloat(dcSec, "position_min", &dcPositionMinDefault)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
 	}
-	if v := dcSec["position_max"]; v != "" {
-		dcPositionMax, _ = strconv.ParseFloat(v, 64)
+	dcPositionMaxDefault := 200.0
+	dcPositionMax, err := parseFloat(dcSec, "position_max", &dcPositionMaxDefault)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
 	}
 
 	rails := [3]stepperCfg{sx, sy, sz}
@@ -4565,13 +4594,15 @@ func newHybridCoreXYRuntime(cfg *configWrapper, dict *protocol.Dictionary, forma
 	if err != nil {
 		return nil, err
 	}
-	dcRotDist := 40.0
-	if v := dcSec["rotation_distance"]; v != "" {
-		dcRotDist, _ = strconv.ParseFloat(v, 64)
+	dcRotDistDefault := 40.0
+	dcRotDist, err := parseFloat(dcSec, "rotation_distance", &dcRotDistDefault)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
 	}
-	dcMicrosteps := 16
-	if v := dcSec["microsteps"]; v != "" {
-		dcMicrosteps, _ = strconv.Atoi(v)
+	dcMicrostepsDefault := 16
+	dcMicrosteps, err := parseInt(dcSec, "microsteps", &dcMicrostepsDefault)
+	if err != nil {
+		return nil, fmt.Errorf("dual_carriage: %w", err)
 	}
 	dcStepDist := dcRotDist / float64(200*dcMicrosteps)
 
@@ -5162,9 +5193,7 @@ func (r *runtime) setupHeater(hc *heaterConfig) error {
 		return fmt.Errorf("failed to setup heater with manager: %w", err)
 	}
 
-	// Store heater reference in runtime for G-code commands
-	// TODO: Add heater map to runtime struct
-
+	// Heater is now accessible via r.heaterManager.GetHeater(name)
 	r.tracef("Heater %s initialized (gcode_id=%s)\n", hc.name, gcodeID)
 
 	return nil
@@ -5328,8 +5357,21 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 	}
 	switch cmd.Name {
 	case "G28":
-		if len(r.homingOverrideGcode) > 0 {
-			// Use homing override instead of normal homing
+		// Use HomingOverrideHandler if available (supports selective axis override)
+		if r.homingOverrideHandler != nil {
+			err := r.homingOverrideHandler.HandleG28(cmd, func() error {
+				// Normal homing callback
+				if err := r.homeAll(); err != nil {
+					return err
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			r.gm.resetFromToolhead()
+		} else if len(r.homingOverrideGcode) > 0 {
+			// Legacy homing override (no selective axis support)
 			// Build the initial position from set_position_x/y/z
 			newPos := make([]float64, len(r.toolhead.commandedPos))
 			copy(newPos, r.toolhead.commandedPos)
@@ -5622,8 +5664,9 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		}
 		return fmt.Errorf("SET_LED requires LED configuration")
 	case "SET_LED_TEMPLATE":
-		// SET_LED_TEMPLATE is a display template feature - not implemented yet
-		// For now, ignore it (Python outputs nothing for basic template changes)
+		// SET_LED_TEMPLATE assigns a display_template to an LED for dynamic updates.
+		// In file output mode, templates don't run (no reactor/timer), so this is a no-op.
+		// For real-time mode, full template evaluation would be needed.
 		return nil
 	default:
 		return fmt.Errorf("unsupported gcode %q (H4)", cmd.Name)
@@ -6384,15 +6427,17 @@ func (r *runtime) homingMove(axis int, movepos []float64, speed float64) error {
 		return err
 	}
 	r.tracef("HOMING: after dripMove preDecelTime=%.9f endTime=%.9f\n", preDecelTime, endTime)
+	// Match Python homing.py: flush all steps BEFORE sending the disable command.
+	// This ensures all queue_step commands are in serialqueue before endstop_home clock=0.
+	// Python's drip_move completes all step generation, then home_wait sends disable.
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return err
+	}
 	r.traceMotion("HOMING: before homeStop")
 	if err := r.endstops[axis].homeStop(); err != nil {
 		return err
 	}
-	r.tracef("HOMING: after homeStop (all steps already flushed, disable should be picked first by req_clock=0)\n")
-	// All steps have already been generated to the serialqueue by dripMove.
-	// The disable command was sent with req_clock=0.
-	// The serialqueue's build_and_send_command picks by lowest req_clock,
-	// so the disable should appear before decel steps in the output.
+	r.tracef("HOMING: after homeStop\n")
 	_ = preDecelTime
 	_ = endTime
 	if r.trace != nil {
@@ -6811,7 +6856,11 @@ func (r *runtime) cmdM105(args map[string]string) error {
 	// Usage: M105
 
 	// Get temperature report from heater manager
-	eventtime := 0.0 // TODO: get actual eventtime
+	// In file output mode (golden testing), eventtime=0 is used since there's
+	// no real reactor clock. The temperature values are always 0/target anyway
+	// because there's no ADC hardware feedback. For real hardware operation,
+	// this would need access to the reactor's monotonic clock.
+	eventtime := 0.0
 	response := r.heaterManager.GetM105Response(eventtime)
 
 	r.tracef("M105: %s\n", response)
@@ -6991,8 +7040,8 @@ func (r *runtime) cmdPIDCalibrate(args map[string]string) error {
 		return fmt.Errorf("PID_CALIBRATE requires TARGET parameter")
 	}
 
-	var target float64
-	if _, err := fmt.Sscanf(targetStr, "%f", &target); err != nil {
+	target, err := strconv.ParseFloat(targetStr, 64)
+	if err != nil {
 		return fmt.Errorf("invalid TARGET value: %s", targetStr)
 	}
 
@@ -7003,21 +7052,31 @@ func (r *runtime) cmdPIDCalibrate(args map[string]string) error {
 
 	r.tracef("PID_CALIBRATE: heater=%s target=%.1f write_file=%v\n", heaterName, target, writeFile)
 
-	// In file output mode (golden tests), skip the actual calibration
-	// Python outputs PID parameters at the end, but in file mode it skips
-	// the heating cycles entirely.
-	//
-	// The actual calibration involves:
-	// 1. Setting the heater to target temperature
-	// 2. Recording temperature oscillations
-	// 3. Using Ziegler-Nichols method to calculate PID parameters
-	//
-	// For golden tests, we just log and return success
+	// Verify heater exists
+	if r.heaterManager != nil {
+		if _, err := r.heaterManager.GetHeater(heaterName); err != nil {
+			return fmt.Errorf("unknown heater '%s'", heaterName)
+		}
+	}
 
-	r.gcodeRespond("PID_CALIBRATE skipped in file output mode")
-	r.gcodeRespond(fmt.Sprintf("Would calibrate %s to %.1f degrees", heaterName, target))
+	// In file output mode (golden tests), Python's _wait_for_temperature returns
+	// immediately without waiting for temperature feedback. The calibration then
+	// gets interrupted because there are no temperature oscillation peaks recorded.
+	//
+	// Python behavior in file output mode:
+	// 1. Look up heater - succeeds
+	// 2. Create ControlAutoTune controller - succeeds
+	// 3. Set heater temperature - emits PWM command
+	// 4. Wait for temperature - returns immediately (debugoutput mode)
+	// 5. Check if busy - returns True (not enough peaks)
+	// 6. Raises "pid_calibrate interrupted" error
+	//
+	// For Go file output mode, we match this by returning an error, which is
+	// consistent with Python's behavior. The heater target would be set
+	// momentarily, but since there's no real temperature feedback, the
+	// calibration cannot proceed.
 
-	return nil
+	return fmt.Errorf("pid_calibrate interrupted")
 }
 
 func (r *runtime) cmdM106(args map[string]string) error {
@@ -7392,36 +7451,41 @@ func (r *runtime) homeAll() error {
 func (r *runtime) homeIDEX() error {
 	// Read dual_carriage section to get its homing parameters
 	dcSec, _ := r.cfg.section("dual_carriage")
-	dcPositionEndstop := 200.0
-	dcPositionMin := 0.0
-	dcPositionMax := 200.0
-	dcHomingSpeed := 50.0
-	dcPositiveDir := true // dual_carriage typically homes positive
-	dcRetractDist := 5.0
-	dcSecondHomingSpeed := 25.0
 
-	if v := dcSec["position_endstop"]; v != "" {
-		dcPositionEndstop, _ = strconv.ParseFloat(v, 64)
+	// Parse dual_carriage homing parameters with defaults
+	dcPositionEndstopDefault := 200.0
+	dcPositionEndstop, err := parseFloat(dcSec, "position_endstop", &dcPositionEndstopDefault)
+	if err != nil {
+		return fmt.Errorf("dual_carriage: %w", err)
 	}
-	if v := dcSec["position_min"]; v != "" {
-		dcPositionMin, _ = strconv.ParseFloat(v, 64)
+	dcPositionMinDefault := 0.0
+	dcPositionMin, err := parseFloat(dcSec, "position_min", &dcPositionMinDefault)
+	if err != nil {
+		return fmt.Errorf("dual_carriage: %w", err)
 	}
-	if v := dcSec["position_max"]; v != "" {
-		dcPositionMax, _ = strconv.ParseFloat(v, 64)
+	dcPositionMaxDefault := 200.0
+	dcPositionMax, err := parseFloat(dcSec, "position_max", &dcPositionMaxDefault)
+	if err != nil {
+		return fmt.Errorf("dual_carriage: %w", err)
 	}
-	if v := dcSec["homing_speed"]; v != "" {
-		dcHomingSpeed, _ = strconv.ParseFloat(v, 64)
+	dcHomingSpeedDefault := 50.0
+	dcHomingSpeed, err := parseFloat(dcSec, "homing_speed", &dcHomingSpeedDefault)
+	if err != nil {
+		return fmt.Errorf("dual_carriage: %w", err)
 	}
-	if v := dcSec["homing_retract_dist"]; v != "" {
-		dcRetractDist, _ = strconv.ParseFloat(v, 64)
+	dcRetractDistDefault := 5.0
+	dcRetractDist, err := parseFloat(dcSec, "homing_retract_dist", &dcRetractDistDefault)
+	if err != nil {
+		return fmt.Errorf("dual_carriage: %w", err)
 	}
-	if v := dcSec["second_homing_speed"]; v != "" {
-		dcSecondHomingSpeed, _ = strconv.ParseFloat(v, 64)
-	} else {
-		dcSecondHomingSpeed = dcHomingSpeed / 2
+	dcSecondHomingSpeedDefault := dcHomingSpeed / 2
+	dcSecondHomingSpeed, err := parseFloat(dcSec, "second_homing_speed", &dcSecondHomingSpeedDefault)
+	if err != nil {
+		return fmt.Errorf("dual_carriage: %w", err)
 	}
+
 	// Check homing_positive_dir: default based on position_endstop
-	dcPositiveDir = dcPositionEndstop > (dcPositionMin+dcPositionMax)/2
+	dcPositiveDir := dcPositionEndstop > (dcPositionMin+dcPositionMax)/2
 	if v := dcSec["homing_positive_dir"]; v != "" {
 		dcPositiveDir = strings.ToLower(v) == "true"
 	}
@@ -7772,16 +7836,18 @@ func (r *runtime) homeDelta() error {
 
 	// Get delta parameters from config
 	printerSec, _ := r.cfg.section("printer")
-	deltaRadius := 174.75
-	if v := printerSec["delta_radius"]; v != "" {
-		deltaRadius, _ = strconv.ParseFloat(v, 64)
+	deltaRadiusDefault := 174.75
+	deltaRadius, err := parseFloat(printerSec, "delta_radius", &deltaRadiusDefault)
+	if err != nil {
+		return fmt.Errorf("printer delta_radius: %w", err)
 	}
 
 	// Get arm lengths from stepper sections
 	secA, _ := r.cfg.section("stepper_a")
-	armLengthA := 333.0
-	if v := secA["arm_length"]; v != "" {
-		armLengthA, _ = strconv.ParseFloat(v, 64)
+	armLengthADefault := 333.0
+	armLengthA, err := parseFloat(secA, "arm_length", &armLengthADefault)
+	if err != nil {
+		return fmt.Errorf("stepper_a arm_length: %w", err)
 	}
 	arm2 := armLengthA * armLengthA
 	maxXY2 := (deltaRadius * 0.8) * (deltaRadius * 0.8)
@@ -7971,9 +8037,10 @@ func newPolarRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 		return nil, fmt.Errorf("stepper_bed: %w", err)
 	}
 	// gear_ratio for polar bed (e.g., 80:16)
-	bedMicrosteps := 16
-	if v := bedSec["microsteps"]; v != "" {
-		bedMicrosteps, _ = strconv.Atoi(v)
+	bedMicrostepsDefault := 16
+	bedMicrosteps, err := parseInt(bedSec, "microsteps", &bedMicrostepsDefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_bed: %w", err)
 	}
 	// For polar bed, full rotation = 360 degrees
 	// With gear_ratio 80:16 (5:1), motor does 5 full rotations per bed rotation
@@ -8388,13 +8455,15 @@ func newRotaryDeltaRuntime(cfg *configWrapper, dict *protocol.Dictionary, format
 	}
 
 	// Get shoulder_radius and shoulder_height from printer section
-	shoulderRadius := 33.9 // Default from rotary_delta_calibrate.cfg
-	if v := printerSec["shoulder_radius"]; v != "" {
-		shoulderRadius, _ = strconv.ParseFloat(v, 64)
+	shoulderRadiusDefault := 33.9 // Default from rotary_delta_calibrate.cfg
+	shoulderRadius, err := parseFloat(printerSec, "shoulder_radius", &shoulderRadiusDefault)
+	if err != nil {
+		return nil, fmt.Errorf("printer: %w", err)
 	}
-	shoulderHeight := 412.9 // Default from rotary_delta_calibrate.cfg
-	if v := printerSec["shoulder_height"]; v != "" {
-		shoulderHeight, _ = strconv.ParseFloat(v, 64)
+	shoulderHeightDefault := 412.9 // Default from rotary_delta_calibrate.cfg
+	shoulderHeight, err := parseFloat(printerSec, "shoulder_height", &shoulderHeightDefault)
+	if err != nil {
+		return nil, fmt.Errorf("printer: %w", err)
 	}
 
 	// Read stepper configs
@@ -8413,55 +8482,73 @@ func newRotaryDeltaRuntime(cfg *configWrapper, dict *protocol.Dictionary, format
 
 	// Read arm lengths and angles from stepper sections (may come from SAVE_CONFIG)
 	secA, _ := cfg.section("stepper_a")
-	upperArmA := 170.0
-	if v := secA["upper_arm_length"]; v != "" {
-		upperArmA, _ = strconv.ParseFloat(v, 64)
+	upperArmADefault := 170.0
+	upperArmA, err := parseFloat(secA, "upper_arm_length", &upperArmADefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_a: %w", err)
 	}
-	lowerArmA := 320.0
-	if v := secA["lower_arm_length"]; v != "" {
-		lowerArmA, _ = strconv.ParseFloat(v, 64)
+	lowerArmADefault := 320.0
+	lowerArmA, err := parseFloat(secA, "lower_arm_length", &lowerArmADefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_a: %w", err)
 	}
 	// lower_arm can also override lower_arm_length (from SAVE_CONFIG)
 	if v := secA["lower_arm"]; v != "" {
-		lowerArmA, _ = strconv.ParseFloat(v, 64)
+		lowerArmA, err = strconv.ParseFloat(v, 64)
+		if err != nil {
+			return nil, fmt.Errorf("stepper_a lower_arm: %w", err)
+		}
 	}
-	angleA := 30.0 // degrees
-	if v := secA["angle"]; v != "" {
-		angleA, _ = strconv.ParseFloat(v, 64)
+	angleADefault := 30.0 // degrees
+	angleA, err := parseFloat(secA, "angle", &angleADefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_a: %w", err)
 	}
 
 	secB, _ := cfg.section("stepper_b")
-	upperArmB := 170.0
-	if v := secB["upper_arm_length"]; v != "" {
-		upperArmB, _ = strconv.ParseFloat(v, 64)
+	upperArmBDefault := 170.0
+	upperArmB, err := parseFloat(secB, "upper_arm_length", &upperArmBDefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_b: %w", err)
 	}
-	lowerArmB := 320.0
-	if v := secB["lower_arm_length"]; v != "" {
-		lowerArmB, _ = strconv.ParseFloat(v, 64)
+	lowerArmBDefault := 320.0
+	lowerArmB, err := parseFloat(secB, "lower_arm_length", &lowerArmBDefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_b: %w", err)
 	}
 	if v := secB["lower_arm"]; v != "" {
-		lowerArmB, _ = strconv.ParseFloat(v, 64)
+		lowerArmB, err = strconv.ParseFloat(v, 64)
+		if err != nil {
+			return nil, fmt.Errorf("stepper_b lower_arm: %w", err)
+		}
 	}
-	angleB := 150.0 // degrees
-	if v := secB["angle"]; v != "" {
-		angleB, _ = strconv.ParseFloat(v, 64)
+	angleBDefault := 150.0 // degrees
+	angleB, err := parseFloat(secB, "angle", &angleBDefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_b: %w", err)
 	}
 
 	secC, _ := cfg.section("stepper_c")
-	upperArmC := 170.0
-	if v := secC["upper_arm_length"]; v != "" {
-		upperArmC, _ = strconv.ParseFloat(v, 64)
+	upperArmCDefault := 170.0
+	upperArmC, err := parseFloat(secC, "upper_arm_length", &upperArmCDefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_c: %w", err)
 	}
-	lowerArmC := 320.0
-	if v := secC["lower_arm_length"]; v != "" {
-		lowerArmC, _ = strconv.ParseFloat(v, 64)
+	lowerArmCDefault := 320.0
+	lowerArmC, err := parseFloat(secC, "lower_arm_length", &lowerArmCDefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_c: %w", err)
 	}
 	if v := secC["lower_arm"]; v != "" {
-		lowerArmC, _ = strconv.ParseFloat(v, 64)
+		lowerArmC, err = strconv.ParseFloat(v, 64)
+		if err != nil {
+			return nil, fmt.Errorf("stepper_c lower_arm: %w", err)
+		}
 	}
-	angleC := 270.0 // degrees
-	if v := secC["angle"]; v != "" {
-		angleC, _ = strconv.ParseFloat(v, 64)
+	angleCDefault := 270.0 // degrees
+	angleC, err := parseFloat(secC, "angle", &angleCDefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_c: %w", err)
 	}
 
 	rails := [3]stepperCfg{stepperA, stepperB, stepperC}
@@ -9132,25 +9219,27 @@ func newDeltesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats 
 
 	// Read arm parameters from stepper_left section
 	leftSec, _ := cfg.section("stepper_left")
-	armLength := 217.0
-	if v := leftSec["arm_length"]; v != "" {
-		armLength, _ = strconv.ParseFloat(v, 64)
+	armLengthDefault := 217.0
+	armLength, err := parseFloat(leftSec, "arm_length", &armLengthDefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_left: %w", err)
 	}
-	armXLength := 160.0
-	if v := leftSec["arm_x_length"]; v != "" {
-		armXLength, _ = strconv.ParseFloat(v, 64)
+	armXLengthDefault := 160.0
+	armXLength, err := parseFloat(leftSec, "arm_x_length", &armXLengthDefault)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_left: %w", err)
 	}
 	arm2Left := armLength * armLength
 
 	// Read arm parameters from stepper_right section (default to left values)
 	rightSec, _ := cfg.section("stepper_right")
-	armLengthRight := armLength
-	if v := rightSec["arm_length"]; v != "" {
-		armLengthRight, _ = strconv.ParseFloat(v, 64)
+	armLengthRight, err := parseFloat(rightSec, "arm_length", &armLength)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_right: %w", err)
 	}
-	armXLengthRight := armXLength
-	if v := rightSec["arm_x_length"]; v != "" {
-		armXLengthRight, _ = strconv.ParseFloat(v, 64)
+	armXLengthRight, err := parseFloat(rightSec, "arm_x_length", &armXLength)
+	if err != nil {
+		return nil, fmt.Errorf("stepper_right: %w", err)
 	}
 	arm2Right := armLengthRight * armLengthRight
 
@@ -9515,7 +9604,9 @@ func newDeltesianRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats 
 
 // newWinchRuntime creates a runtime for winch (cable robot) kinematics.
 // Winch uses stepper_a through stepper_d (or more), each with anchor_x, anchor_y, anchor_z.
-// Homing is not implemented for winch - the toolhead position is assumed to start at 0,0,0.
+// Note: Winch homing is not implemented in Python either (klippy/kinematics/winch.py:41-44
+// has "XXX - homing not implemented"). The toolhead position is assumed to start at 0,0,0.
+// This matches upstream Klipper behavior - winch robots typically use manual positioning.
 func newWinchRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[string]*protocol.MessageFormat, mcuFreq, maxVelocity, maxAccel, maxZVelocity, maxZAccel float64, queueStepID, setDirID int32) (*runtime, error) {
 	// Find all stepper sections (stepper_a through stepper_z)
 	type winchStepperInfo struct {
@@ -9540,12 +9631,24 @@ func newWinchRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 		}
 
 		// Parse anchor coordinates
-		anchorX, _ := strconv.ParseFloat(sec["anchor_x"], 64)
-		anchorY, _ := strconv.ParseFloat(sec["anchor_y"], 64)
-		anchorZ, _ := strconv.ParseFloat(sec["anchor_z"], 64)
+		anchorXDefault := 0.0
+		anchorX, err := parseFloat(sec, "anchor_x", &anchorXDefault)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		anchorYDefault := 0.0
+		anchorY, err := parseFloat(sec, "anchor_y", &anchorYDefault)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		anchorZDefault := 0.0
+		anchorZ, err := parseFloat(sec, "anchor_z", &anchorZDefault)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
 
 		// Parse stepper config (we don't need endstop for winch - homing not implemented)
-		_, err := parsePin(sec, "step_pin", true, false)
+		_, err = parsePin(sec, "step_pin", true, false)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
@@ -9558,13 +9661,15 @@ func newWinchRuntime(cfg *configWrapper, dict *protocol.Dictionary, formats map[
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
 
-		microsteps := 16
-		if v := sec["microsteps"]; v != "" {
-			microsteps, _ = strconv.Atoi(v)
+		microstepsDefault := 16
+		microsteps, err := parseInt(sec, "microsteps", &microstepsDefault)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
 		}
-		rotDist := 40.0
-		if v := sec["rotation_distance"]; v != "" {
-			rotDist, _ = strconv.ParseFloat(v, 64)
+		rotDistDefault := 40.0
+		rotDist, err := parseFloat(sec, "rotation_distance", &rotDistDefault)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
 		}
 		stepDist := rotDist / float64(200*microsteps)
 
