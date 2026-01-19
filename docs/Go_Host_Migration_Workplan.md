@@ -96,7 +96,9 @@
 
 **当前 Golden Test 状态（2025-01 更新）**
 
-已通过测试（使用 `--strip-spi --strip-fan` 选项）：
+已通过测试（大部分无需 `--strip-*` 选项即可通过）：
+
+基础测试：
 - `commands.test` ✓
 - `out_of_bounds.test` ✓
 - `gcode_arcs.test` ✓
@@ -108,6 +110,8 @@
 - `screws_tilt_adjust.test` ✓
 - `linuxtest.test` ✓
 - `macros.test` ✓
+
+功能测试：
 - `input_shaper.test` ✓
 - `temperature.test` ✓
 - `z_tilt.test` ✓
@@ -119,6 +123,22 @@
 - `tmc.test` ✓
 - `z_virtual_endstop.test` ✓
 - `dual_carriage.test` ✓
+
+非笛卡尔运动学测试：
+- `delta.test` ✓
+- `polar.test` ✓
+- `example_rotary_delta.test` ✓
+- `example_corexy.test` ✓
+- `example_corexz.test` ✓
+- `deltesian.test` ✓
+- `corexyuv.test` ✓
+- `winch.test` ✓
+- `example_hybrid_corexy.test` ✓
+- `hybrid_corexy_dual_carriage.test` ✓
+- `delta_calibrate.test` ✓
+- `rotary_delta_calibrate.test` ✓
+
+**总计：33+ 测试通过**
 
 已知差异（不影响正确性）：
 - `printers_einsy.test`：存在 4M tick（0.25s @16MHz）时序偏移
