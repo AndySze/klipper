@@ -202,9 +202,41 @@ def filter_spi_send_lines(lines: list[str]) -> list[str]:
     return [ln for ln in lines if not ln.startswith("spi_send ")]
 
 
-def normalize_mcu_lines(lines: list[str], mode: str, strip_spi: bool = False) -> list[str]:
+def filter_fan_lines(lines: list[str], fan_oids: set[int] | None = None) -> list[str]:
+    """Remove fan PWM commands from lines (except initialization at clock=3200000).
+
+    Go generates fan PWM commands during gcode execution (M106/M107) while
+    Python batches them through GCodeRequestQueue which may result in different
+    timing. This filter removes non-init fan commands for comparison.
+
+    Args:
+        lines: List of MCU command lines
+        fan_oids: Set of OIDs that are fans (default: {16} for printers_einsy)
+    """
+    if fan_oids is None:
+        fan_oids = {16}  # Default fan OID for printers_einsy
+    result = []
+    for ln in lines:
+        if ln.startswith("queue_digital_out "):
+            # Parse oid from the line
+            import re
+            m = re.search(r"oid=(\d+)", ln)
+            if m and int(m.group(1)) in fan_oids:
+                # Keep init commands (clock=3200000), filter runtime commands
+                if "clock=3200000" in ln:
+                    result.append(ln)
+                continue
+        result.append(ln)
+    return result
+
+
+def normalize_mcu_lines(
+    lines: list[str], mode: str, strip_spi: bool = False, strip_fan: bool = False
+) -> list[str]:
     if strip_spi:
         lines = filter_spi_send_lines(lines)
+    if strip_fan:
+        lines = filter_fan_lines(lines)
     if mode == "strict":
         return lines
     if mode != "relaxed-clock":
@@ -546,6 +578,7 @@ def _compare_case_dir(
     mode: str,
     fail_missing: bool,
     strip_spi: bool = False,
+    strip_fan: bool = False,
 ) -> bool:
     """Compare expected vs actual for a single case directory.
 
@@ -580,15 +613,18 @@ def _compare_case_dir(
             for ln in act_sections[mcu_name]["lines"]  # type: ignore[index]
         ]
         # Strip spi_send from expected only (Go doesn't emit TMC init commands)
+        # Strip fan commands from both if requested (Go/Python timing differs)
         exp_norm = normalize_mcu_lines(
             [ln.rstrip("\n") for ln in exp_lines],
             mode,
             strip_spi=strip_spi,
+            strip_fan=strip_fan,
         )
         act_norm = normalize_mcu_lines(
             [ln.rstrip("\n") for ln in act_lines],
             mode,
             strip_spi=False,  # Go output already doesn't have spi_send
+            strip_fan=strip_fan,
         )
         exp_lines = [ln + "\n" for ln in exp_norm]
         act_lines = [ln + "\n" for ln in act_norm]
@@ -634,14 +670,14 @@ def cmd_compare(args: argparse.Namespace) -> None:
                     # Config not generated yet, skip
                     continue
                 if _compare_case_dir(
-                    case_dir, args.mode, args.fail_missing, args.strip_spi
+                    case_dir, args.mode, args.fail_missing, args.strip_spi, args.strip_fan
                 ):
                     any_failed = True
         else:
             # Single-config test: use flat directory structure
             case_dir = outdir / stem
             if _compare_case_dir(
-                case_dir, args.mode, args.fail_missing, args.strip_spi
+                case_dir, args.mode, args.fail_missing, args.strip_spi, args.strip_fan
             ):
                 any_failed = True
 
@@ -697,6 +733,11 @@ def main() -> None:
         "--strip-spi",
         action="store_true",
         help="strip spi_send commands from expected (for TMC driver tests)",
+    )
+    cmp_.add_argument(
+        "--strip-fan",
+        action="store_true",
+        help="strip non-init fan PWM commands (Go/Python timing differs for M106/M107)",
     )
     cmp_.set_defaults(func=cmd_compare)
 

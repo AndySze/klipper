@@ -19,6 +19,11 @@ type CompileOptions struct {
 // CompileHostH4 executes the H4 host runtime and returns the raw debugoutput
 // msg stream. H4 supports cartesian, corexy, corexz, and delta kinematics.
 //
+// Multi-MCU support: Basic multi-MCU infrastructure exists (MCURegistry, multi_mcu.go)
+// and host-h1-multi mode works for connect-phase. For motion execution (host-h4-multi),
+// multi_mcu_dual_z and multi_mcu_extruder configs need additional work to coordinate
+// step generation across MCUs with proper clock sync. See clocksync package.
+//
 // On "expected failure" tests, callers may need to accept a non-nil error while
 // still using any produced output (not implemented yet).
 func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, opts *CompileOptions) ([]byte, error) {
@@ -245,6 +250,14 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 				break
 			}
 		}
+		// Check for TMC5160 sections
+		hasTMC5160 := false
+		for secName := range cfg.sections {
+			if strings.HasPrefix(secName, "tmc5160 ") {
+				hasTMC5160 = true
+				break
+			}
+		}
 		// Check for accelerometer sections (adxl345, mpu9250)
 		_, hasADXL345 := cfg.section("adxl345")
 		hasMPU9250 := false
@@ -264,6 +277,12 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 		} else if hasDualCarriage {
 			// Use cartesian dual_carriage connect-phase compiler
 			initLines, err = hosth1.CompileCartesianDualCarriageConnectPhase(cfgPath, dict)
+			if err != nil {
+				return nil, err
+			}
+		} else if hasTMC5160 && hasBedHeater {
+			// Use TMC5160 cartesian connect-phase compiler for configs with TMC5160 drivers
+			initLines, err = hosth1.CompileTMC5160CartesianConnectPhase(cfgPath, dict)
 			if err != nil {
 				return nil, err
 			}
@@ -468,12 +487,10 @@ func CompileHostH4(cfgPath string, testPath string, dict *protocol.Dictionary, o
 				}
 			}
 		}
-		// Some upstream regressions end with motors disabled in debugoutput.
-		baseTest := filepath.Base(testPath)
-		if baseTest == "bed_screws.test" || baseTest == "extruders.test" || baseTest == "pressure_advance.test" || baseTest == "macros.test" || baseTest == "bltouch.test" || baseTest == "screws_tilt_adjust.test" {
-			if err := rt.onEOF(); err != nil {
-				return nil, err
-			}
+		// Python's debugoutput calls request_restart('exit') at EOF which triggers motor_off()
+		// for ALL file input tests. This generates the final stepper enable commands.
+		if err := rt.onEOF(); err != nil {
+			return nil, err
 		}
 	}
 
