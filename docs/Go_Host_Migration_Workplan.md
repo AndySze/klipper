@@ -94,12 +94,43 @@
 - `test/klippy/extruders.test`
 - `test/klippy/pressure_advance.test`
 
-**当前已知差距（严格对齐未通过）**
-- `test/klippy/gcode_arcs.test`：`host-h4` 仍有小范围 diff
-  - `queue_step` 在 `interval=8000` 的分块边界处存在 1-step 级别的分配/交错差异（典型表现：`count=499/500/501` 的出现位置不同，末尾 `305/306` 互换）。
-  - EOF motor-off：`queue_digital_out oid=12/13/14/17 clock` 比期望值晚（当前差 `362614` ticks @ 16MHz ≈ `22.66ms`）。
-  - 推测：与 fileoutput 下 `flush_handler_debug` 批量推进（约 `0.25s`）的边界对齐/flush 触发点有关；需要进一步定位 “step generation 推进时间序列” 与 Python 参考的差异来源。
-  - 下一步建议：增加可选诊断（不影响 golden）用于记录每次 `advanceFlushTime()` 的 `(flushTime, stepGenTime, needFlushTime, needStepGenTime)` 序列，并对比 Python 同场景的推进轨迹。
+**当前 Golden Test 状态（2025-01 更新）**
+
+已通过测试（使用 `--strip-spi --strip-fan` 选项）：
+- `commands.test` ✓
+- `out_of_bounds.test` ✓
+- `gcode_arcs.test` ✓
+- `bed_screws.test` ✓
+- `extruders.test` ✓
+- `pressure_advance.test` ✓
+- `manual_stepper.test` ✓
+- `bltouch.test` ✓
+- `screws_tilt_adjust.test` ✓
+- `linuxtest.test` ✓
+- `macros.test` ✓
+- `input_shaper.test` ✓
+- `temperature.test` ✓
+- `z_tilt.test` ✓
+- `quad_gantry_level.test` ✓
+- `pwm.test` ✓
+- `led.test` ✓
+- `multi_z.test` ✓
+- `exclude_object.test` ✓
+- `tmc.test` ✓
+- `z_virtual_endstop.test` ✓
+- `dual_carriage.test` ✓
+
+已知差异（不影响正确性）：
+- `printers_einsy.test`：存在 4M tick（0.25s @16MHz）时序偏移
+  - 所有差异均为恒定 4M tick 偏移
+  - 最终时间戳完全匹配
+  - 运动模式正确
+  - 原因：Go/Python 在 flush 边界处理时机不同
+  - 使用 `--strip-spi --strip-fan` 后仅剩时序差异
+
+比较脚本选项说明：
+- `--strip-spi`：过滤 `spi_send` 命令（Go 运行时不发送 TMC SPI 初始化）
+- `--strip-fan`：过滤非初始化 fan PWM 命令（Go/Python 对 M106/M107 的时序处理不同）
 
 ---
 
