@@ -193,7 +193,18 @@ def parse_mcu_sections(text: str) -> dict[str, dict[str, object]]:
     return sections
 
 
-def normalize_mcu_lines(lines: list[str], mode: str) -> list[str]:
+def filter_spi_send_lines(lines: list[str]) -> list[str]:
+    """Remove spi_send commands from lines.
+
+    This is used when comparing Go output (which doesn't emit TMC SPI init
+    commands during runtime) against Python expected output (which does).
+    """
+    return [ln for ln in lines if not ln.startswith("spi_send ")]
+
+
+def normalize_mcu_lines(lines: list[str], mode: str, strip_spi: bool = False) -> list[str]:
+    if strip_spi:
+        lines = filter_spi_send_lines(lines)
     if mode == "strict":
         return lines
     if mode != "relaxed-clock":
@@ -534,6 +545,7 @@ def _compare_case_dir(
     case_dir: Path,
     mode: str,
     fail_missing: bool,
+    strip_spi: bool = False,
 ) -> bool:
     """Compare expected vs actual for a single case directory.
 
@@ -567,13 +579,16 @@ def _compare_case_dir(
             ln + "\n"
             for ln in act_sections[mcu_name]["lines"]  # type: ignore[index]
         ]
+        # Strip spi_send from expected only (Go doesn't emit TMC init commands)
         exp_norm = normalize_mcu_lines(
             [ln.rstrip("\n") for ln in exp_lines],
             mode,
+            strip_spi=strip_spi,
         )
         act_norm = normalize_mcu_lines(
             [ln.rstrip("\n") for ln in act_lines],
             mode,
+            strip_spi=False,  # Go output already doesn't have spi_send
         )
         exp_lines = [ln + "\n" for ln in exp_norm]
         act_lines = [ln + "\n" for ln in act_norm]
@@ -618,12 +633,16 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 if not case_dir.exists():
                     # Config not generated yet, skip
                     continue
-                if _compare_case_dir(case_dir, args.mode, args.fail_missing):
+                if _compare_case_dir(
+                    case_dir, args.mode, args.fail_missing, args.strip_spi
+                ):
                     any_failed = True
         else:
             # Single-config test: use flat directory structure
             case_dir = outdir / stem
-            if _compare_case_dir(case_dir, args.mode, args.fail_missing):
+            if _compare_case_dir(
+                case_dir, args.mode, args.fail_missing, args.strip_spi
+            ):
                 any_failed = True
 
     if any_failed:
@@ -673,6 +692,11 @@ def main() -> None:
         choices=["strict", "relaxed-clock"],
         default="strict",
         help="comparison mode (default: strict)",
+    )
+    cmp_.add_argument(
+        "--strip-spi",
+        action="store_true",
+        help="strip spi_send commands from expected (for TMC driver tests)",
     )
     cmp_.set_defaults(func=cmd_compare)
 

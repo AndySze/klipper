@@ -1019,11 +1019,12 @@ type pin struct {
 }
 
 type heater struct {
-	HeaterPin  pin
-	SensorPin  pin
-	SensorType string
-	MinTemp    float64
-	MaxTemp    float64
+	HeaterPin      pin
+	SensorPin      pin
+	SensorType     string
+	MinTemp        float64
+	MaxTemp        float64
+	PullupResistor float64 // Custom pullup resistor value (0 = use default 4700)
 }
 
 type tempSensor struct {
@@ -1212,12 +1213,21 @@ func readHeaterFromSection(sec map[string]string) (heater, error) {
 	if err != nil {
 		return heater{}, err
 	}
+	// Parse optional pullup_resistor (default 0 means use thermistor default of 4700)
+	var pullupResistor float64
+	if raw := strings.TrimSpace(sec["pullup_resistor"]); raw != "" {
+		pullupResistor, err = strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return heater{}, fmt.Errorf("bad float pullup_resistor=%q", raw)
+		}
+	}
 	return heater{
-		HeaterPin:  heaterPin,
-		SensorPin:  sensorPin,
-		SensorType: sensorType,
-		MinTemp:    minTemp,
-		MaxTemp:    maxTemp,
+		HeaterPin:      heaterPin,
+		SensorPin:      sensorPin,
+		SensorType:     sensorType,
+		MinTemp:        minTemp,
+		MaxTemp:        maxTemp,
+		PullupResistor: pullupResistor,
 	}, nil
 }
 
@@ -1526,6 +1536,10 @@ func thermistorMinMaxTicks(h heater, adcMax float64, sampleCount int) (int, int,
 		th = thermistorTDKNTCG104()
 	default:
 		return 0, 0, fmt.Errorf("unsupported sensor_type %q", h.SensorType)
+	}
+	// Override pullup resistor if config specifies a custom value
+	if h.PullupResistor > 0 {
+		th.pullup = h.PullupResistor
 	}
 	a := []float64{th.calcADC(h.MinTemp), th.calcADC(h.MaxTemp)}
 	sort.Float64s(a)
@@ -3958,6 +3972,341 @@ func generateTMC2130InitCommands(oid int, tmc *tmc2130Config) []string {
 	return cmds
 }
 
+// ============================================================================
+// TMC5160 SPI Driver Support
+// ============================================================================
+
+// TMC5160 register addresses
+const (
+	tmc5160GCONF        = 0x00
+	tmc5160GSTAT        = 0x01
+	tmc5160SHORT_CONF   = 0x09
+	tmc5160DRV_CONF     = 0x0A
+	tmc5160GLOBALSCALER = 0x0B
+	tmc5160IHOLD_IRUN   = 0x10
+	tmc5160TPOWERDOWN   = 0x11
+	tmc5160TPWMTHRS     = 0x13
+	tmc5160TCOOLTHRS    = 0x14
+	tmc5160THIGH        = 0x15
+	tmc5160MSLUT0       = 0x60
+	tmc5160MSLUT1       = 0x61
+	tmc5160MSLUT2       = 0x62
+	tmc5160MSLUT3       = 0x63
+	tmc5160MSLUT4       = 0x64
+	tmc5160MSLUT5       = 0x65
+	tmc5160MSLUT6       = 0x66
+	tmc5160MSLUT7       = 0x67
+	tmc5160MSLUTSEL     = 0x68
+	tmc5160MSLUTSTART   = 0x69
+	tmc5160CHOPCONF     = 0x6c
+	tmc5160COOLCONF     = 0x6d
+	tmc5160PWMCONF      = 0x70
+)
+
+// TMC5160 constants
+const (
+	tmc5160VREF        = 0.325
+	tmc5160MaxCurrent  = 10.0
+	tmc5160SPIMode     = 3
+	tmc5160SPISpeed    = 4000000
+)
+
+// tmc5160Config holds parsed TMC5160 configuration
+type tmc5160Config struct {
+	csPin         string
+	spiBus        string
+	chainPosition int
+	chainLength   int
+	runCurrent    float64
+	holdCurrent   float64
+	senseResistor float64
+	microsteps    int
+	interpolate   bool
+	stealthchop   bool
+}
+
+// tmc5160CalcGlobalscaler calculates the globalscaler value for TMC5160
+func tmc5160CalcGlobalscaler(current, senseResistor float64) int {
+	globalscaler := int(current*256.0*math.Sqrt(2.0)*senseResistor/tmc5160VREF + 0.5)
+	if globalscaler < 32 {
+		globalscaler = 32
+	}
+	if globalscaler >= 256 {
+		globalscaler = 0 // 0 means 256
+	}
+	return globalscaler
+}
+
+// tmc5160CalcCurrentBits calculates irun/ihold bits for TMC5160
+func tmc5160CalcCurrentBits(current float64, globalscaler int, senseResistor float64) int {
+	if globalscaler == 0 {
+		globalscaler = 256
+	}
+	cs := int(current*256.0*32.0*math.Sqrt(2.0)*senseResistor/(float64(globalscaler)*tmc5160VREF) - 1.0 + 0.5)
+	if cs < 0 {
+		return 0
+	}
+	if cs > 31 {
+		return 31
+	}
+	return cs
+}
+
+// tmc5160CalcCurrent calculates globalscaler, irun, ihold for TMC5160
+func tmc5160CalcCurrent(runCurrent, holdCurrent, senseResistor float64) (globalscaler, irun, ihold int) {
+	globalscaler = tmc5160CalcGlobalscaler(runCurrent, senseResistor)
+	irun = tmc5160CalcCurrentBits(runCurrent, globalscaler, senseResistor)
+	minHold := holdCurrent
+	if minHold > runCurrent {
+		minHold = runCurrent
+	}
+	ihold = tmc5160CalcCurrentBits(minHold, globalscaler, senseResistor)
+	return
+}
+
+// tmc5160BuildCHOPCONF builds TMC5160 CHOPCONF register value
+func tmc5160BuildCHOPCONF(toff, hstrt, hend, tbl, tpfd, mres int, intpol, dedge bool) uint32 {
+	val := uint32(toff & 0x0f)
+	val |= uint32((hstrt & 0x07) << 4)
+	val |= uint32((hend & 0x0f) << 7)
+	val |= uint32((tbl & 0x03) << 15)
+	val |= uint32((tpfd & 0x0f) << 20)
+	val |= uint32((mres & 0x0f) << 24)
+	if intpol {
+		val |= 1 << 28
+	}
+	if dedge {
+		val |= 1 << 29
+	}
+	return val
+}
+
+// tmc5160BuildIHOLD_IRUN builds TMC5160 IHOLD_IRUN register value
+func tmc5160BuildIHOLD_IRUN(ihold, irun, iholddelay int) uint32 {
+	return uint32(ihold&0x1f) | uint32((irun&0x1f)<<8) | uint32((iholddelay&0x0f)<<16)
+}
+
+// tmc5160BuildGCONF builds TMC5160 GCONF register value
+func tmc5160BuildGCONF(multistepFilt bool, enPwmMode bool) uint32 {
+	var val uint32
+	if enPwmMode {
+		val |= 1 << 2
+	}
+	if multistepFilt {
+		val |= 1 << 3
+	}
+	return val
+}
+
+// tmc5160BuildPWMCONF builds TMC5160 PWMCONF register value
+func tmc5160BuildPWMCONF(pwmOfs, pwmGrad, pwmFreq int, pwmAutoscale, pwmAutograd bool, freewheel, pwmReg, pwmLim int) uint32 {
+	val := uint32(pwmOfs & 0xff)
+	val |= uint32((pwmGrad & 0xff) << 8)
+	val |= uint32((pwmFreq & 0x03) << 16)
+	if pwmAutoscale {
+		val |= 1 << 18
+	}
+	if pwmAutograd {
+		val |= 1 << 19
+	}
+	val |= uint32((freewheel & 0x03) << 20)
+	val |= uint32((pwmReg & 0x0f) << 24)
+	val |= uint32((pwmLim & 0x0f) << 28)
+	return val
+}
+
+// tmc5160BuildDRV_CONF builds TMC5160 DRV_CONF register value
+func tmc5160BuildDRV_CONF(bbmtime, bbmclks int) uint32 {
+	return uint32(bbmtime&0x1f) | uint32((bbmclks&0x0f)<<8)
+}
+
+// parseTMC5160 parses a [tmc5160 xxx] section
+func parseTMC5160(cfg *config, stepperName string) (*tmc5160Config, error) {
+	secName := "tmc5160 " + stepperName
+	sec, ok := cfg.sections[secName]
+	if !ok {
+		return nil, nil // No TMC5160 for this stepper
+	}
+
+	csPin := strings.TrimSpace(sec["cs_pin"])
+	if csPin == "" {
+		return nil, fmt.Errorf("missing cs_pin in [%s]", secName)
+	}
+
+	spiBus := strings.TrimSpace(sec["spi_bus"])
+
+	chainPosition := 1 // default for non-chained
+	if v, ok := sec["chain_position"]; ok {
+		var err error
+		chainPosition, err = strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return nil, fmt.Errorf("invalid chain_position in [%s]: %w", secName, err)
+		}
+	}
+
+	chainLength := 1 // default for non-chained
+	if v, ok := sec["chain_length"]; ok {
+		var err error
+		chainLength, err = strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return nil, fmt.Errorf("invalid chain_length in [%s]: %w", secName, err)
+		}
+	}
+
+	runCurrent := 0.8 // default
+	if v, ok := sec["run_current"]; ok {
+		var err error
+		runCurrent, err = strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid run_current in [%s]: %w", secName, err)
+		}
+	}
+
+	holdCurrent := tmc5160MaxCurrent // default to max
+	if v, ok := sec["hold_current"]; ok {
+		var err error
+		holdCurrent, err = strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hold_current in [%s]: %w", secName, err)
+		}
+	}
+
+	senseResistor := 0.075 // default for TMC5160
+	if v, ok := sec["sense_resistor"]; ok {
+		var err error
+		senseResistor, err = strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid sense_resistor in [%s]: %w", secName, err)
+		}
+	}
+
+	interpolate := true // default
+	if v, ok := sec["interpolate"]; ok {
+		interpolate = strings.ToLower(strings.TrimSpace(v)) == "true"
+	}
+
+	stealthchop := false // default for TMC5160
+	if v, ok := sec["stealthchop_threshold"]; ok {
+		// If stealthchop_threshold is set to a non-zero value, enable en_pwm_mode
+		thresh, _ := strconv.Atoi(strings.TrimSpace(v))
+		stealthchop = thresh > 0
+	}
+
+	// Get microsteps from stepper section
+	stepperSec, ok := cfg.sections[stepperName]
+	if !ok {
+		return nil, fmt.Errorf("missing [%s] section for TMC5160", stepperName)
+	}
+	microsteps := 16 // default
+	if v, ok := stepperSec["microsteps"]; ok {
+		var err error
+		microsteps, err = strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return nil, fmt.Errorf("invalid microsteps in [%s]: %w", stepperName, err)
+		}
+	}
+
+	return &tmc5160Config{
+		csPin:         csPin,
+		spiBus:        spiBus,
+		chainPosition: chainPosition,
+		chainLength:   chainLength,
+		runCurrent:    runCurrent,
+		holdCurrent:   holdCurrent,
+		senseResistor: senseResistor,
+		microsteps:    microsteps,
+		interpolate:   interpolate,
+		stealthchop:   stealthchop,
+	}, nil
+}
+
+// formatSPISendChain formats spi_send command for daisy chain with padding
+func formatSPISendChain(oid int, chainPos, chainLen int, reg byte, val uint32) string {
+	// Total length = chainLen * 5 bytes
+	data := make([]byte, chainLen*5)
+
+	// Position data at correct chain position
+	// Chain position 1 = last 5 bytes, position N = first 5 bytes
+	offset := (chainLen - chainPos) * 5
+	data[offset] = reg | 0x80 // Write bit
+	data[offset+1] = byte(val >> 24)
+	data[offset+2] = byte(val >> 16)
+	data[offset+3] = byte(val >> 8)
+	data[offset+4] = byte(val)
+
+	return fmt.Sprintf("spi_send oid=%d data=b'%s'", oid, formatPythonBytes(data))
+}
+
+// generateTMC5160InitCommands generates spi_send commands for TMC5160 register initialization
+func generateTMC5160InitCommands(oid int, tmc *tmc5160Config) []string {
+	// Calculate current settings
+	globalscaler, irun, ihold := tmc5160CalcCurrent(tmc.runCurrent, tmc.holdCurrent, tmc.senseResistor)
+
+	// Build register values
+	mres := microstepsToMres(tmc.microsteps)
+
+	// GLOBALSCALER
+	globalscalerReg := uint32(globalscaler)
+
+	// IHOLD_IRUN with iholddelay=6
+	iholdIrun := tmc5160BuildIHOLD_IRUN(ihold, irun, 6)
+
+	// CHOPCONF: toff=0 (driver disabled via virtual enable), hstrt=5, hend=2, tbl=2, tpfd=4, dedge=true
+	// When using shared enable pins, TMC drivers use "virtual enable" via CHOPCONF.toff
+	// toff=0 disables the driver; toff=3 is the configured value used when enabled
+	chopconf := tmc5160BuildCHOPCONF(0, 5, 2, 2, 4, mres, tmc.interpolate, true)
+
+	// MSLUT (same default wave table as TMC2130)
+	// MSLUTSEL: w0=2, w1=1, w2=1, w3=1, x1=128, x2=255, x3=255
+	mslutsel := tmc2130BuildMSLUTSEL(2, 1, 1, 1, 128, 255, 255)
+	// MSLUTSTART: start_sin=0, start_sin90=247
+	mslutstart := tmc2130BuildMSLUTSTART(0, 247)
+
+	// TPWMTHRS
+	tpwmthrs := uint32(0x000FFFFF) // default
+
+	// GCONF: multistep_filt=true by default
+	gconf := tmc5160BuildGCONF(true, tmc.stealthchop)
+
+	// TCOOLTHRS, THIGH, COOLCONF default to 0
+	tcoolthrs := uint32(0)
+	thigh := uint32(0)
+	coolconf := uint32(0)
+
+	// DRV_CONF: bbmtime=0, bbmclks=4
+	drvConf := tmc5160BuildDRV_CONF(0, 4)
+
+	// PWMCONF: pwm_ofs=30, pwm_grad=0, pwm_freq=0, pwm_autoscale=true, pwm_autograd=true, freewheel=0, pwm_reg=4, pwm_lim=12
+	pwmconf := tmc5160BuildPWMCONF(30, 0, 0, true, true, 0, 4, 12)
+
+	// TPOWERDOWN
+	tpowerdown := uint32(10)
+
+	var cmds []string
+	chainPos := tmc.chainPosition
+	chainLen := tmc.chainLength
+
+	// Generate init commands in correct order (matching Python output)
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160GLOBALSCALER, globalscalerReg))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160IHOLD_IRUN, iholdIrun))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160CHOPCONF, chopconf))
+	for i := 0; i < 8; i++ {
+		cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, byte(tmc5160MSLUT0+i), tmc2130DefaultMSLUT[i]))
+	}
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160MSLUTSEL, mslutsel))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160MSLUTSTART, mslutstart))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160TPWMTHRS, tpwmthrs))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160GCONF, gconf))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160TCOOLTHRS, tcoolthrs))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160THIGH, thigh))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160COOLCONF, coolconf))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160DRV_CONF, drvConf))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160PWMCONF, pwmconf))
+	cmds = append(cmds, formatSPISendChain(oid, chainPos, chainLen, tmc5160TPOWERDOWN, tpowerdown))
+
+	return cmds
+}
+
 // CompileTMC2130CartesianConnectPhase compiles the connect-phase MCU command stream
 // for cartesian configs with TMC2130 stepper drivers (e.g., generic-einsy-rambo.cfg).
 func CompileTMC2130CartesianConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
@@ -4310,6 +4659,360 @@ func CompileTMC2130CartesianConnectPhase(cfgPath string, dict *protocol.Dictiona
 	}
 	if tmcE != nil {
 		initCmds = append(initCmds, generateTMC2130InitCommands(oidSPI_E, tmcE)...)
+	}
+
+	// Build final output
+	out := make([]string, 0)
+	out = append(out, withAllocate...)
+	out = append(out, fmt.Sprintf("finalize_config crc=%d", crc))
+	out = append(out, initCmds...)
+	return out, nil
+}
+
+// CompileTMC5160CartesianConnectPhase compiles the connect-phase MCU command stream
+// for cartesian configs with TMC5160 stepper drivers in SPI daisy chain (e.g., generic-duet3-6hc.cfg).
+func CompileTMC5160CartesianConnectPhase(cfgPath string, dict *protocol.Dictionary) ([]string, error) {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return nil, err
+	}
+	clockFreq, err := dictConfigFloat(dict, "CLOCK_FREQ")
+	if err != nil {
+		return nil, err
+	}
+	adcMax, err := dictConfigFloat(dict, "ADC_MAX")
+	if err != nil {
+		return nil, err
+	}
+	mcuFreq := clockFreq
+
+	// Derived constants
+	const (
+		pwmCycleTime     = 0.100
+		fanCycleTime     = 0.010
+		heaterMaxHeatSec = 3.0
+		adcSampleTime    = 0.001
+		adcSampleCount   = 8
+		adcReportTime    = 0.300
+		adcRangeChecks   = 4
+		pwmInitDelaySec  = 0.200
+	)
+	cycleTicks := secondsToClock(mcuFreq, pwmCycleTime)
+	fanCycleTicks := secondsToClock(mcuFreq, fanCycleTime)
+	mdurTicks := secondsToClock(mcuFreq, heaterMaxHeatSec)
+	// TMC5160 uses dedge mode (dual-edge stepping)
+	// step_pulse_ticks for dedge is calculated differently
+	// For SAME70 at 300MHz, Python produces step_pulse_ticks=30
+	stepPulseTicks := secondsToClock(mcuFreq, 0.0000001) // 100ns minimum
+	if stepPulseTicks < 30 {
+		stepPulseTicks = 30
+	}
+	sampleTicks := secondsToClock(mcuFreq, adcSampleTime)
+	reportTicks := secondsToClock(mcuFreq, adcReportTime)
+	pwmInitClock := secondsToClock(mcuFreq, pwmInitDelaySec)
+
+	// Parse TMC5160 configs
+	tmcX, err := parseTMC5160(cfg, "stepper_x")
+	if err != nil {
+		return nil, err
+	}
+	tmcY, err := parseTMC5160(cfg, "stepper_y")
+	if err != nil {
+		return nil, err
+	}
+	tmcZ, err := parseTMC5160(cfg, "stepper_z")
+	if err != nil {
+		return nil, err
+	}
+	tmcE, err := parseTMC5160(cfg, "extruder")
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse stepper configs
+	stepperX, err := readStepper(cfg, "stepper_x")
+	if err != nil {
+		return nil, err
+	}
+	stepperY, err := readStepper(cfg, "stepper_y")
+	if err != nil {
+		return nil, err
+	}
+	stepperZ, err := readStepper(cfg, "stepper_z")
+	if err != nil {
+		return nil, err
+	}
+	extruder, err := readExtruder(cfg, "extruder")
+	if err != nil {
+		return nil, err
+	}
+	bed, err := readHeater(cfg, "heater_bed")
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for fan
+	fanSec, hasFan := cfg.sections["fan"]
+	var fanPin pin
+	if hasFan {
+		fanPin, err = parsePin(fanSec, "pin", true, false)
+		if err != nil {
+			return nil, fmt.Errorf("fan pin: %w", err)
+		}
+	}
+
+	// Check for heater_fan
+	var heaterFanPin string
+	for secName, secData := range cfg.sections {
+		if strings.HasPrefix(secName, "heater_fan ") {
+			if p, ok := secData["pin"]; ok {
+				heaterFanPin = strings.TrimSpace(p)
+				break
+			}
+		}
+	}
+
+	// Check for adc_scaled (vref/vssa pins)
+	var vrefPin, vssaPin string
+	for secName, secData := range cfg.sections {
+		if strings.HasPrefix(secName, "adc_scaled ") {
+			vrefPin = strings.TrimSpace(secData["vref_pin"])
+			vssaPin = strings.TrimSpace(secData["vssa_pin"])
+			break
+		}
+	}
+
+	// OID allocation for TMC5160 daisy chain
+	// TMC5160 shares a single SPI OID for all drivers in chain
+	// OID 0: SPI for TMC5160 daisy chain
+	// OID 1: endstop X
+	// OID 2: trsync X
+	// OID 3: stepper X
+	// OID 4: endstop Y
+	// OID 5: trsync Y
+	// OID 6: stepper Y
+	// OID 7: endstop Z
+	// OID 8: trsync Z
+	// OID 9: stepper Z
+	// OID 10: stepper E
+	// OID 11+: vref, vssa, heater_fan, fan, heaters, etc.
+
+	oidSPI := 0
+	oidEndstopX := 1
+	oidTrsyncX := 2
+	oidStepperX := 3
+	oidEndstopY := 4
+	oidTrsyncY := 5
+	oidStepperY := 6
+	oidEndstopZ := 7
+	oidTrsyncZ := 8
+	oidStepperZ := 9
+	oidStepperE := 10
+
+	nextOID := 11
+
+	// vref/vssa ADC
+	oidVref := -1
+	oidVssa := -1
+	if vrefPin != "" {
+		oidVref = nextOID
+		nextOID++
+	}
+	if vssaPin != "" {
+		oidVssa = nextOID
+		nextOID++
+	}
+
+	// Heater fan
+	oidHeaterFan := -1
+	if heaterFanPin != "" {
+		oidHeaterFan = nextOID
+		nextOID++
+	}
+
+	// Bed heater
+	oidADCBed := nextOID
+	nextOID++
+	oidPWMBed := nextOID
+	nextOID++
+
+	// Part cooling fan
+	oidPWMFan := -1
+	if hasFan {
+		oidPWMFan = nextOID
+		nextOID++
+	}
+
+	// Enable pin (shared for all TMC5160)
+	oidEnable := nextOID
+	nextOID++
+
+	// Extruder
+	oidADCE := nextOID
+	nextOID++
+	oidPWME := nextOID
+	nextOID++
+
+	totalOIDs := nextOID
+
+	// Build config commands
+	var configCmds []string
+
+	// Get CS pin and SPI bus from first TMC config
+	var csPin, spiBus string
+	if tmcX != nil {
+		csPin = tmcX.csPin
+		spiBus = tmcX.spiBus
+	} else if tmcY != nil {
+		csPin = tmcY.csPin
+		spiBus = tmcY.spiBus
+	}
+
+	// SPI config for TMC5160 daisy chain (single shared OID)
+	configCmds = append(configCmds, fmt.Sprintf("config_spi oid=%d pin=%s cs_active_high=0", oidSPI, csPin))
+	configCmds = append(configCmds, fmt.Sprintf("spi_set_bus oid=%d spi_bus=%s mode=3 rate=4000000", oidSPI, spiBus))
+
+	// vref/vssa ADC (for adc_scaled)
+	if vrefPin != "" {
+		configCmds = append(configCmds, fmt.Sprintf("config_analog_in oid=%d pin=%s", oidVref, vrefPin))
+	}
+	if vssaPin != "" {
+		configCmds = append(configCmds, fmt.Sprintf("config_analog_in oid=%d pin=%s", oidVssa, vssaPin))
+	}
+
+	// Heater fan
+	if heaterFanPin != "" {
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=1 max_duration=0", oidHeaterFan, heaterFanPin),
+			fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", oidHeaterFan, fanCycleTicks),
+		)
+	}
+
+	// Heater bed
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", oidADCBed, bed.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=%d", oidPWMBed, bed.HeaterPin.pin, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", oidPWMBed, cycleTicks),
+	)
+
+	// Part cooling fan
+	if hasFan {
+		configCmds = append(configCmds,
+			fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=0", oidPWMFan, fanPin.pin),
+			fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", oidPWMFan, fanCycleTicks),
+		)
+	}
+
+	// Stepper X - TMC5160 uses dedge (invert_step=-1 = 0xFFFFFFFF)
+	invertStep := uint32(0xFFFFFFFF) // dedge mode
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", oidEndstopX, stepperX.Endstop.pin, stepperX.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", oidTrsyncX),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperX, stepperX.Step.pin, stepperX.Dir.pin, invertStep, stepPulseTicks),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=%d default_value=%d max_duration=0",
+			oidEnable, stepperX.Enable.pin, boolToInt(stepperX.Enable.invert), boolToInt(stepperX.Enable.invert)),
+	)
+
+	// Stepper Y
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", oidEndstopY, stepperY.Endstop.pin, stepperY.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", oidTrsyncY),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperY, stepperY.Step.pin, stepperY.Dir.pin, invertStep, stepPulseTicks),
+	)
+
+	// Stepper Z
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_endstop oid=%d pin=%s pull_up=%d", oidEndstopZ, stepperZ.Endstop.pin, stepperZ.Endstop.pullup),
+		fmt.Sprintf("config_trsync oid=%d", oidTrsyncZ),
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperZ, stepperZ.Step.pin, stepperZ.Dir.pin, invertStep, stepPulseTicks),
+	)
+
+	// Extruder heater/sensor
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_analog_in oid=%d pin=%s", oidADCE, extruder.Heater.SensorPin.pin),
+		fmt.Sprintf("config_digital_out oid=%d pin=%s value=0 default_value=0 max_duration=%d", oidPWME, extruder.Heater.HeaterPin.pin, mdurTicks),
+		fmt.Sprintf("set_digital_out_pwm_cycle oid=%d cycle_ticks=%d", oidPWME, cycleTicks),
+	)
+
+	// Extruder stepper
+	configCmds = append(configCmds,
+		fmt.Sprintf("config_stepper oid=%d step_pin=%s dir_pin=%s invert_step=%d step_pulse_ticks=%d",
+			oidStepperE, extruder.Step.pin, extruder.Dir.pin, invertStep, stepPulseTicks),
+	)
+
+	// Build allocate_oids + config commands
+	withAllocate := append([]string{fmt.Sprintf("allocate_oids count=%d", totalOIDs)}, configCmds...)
+
+	// Compute CRC
+	crcText := strings.Join(withAllocate, "\n")
+	crc := crc32.ChecksumIEEE([]byte(crcText))
+
+	// Build init commands
+	var initCmds []string
+
+	// vref/vssa ADC queries
+	if vrefPin != "" {
+		initCmds = append(initCmds,
+			fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=0 max_value=32760 range_check_count=0",
+				oidVref, querySlotClock(mcuFreq, oidVref), sampleTicks, adcSampleCount, reportTicks),
+		)
+	}
+	if vssaPin != "" {
+		initCmds = append(initCmds,
+			fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=0 max_value=32760 range_check_count=0",
+				oidVssa, querySlotClock(mcuFreq, oidVssa), sampleTicks, adcSampleCount, reportTicks),
+		)
+	}
+
+	// Heater fan init
+	if heaterFanPin != "" {
+		initCmds = append(initCmds,
+			fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", oidHeaterFan, pwmInitClock),
+		)
+	}
+
+	// ADC queries for heaters
+	bedMin, bedMax, err := thermistorMinMaxTicks(bed, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+	initCmds = append(initCmds,
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			oidADCBed, querySlotClock(mcuFreq, oidADCBed), sampleTicks, adcSampleCount, reportTicks, bedMin, bedMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", oidPWMBed, pwmInitClock),
+	)
+
+	if hasFan {
+		initCmds = append(initCmds,
+			fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", oidPWMFan, pwmInitClock),
+		)
+	}
+
+	extMin, extMax, err := thermistorMinMaxTicks(extruder.Heater, adcMax, adcSampleCount)
+	if err != nil {
+		return nil, err
+	}
+	initCmds = append(initCmds,
+		fmt.Sprintf("query_analog_in oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d min_value=%d max_value=%d range_check_count=%d",
+			oidADCE, querySlotClock(mcuFreq, oidADCE), sampleTicks, adcSampleCount, reportTicks, extMin, extMax, adcRangeChecks),
+		fmt.Sprintf("queue_digital_out oid=%d clock=%d on_ticks=0", oidPWME, pwmInitClock),
+	)
+
+	// TMC5160 init commands (spi_send) - all using same SPI OID
+	if tmcX != nil {
+		initCmds = append(initCmds, generateTMC5160InitCommands(oidSPI, tmcX)...)
+	}
+	if tmcY != nil {
+		initCmds = append(initCmds, generateTMC5160InitCommands(oidSPI, tmcY)...)
+	}
+	if tmcZ != nil {
+		initCmds = append(initCmds, generateTMC5160InitCommands(oidSPI, tmcZ)...)
+	}
+	if tmcE != nil {
+		initCmds = append(initCmds, generateTMC5160InitCommands(oidSPI, tmcE)...)
 	}
 
 	// Build final output

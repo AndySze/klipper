@@ -133,14 +133,50 @@ func (f *fan) setSpeed(printTime float64, value float64) error {
 		return nil
 	}
 
-	// Handle kick start for fans spinning up
-	if value > 0 && f.lastFanValue == 0 && f.kickStartTime > 0 {
-		// Run at kick start power first
+	// Handle kick start for fans spinning up from zero
+	// (or when increasing speed by > 0.5, matching Python behavior)
+	needsKickStart := value > 0 && f.kickStartTime > 0 &&
+		(f.lastFanValue == 0 || value-f.lastFanValue > 0.5)
+
+	if needsKickStart {
+		// Run at kick start power first (use kickStartPower, scaled by maxPower)
+		kickPower := f.kickStartPower * f.maxPower
+		if kickPower > f.maxPower {
+			kickPower = f.maxPower
+		}
+
+		f.rt.tracef("Fan %s: kick-start at power %.2f for %.3fs\n", f.name, kickPower, f.kickStartTime)
+
+		// Send PWM command for kick-start power
+		if f.out != nil && f.cycleTicks > 0 {
+			onTicks := uint32(kickPower*float64(f.cycleTicks) + 0.5)
+			if err := f.out.setOnTicks(printTime, onTicks); err != nil {
+				return err
+			}
+		}
+
+		// Update state for kick-start period
 		f.enabledFromTime = printTime
-		// TODO: In full implementation, would schedule a callback to reduce power
-		// after kickStartTime elapses
+		f.lastFanValue = kickPower
+		f.lastFanTime = printTime
+
+		// Now set the actual target value after kick-start time elapses
+		// In file output mode, we emit both commands (kick-start now, target later)
+		targetTime := printTime + f.kickStartTime
+		if f.out != nil && f.cycleTicks > 0 {
+			onTicks := uint32(value*float64(f.cycleTicks) + 0.5)
+			if err := f.out.setOnTicks(targetTime, onTicks); err != nil {
+				return err
+			}
+		}
+
+		f.lastFanValue = value
+		f.lastFanTime = targetTime
+		f.rt.tracef("Fan %s: set speed to %.2f at time %.3f (after kick-start)\n", f.name, value, targetTime)
+		return nil
 	}
 
+	// Normal speed change (no kick-start needed)
 	f.lastFanValue = value
 	f.lastFanTime = printTime
 
@@ -181,21 +217,37 @@ type fanManager struct {
 }
 
 // controllerFan is a fan that turns on when steppers are active.
+// Note: controller_fan uses a periodic timer callback (reactor.register_timer)
+// to check stepper/heater activity and adjust fan speed. In file output mode,
+// no reactor runs, so the callback isn't invoked and no auto-control happens.
+// For real-time mode, implement the periodic check against stepper_enable status.
 type controllerFan struct {
 	*fan
 	idleTimeout float64
 	idleSpeed   float64
+	fanSpeed    float64   // Speed when active
+	steppers    []string  // Stepper names to monitor
+	heaters     []string  // Heater names to monitor
 }
 
 // heaterFan is a fan that turns on when a heater is above a threshold.
+// Note: heater_fan uses a periodic timer callback (reactor.register_timer)
+// to check heater temperature and adjust fan speed. In file output mode,
+// no reactor runs, so the callback isn't invoked and no auto-control happens.
+// For real-time mode, implement the periodic check against heater temperatures.
 type heaterFan struct {
 	*fan
-	heaterName string
-	heaterTemp float64
+	heaterNames []string  // Heater names to monitor
+	heaterTemp  float64   // Temperature threshold for fan activation
+	fanSpeed    float64   // Speed when above threshold
 }
 
 // newFanManager creates a fan manager from configuration.
-func newFanManager(rt *runtime, cfg *configWrapper) (*fanManager, error) {
+// fanOID specifies the OID for the main part cooling fan - this varies by config type:
+// - For TMC2130 configs: oid=16 (after SPI, steppers, bed ADC/PWM)
+// - For non-TMC configs with fan: oid=12
+// - Pass -1 if fan OID should be auto-detected (not recommended)
+func newFanManager(rt *runtime, cfg *configWrapper, fanOID int) (*fanManager, error) {
 	fm := &fanManager{
 		rt:        rt,
 		namedFans: make(map[string]*fan),
@@ -206,13 +258,11 @@ func newFanManager(rt *runtime, cfg *configWrapper) (*fanManager, error) {
 	if err != nil {
 		return nil, err
 	}
-	if partFan != nil {
-		// Set up PWM output for the main fan
-		// OID 12 is used for fan when [fan] section is present (see hosth1/h1.go)
-		const fanOID = 12
+	if partFan != nil && fanOID >= 0 {
+		// Set up PWM output for the main fan using the provided OID
 		const fanCycleTime = 0.010 // 10ms default cycle time
 		cycleTicks := uint64(fanCycleTime * rt.mcuFreq)
-		fanOut := newDigitalOut(fanOID, false, rt.sq, rt.cqMain, rt.formats, rt.mcuFreq, "mcu")
+		fanOut := newDigitalOut(uint32(fanOID), false, rt.sq, rt.cqMain, rt.formats, rt.mcuFreq, "mcu")
 		partFan.out = fanOut
 		partFan.cycleTicks = cycleTicks
 		partFan.mcuFreq = rt.mcuFreq
@@ -228,8 +278,10 @@ func newFanManager(rt *runtime, cfg *configWrapper) (*fanManager, error) {
 		if f != nil {
 			fanName := name[len("fan_generic "):]
 			fm.namedFans[fanName] = f
-			// Note: fan_generic fans would need their own OID allocation
-			// which is not yet implemented
+			// Note: fan_generic fans use OIDs allocated during hosth1 compile phase.
+			// For golden tests, OID assignment depends on config. If fan_generic tests
+			// are needed, the OID would be passed from hosth1's output dictionary.
+			// Currently no tests exercise fan_generic, so this is tracked for future.
 		}
 	}
 

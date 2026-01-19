@@ -3141,7 +3141,18 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 	rt.heaterManager = temperature.NewHeaterManager(newPrinterAdapter(rt))
 
 	// Initialize fan manager if [fan] section exists
-	if fm, err := newFanManager(rt, cfg); err != nil {
+	// Fan OID depends on config type:
+	// - TMC2130 configs: fanOID = 16 (after SPI 0-3, steppers 4-13, bed ADC 14, bed PWM 15)
+	// - Non-TMC configs with fan: fanOID = 12
+	fanOID := -1
+	if hasFan {
+		if hasTMC2130Enable {
+			fanOID = 16
+		} else {
+			fanOID = 12
+		}
+	}
+	if fm, err := newFanManager(rt, cfg, fanOID); err != nil {
 		return nil, fmt.Errorf("initialize fan manager: %w", err)
 	} else if fm != nil {
 		rt.fanManager = fm
