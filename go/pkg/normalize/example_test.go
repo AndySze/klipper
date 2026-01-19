@@ -8,6 +8,7 @@
 package normalize
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -25,10 +26,15 @@ func ExampleNormalizer_Register_reorder() {
 	input := []string{"A", "B", "C", "D", "E"}
 	output := normalizer.Apply(input)
 	
-	// Output: [A C B D E]
 	for _, line := range output {
-		println(line)
+		fmt.Println(line)
 	}
+	// Output:
+	// A
+	// C
+	// B
+	// D
+	// E
 }
 
 // Test basic reorder rule

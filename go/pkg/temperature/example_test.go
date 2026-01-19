@@ -87,8 +87,8 @@ func (m *MockADC) GetMCU() temperature.MCUInterface {
 	return m.mcu
 }
 
-// ExampleHeaterCreation demonstrates creating a heater with PID control
-func ExampleHeaterCreation() {
+// Example_heaterCreation demonstrates creating a heater with PID control
+func Example_heaterCreation() {
 	printer := &MockPrinter{}
 	mcu := &MockMCU{}
 	pwm := &MockPWM{mcu: mcu}
@@ -136,8 +136,8 @@ func ExampleHeaterCreation() {
 		status["temperature"], status["target"], status["power"])
 }
 
-// ExampleBangBangControl demonstrates bang-bang control
-func ExampleBangBangControl() {
+// Example_bangBangControl demonstrates bang-bang control
+func Example_bangBangControl() {
 	printer := &MockPrinter{}
 	mcu := &MockMCU{}
 	pwm := &MockPWM{mcu: mcu}

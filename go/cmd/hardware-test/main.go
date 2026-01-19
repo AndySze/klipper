@@ -56,6 +56,7 @@ func main() {
 	test := flag.String("test", "connect", "Test to run: serial, connect, clock, temp, query, all")
 	socket := flag.Bool("socket", false, "Connect via Unix socket instead of serial port (for Linux MCU simulator)")
 	tcp := flag.Bool("tcp", false, "Connect via TCP (e.g., -device localhost:5555 -tcp)")
+	linux := flag.Bool("linux", false, "Use Linux-style GPIO pins (gpio0, gpio1) instead of ARM-style (PA0, PA1)")
 
 	flag.Parse()
 
@@ -139,9 +140,9 @@ func main() {
 		case "config":
 			err = testConfig(ri, *timeout)
 		case "stepper":
-			err = testStepper(ri, *timeout)
+			err = testStepper(ri, *timeout, *linux)
 		case "gpio":
-			err = testGPIO(ri, *timeout)
+			err = testGPIO(ri, *timeout, *linux)
 		case "endstop":
 			err = testEndstop(ri, *timeout)
 		case "temploop":
@@ -659,8 +660,16 @@ func testConfig(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 }
 
 // testStepper tests stepper motor configuration and control.
-func testStepper(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
+func testStepper(ri *hosth4.RealtimeIntegration, timeout time.Duration, linuxPins bool) error {
 	fmt.Println("=== Test: Stepper Motor ===")
+
+	// Select pin names based on MCU type
+	stepPin := "PA0"
+	dirPin := "PA1"
+	if linuxPins {
+		stepPin = "gpio0"
+		dirPin = "gpio1"
+	}
 
 	// Connect to MCU
 	fmt.Println("Connecting to MCU...")
@@ -706,12 +715,15 @@ func testStepper(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 
 	// Configure stepper (X axis)
 	oid := 0
-	fmt.Printf("\nConfiguring stepper oid=%d...\n", oid)
+	// step_pulse_ticks: duration of step pulse in MCU ticks (2 microseconds at 50MHz = 100 ticks)
+	stepPulseTicks := int(mcu.MCUFreq() * 2 / 1000000) // 2 microseconds
+	fmt.Printf("\nConfiguring stepper oid=%d (step=%s, dir=%s)...\n", oid, stepPin, dirPin)
 	if err := mcu.SendCommand("config_stepper", map[string]interface{}{
-		"oid":         oid,
-		"step_pin":    "PA0",
-		"dir_pin":     "PA1",
-		"invert_step": 0,
+		"oid":              oid,
+		"step_pin":         stepPin,
+		"dir_pin":          dirPin,
+		"invert_step":      0,
+		"step_pulse_ticks": stepPulseTicks,
 	}); err != nil {
 		return fmt.Errorf("config_stepper: %w", err)
 	}
@@ -772,8 +784,18 @@ func testStepper(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 }
 
 // testGPIO tests digital and PWM output.
-func testGPIO(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
+func testGPIO(ri *hosth4.RealtimeIntegration, timeout time.Duration, linuxPins bool) error {
 	fmt.Println("=== Test: GPIO Output ===")
+
+	// Select pin names based on MCU type
+	digPin := "PB0"
+	pwmPin := "pwmchip0/pwm0" // Linux MCU uses pwmchip for PWM
+	if linuxPins {
+		digPin = "gpio2"
+		pwmPin = "pwmchip0/pwm0"
+	} else {
+		pwmPin = "PB1"
+	}
 
 	// Connect to MCU
 	fmt.Println("Connecting to MCU...")
@@ -819,10 +841,10 @@ func testGPIO(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 
 	// Configure digital output (LED)
 	digOid := 0
-	fmt.Printf("\nConfiguring digital output oid=%d...\n", digOid)
+	fmt.Printf("\nConfiguring digital output oid=%d (pin=%s)...\n", digOid, digPin)
 	if err := mcu.SendCommand("config_digital_out", map[string]interface{}{
 		"oid":           digOid,
-		"pin":           "PB0",
+		"pin":           digPin,
 		"value":         0,
 		"default_value": 0,
 		"max_duration":  0,
@@ -834,10 +856,10 @@ func testGPIO(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 	// Configure PWM output (heater/fan)
 	pwmOid := 1
 	pwmCycleTicks := int(mcu.MCUFreq() / 1000) // 1kHz PWM
-	fmt.Printf("\nConfiguring PWM output oid=%d...\n", pwmOid)
+	fmt.Printf("\nConfiguring PWM output oid=%d (pin=%s)...\n", pwmOid, pwmPin)
 	if err := mcu.SendCommand("config_pwm_out", map[string]interface{}{
 		"oid":           pwmOid,
-		"pin":           "PB1",
+		"pin":           pwmPin,
 		"cycle_ticks":   pwmCycleTicks,
 		"value":         0,
 		"default_value": 0,
@@ -1865,7 +1887,7 @@ func testStress(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
 
 // testAll runs all tests.
 func testAll(ri *hosth4.RealtimeIntegration, timeout time.Duration) error {
-	fmt.Println("Running all tests...\n")
+	fmt.Println("Running all tests...")
 
 	if err := testConnect(ri, timeout); err != nil {
 		return err

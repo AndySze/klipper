@@ -7,6 +7,7 @@ package temperature
 
 import (
 	"fmt"
+	"math"
 )
 
 // SensorTypes defines available sensor types
@@ -44,21 +45,14 @@ func NewAD595Sensor(name string, pin string, adc ADCInterface, config *AD595Conf
 	}
 	sensor := NewMCUSensor(name, mcuConfig, adc)
 
-	// AD595: 10mV/°C linear output
-	// At 0°C: 0V, at 250°C: 2.5V
-	// Formula: temp = (voltage - offset) / 0.010
-	slope := 1.0 / 0.010 // 100 degrees per volt
-	base := config.VoltageOffset / 0.010
-	sensor.SetCalibration(base, slope)
-
 	ad595 := &AD595Sensor{
 		sensor: sensor,
 		adc:    adc,
 		config: config,
 	}
 
-	// Setup callback
-	sensor.SetupCallback(ad595.temperatureCallback)
+	// Setup ADC callback - this processes raw ADC values
+	adc.SetupADCCallback(ReportTime, ad595.adcCallback)
 
 	return ad595, nil
 }
@@ -84,11 +78,14 @@ func (s *AD595Sensor) GetTemp(eventtime float64) (current, target float64) {
 	return s.sensor.GetTemp(eventtime)
 }
 
-func (s *AD595Sensor) temperatureCallback(readTime, adcValue float64) {
+// adcCallback processes ADC readings and converts to temperature
+func (s *AD595Sensor) adcCallback(readTime, adcValue float64) {
 	// Convert ADC value to voltage (0-5V range)
+	// ADC value is normalized 0.0-1.0
 	voltage := adcValue * s.config.VoltageSupply
 
 	// Convert to temperature
+	// AD595: 10mV/°C linear output
 	temp := (voltage - s.config.VoltageOffset) / 0.010
 
 	// Store last temperature
@@ -123,34 +120,14 @@ func NewPT100Sensor(name string, pin string, adc ADCInterface, config *PT100Conf
 	}
 	sensor := NewMCUSensor(name, mcuConfig, adc)
 
-	// PT100 with INA826: simplified linear approximation
-	// Formula: temp = (adc_ratio * R_ref - R0) / (R0 * 0.00385)
-	// Where adc_ratio = adc_value / ADC_MAX
-	// Simplified: temp = (voltage / voltage_ref * R_ref - R0) / (R0 * alpha)
-	// With INA826 gain of 8, we get a reasonable approximation
-	alpha := 0.00385 // PT100 temperature coefficient
-	voltageRef := 3.3 // Reference voltage
-	gain := 8.0       // INA826 gain
-
-	// Calculate slope: change in ADC per degree
-	// At 0°C: PT100 = 100 ohms
-	// At 100°C: PT100 = 138.5 ohms
-	// Voltage across PT100 = I * R_PT100
-	// With INA826 gain, V_out = gain * I * R_PT100
-	// This is complex, so use simplified linear approximation
-	slope := config.ReferenceResistor * alpha / (voltageRef / gain) * 5.0 // empirical
-	base := -273.15 // Offset to Celsius
-
-	sensor.SetCalibration(base, slope)
-
 	pt100 := &PT100Sensor{
 		sensor: sensor,
 		adc:    adc,
 		config: config,
 	}
 
-	// Setup callback
-	sensor.SetupCallback(pt100.temperatureCallback)
+	// Setup ADC callback - this processes raw ADC values
+	adc.SetupADCCallback(ReportTime, pt100.adcCallback)
 
 	return pt100, nil
 }
@@ -176,17 +153,18 @@ func (s *PT100Sensor) GetTemp(eventtime float64) (current, target float64) {
 	return s.sensor.GetTemp(eventtime)
 }
 
-func (s *PT100Sensor) temperatureCallback(readTime, adcValue float64) {
-	// PT100 simplified calculation
-	// temp = (adc_ratio * ReferenceResistor - R0) / (R0 * 0.00385)
-	adcMax := 4095.0 // 12-bit ADC
-	adcRatio := adcValue / adcMax
+// adcCallback processes ADC readings and converts to temperature
+func (s *PT100Sensor) adcCallback(readTime, adcValue float64) {
+	// PT100 calculation using standard formula
+	// adcValue is normalized 0.0-1.0, representing resistance ratio
+	// R = adcValue * ReferenceResistor
+	resistance := adcValue * s.config.ReferenceResistor
 
-	resistance := adcRatio * s.config.ReferenceResistor
-	temp := (resistance - s.config.R0) / (s.config.R0 * 0.00385)
-
-	// Convert to Celsius from Kelvin
-	temp = temp - 273.15
+	// PT100 formula: R = R0 * (1 + alpha * T)
+	// Solving for T: T = (R / R0 - 1) / alpha
+	// where alpha = 0.00385 (European standard)
+	alpha := 0.00385
+	temp := (resistance/s.config.R0 - 1.0) / alpha
 
 	// Store last temperature
 	s.sensor.lastTemp = temp
@@ -240,8 +218,8 @@ func NewThermistorSensor(name string, pin string, adc ADCInterface, config *Ther
 		config: config,
 	}
 
-	// Setup callback
-	sensor.SetupCallback(thermistor.temperatureCallback)
+	// Setup ADC callback - this processes raw ADC values
+	adc.SetupADCCallback(ReportTime, thermistor.adcCallback)
 
 	return thermistor, nil
 }
@@ -267,34 +245,37 @@ func (s *ThermistorSensor) GetTemp(eventtime float64) (current, target float64) 
 	return s.sensor.GetTemp(eventtime)
 }
 
-func (s *ThermistorSensor) temperatureCallback(readTime, adcValue float64) {
-	// Simplified thermistor calculation using linear approximation
-	// This is not accurate but provides a reasonable value for testing
+// adcCallback processes ADC readings and converts to temperature using Beta equation
+func (s *ThermistorSensor) adcCallback(readTime, adcValue float64) {
+	// adcValue is normalized 0.0-1.0
+	// For thermistor with pullup: R = Pullup * adcValue / (1 - adcValue)
+	// Or with voltage divider: R = Pullup * (1 - adcValue) / adcValue (if thermistor is on bottom)
 
-	adcMax := 4095.0
-	adcRatio := adcValue / adcMax
-
-	// Very rough approximation for 100K Beta 3950 thermistor
-	// At high temperature: low resistance (low ADC)
-	// At low temperature: high resistance (high ADC)
-	// This is just for testing - real implementation needs proper thermistor math
-
-	var temp float64
-	if adcRatio > 0.9 {
-		temp = 20.0 // Room temperature
-	} else if adcRatio > 0.5 {
-		temp = 100.0 + (0.9-adcRatio)*200.0
-	} else {
-		temp = 200.0 + (0.5-adcRatio)*500.0
+	// Avoid division by zero
+	if adcValue <= 0.0 || adcValue >= 1.0 {
+		if adcValue <= 0.0 {
+			s.sensor.lastTemp = 300.0 // Very high temperature (open circuit)
+		} else {
+			s.sensor.lastTemp = 0.0 // Very low temperature (short circuit)
+		}
+		s.sensor.lastTempTime = readTime
+		return
 	}
 
-	// Clamp to reasonable range
-	if temp < 0 {
-		temp = 0
-	}
-	if temp > 300 {
-		temp = 300
-	}
+	// Calculate resistance (assuming thermistor on bottom of voltage divider)
+	resistance := s.config.PullupResistor * (1.0 - adcValue) / adcValue
+
+	// Beta equation: 1/T = 1/T0 + (1/Beta) * ln(R/R0)
+	// T0 is in Kelvin
+	t0Kelvin := s.config.T0 + 273.15
+	lnR := math.Log(resistance / s.config.R0)
+	invT := 1.0/t0Kelvin + lnR/s.config.Beta
+
+	// Temperature in Kelvin
+	tempKelvin := 1.0 / invT
+
+	// Convert to Celsius
+	temp := tempKelvin - 273.15
 
 	// Store last temperature
 	s.sensor.lastTemp = temp
@@ -338,8 +319,8 @@ func NewThermistorTableSensor(name string, pin string, adc ADCInterface, config 
 		table:  config.Table,
 	}
 
-	// Setup callback
-	sensor.SetupCallback(thermistor.temperatureCallback)
+	// Setup ADC callback - this processes raw ADC values
+	adc.SetupADCCallback(ReportTime, thermistor.adcCallback)
 
 	return thermistor, nil
 }
@@ -365,24 +346,24 @@ func (s *ThermistorTableSensor) GetTemp(eventtime float64) (current, target floa
 	return s.sensor.GetTemp(eventtime)
 }
 
-func (s *ThermistorTableSensor) temperatureCallback(readTime, adcValue float64) {
-	// Calculate resistance from ADC value
-	adcMax := 4095.0
-	adcRatio := adcValue / adcMax
+// adcCallback processes ADC readings and converts to temperature using table lookup
+func (s *ThermistorTableSensor) adcCallback(readTime, adcValue float64) {
+	// adcValue is normalized 0.0-1.0
+	// Calculate resistance: R = Pullup * (1 - adcValue) / adcValue
 
-	if adcRatio <= 0 {
+	if adcValue <= 0.0 {
 		s.sensor.lastTemp = 300.0 // Max temperature for open circuit
 		s.sensor.lastTempTime = readTime
 		return
 	}
 
-	if adcRatio >= 1.0 {
+	if adcValue >= 1.0 {
 		s.sensor.lastTemp = 0.0 // Min temperature for short circuit
 		s.sensor.lastTempTime = readTime
 		return
 	}
 
-	resistance := s.config.PullupResistor * ((1.0 - adcRatio) / adcRatio)
+	resistance := s.config.PullupResistor * ((1.0 - adcValue) / adcValue)
 
 	// Interpolate from table
 	temp := s.interpolate(resistance)

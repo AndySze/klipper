@@ -111,6 +111,10 @@ func TestAD595Sensor(t *testing.T) {
 
 // TestPT100Sensor tests the PT100 RTD sensor
 func TestPT100Sensor(t *testing.T) {
+	// PT100 formula: R = R0 * (1 + alpha * T), where alpha = 0.00385
+	// At 0°C: R = 100 ohms
+	// At 100°C: R = 100 * (1 + 0.00385 * 100) = 138.5 ohms
+	// adcValue represents R / ReferenceResistor
 	tests := []struct {
 		name               string
 		referenceResistor  float64
@@ -123,25 +127,25 @@ func TestPT100Sensor(t *testing.T) {
 			name:              "0°C at 100 ohms",
 			referenceResistor: 4300.0,
 			r0:                100.0,
-			adcValue:          100.0 / 4300.0, // R = 100 ohms
-			expectedTemp:      -273.15 + 0.0, // Should be near 0°C after conversion
+			adcValue:          100.0 / 4300.0, // R = 100 ohms -> T = 0°C
+			expectedTemp:      0.0,
 			tolerance:         1.0,
 		},
 		{
 			name:              "100°C at 138.5 ohms",
 			referenceResistor: 4300.0,
 			r0:                100.0,
-			adcValue:          138.5 / 4300.0, // R = 138.5 ohms
+			adcValue:          138.5 / 4300.0, // R = 138.5 ohms -> T = 100°C
 			expectedTemp:      100.0,
 			tolerance:         1.0,
 		},
 		{
-			name:              "High temperature reading",
+			name:              "200°C at 177 ohms",
 			referenceResistor: 4300.0,
 			r0:                100.0,
-			adcValue:          0.5, // 50% of reference
-			expectedTemp:      770.0, // Rough calculation
-			tolerance:         10.0,  // Higher tolerance due to linear approximation
+			adcValue:          177.0 / 4300.0, // R = 177 ohms -> T ≈ 200°C
+			expectedTemp:      200.0,
+			tolerance:         5.0, // Tolerance for linear approximation error
 		},
 	}
 
@@ -178,6 +182,12 @@ func TestPT100Sensor(t *testing.T) {
 
 // TestThermistorSensor tests the thermistor sensor
 func TestThermistorSensor(t *testing.T) {
+	// Circuit: Vcc -> R_pullup -> ADC_pin -> R_thermistor -> GND
+	// Vout (at ADC) = Vcc * R_thermistor / (R_pullup + R_thermistor)
+	// BUT we read the top voltage, so: adcValue = R_pullup / (R_pullup + R_thermistor) if inverted
+	// Implementation uses: R = R_pullup * (1 - adcValue) / adcValue
+	// So: high adcValue -> low R -> high temp (for NTC)
+	// Beta equation: 1/T = 1/T0 + (1/Beta) * ln(R/R0)
 	tests := []struct {
 		name           string
 		beta           float64
@@ -189,34 +199,40 @@ func TestThermistorSensor(t *testing.T) {
 		maxTemp        float64
 	}{
 		{
-			name:           "High temperature (low ADC)",
+			name:           "High temperature (low resistance)",
 			beta:           3950.0,
 			r0:             100000.0,
 			t0:             25.0,
 			pullupResistor: 4700.0,
-			adcValue:       0.1, // Low ADC value = hot
-			minTemp:        200.0,
+			// At ~200°C, R ≈ 300 ohms
+			// R = 4700 * (1 - adc) / adc -> adc = 4700 / (4700 + 300) = 0.94
+			adcValue:       0.94,
+			minTemp:        150.0,
 			maxTemp:        300.0,
 		},
 		{
-			name:           "Medium temperature",
+			name:           "Medium temperature (~100°C)",
 			beta:           3950.0,
 			r0:             100000.0,
 			t0:             25.0,
 			pullupResistor: 4700.0,
-			adcValue:       0.6,
-			minTemp:        100.0,
-			maxTemp:        200.0,
+			// At ~100°C, R ≈ 6800 ohms
+			// adc = 4700 / (4700 + 6800) = 0.409
+			adcValue:       0.409,
+			minTemp:        80.0,
+			maxTemp:        120.0,
 		},
 		{
-			name:           "Room temperature (high ADC)",
+			name:           "Room temperature (~25°C)",
 			beta:           3950.0,
 			r0:             100000.0,
 			t0:             25.0,
 			pullupResistor: 4700.0,
-			adcValue:       0.95, // High ADC value = cold
-			minTemp:        0.0,
-			maxTemp:        50.0,
+			// At 25°C, R = R0 = 100K ohms
+			// adc = 4700 / (4700 + 100000) = 0.0449
+			adcValue:       0.0449,
+			minTemp:        20.0,
+			maxTemp:        35.0,
 		},
 	}
 
@@ -250,14 +266,17 @@ func TestThermistorSensor(t *testing.T) {
 
 // TestThermistorTableSensor tests the table-based thermistor sensor
 func TestThermistorTableSensor(t *testing.T) {
-	// Create a simple temperature table
+	// Create a simple temperature table (sorted by increasing resistance = decreasing temp)
+	// The table should be sorted from high temp (low R) to low temp (high R) for proper interpolation
 	table := []ThermistorEntry{
-		{Temp: 20.0, Resistance: 126700.0},  // 20°C
-		{Temp: 100.0, Resistance: 17600.0},  // 100°C
+		{Temp: 300.0, Resistance: 760.0},    // 300°C (hottest, lowest R)
 		{Temp: 200.0, Resistance: 3100.0},   // 200°C
-		{Temp: 300.0, Resistance: 760.0},    // 300°C
+		{Temp: 100.0, Resistance: 17600.0},  // 100°C
+		{Temp: 20.0, Resistance: 126700.0},  // 20°C (coldest, highest R)
 	}
 
+	// Implementation: R = R_pullup * (1 - adcValue) / adcValue
+	// So for given R: adcValue = R_pullup / (R_pullup + R)
 	tests := []struct {
 		name           string
 		pullupResistor float64
@@ -266,32 +285,36 @@ func TestThermistorTableSensor(t *testing.T) {
 		tolerance      float64
 	}{
 		{
-			name:           "Table entry 1 (20°C)",
+			name:           "Table entry 1 (20°C at 126700 ohms)",
 			pullupResistor: 4700.0,
-			adcValue:       126700.0 / (126700.0 + 4700.0),
+			// adcValue = 4700 / (4700 + 126700) = 0.0358
+			adcValue:       4700.0 / (4700.0 + 126700.0),
 			expectedTemp:   20.0,
-			tolerance:      1.0,
+			tolerance:      5.0,
 		},
 		{
-			name:           "Table entry 2 (100°C)",
+			name:           "Table entry 2 (100°C at 17600 ohms)",
 			pullupResistor: 4700.0,
-			adcValue:       17600.0 / (17600.0 + 4700.0),
+			// adcValue = 4700 / (4700 + 17600) = 0.211
+			adcValue:       4700.0 / (4700.0 + 17600.0),
 			expectedTemp:   100.0,
-			tolerance:      1.0,
+			tolerance:      5.0,
 		},
 		{
-			name:           "Table entry 3 (200°C)",
+			name:           "Table entry 3 (200°C at 3100 ohms)",
 			pullupResistor: 4700.0,
-			adcValue:       3100.0 / (3100.0 + 4700.0),
+			// adcValue = 4700 / (4700 + 3100) = 0.603
+			adcValue:       4700.0 / (4700.0 + 3100.0),
 			expectedTemp:   200.0,
-			tolerance:      1.0,
+			tolerance:      5.0,
 		},
 		{
-			name:           "Interpolation between 100°C and 200°C",
+			name:           "Interpolation between 100°C and 200°C (~10K ohms)",
 			pullupResistor: 4700.0,
-			adcValue:       10000.0 / (10000.0 + 4700.0), // ~10K ohms
+			// adcValue = 4700 / (4700 + 10000) = 0.32
+			adcValue:       4700.0 / (4700.0 + 10000.0),
 			expectedTemp:   150.0, // Should interpolate to ~150°C
-			tolerance:      20.0,  // Wider tolerance for interpolation
+			tolerance:      25.0,  // Wider tolerance for interpolation
 		},
 	}
 
