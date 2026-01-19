@@ -934,7 +934,8 @@ func (mc *MCUConnection) handleShutdown(msg *mcupkg.Message) {
 
 // handleClockResponse handles clock synchronization response.
 func (mc *MCUConnection) handleClockResponse(msg *mcupkg.Message) {
-	receiveTime := time.Since(time.Now()).Seconds() // Should use reactor time
+	// Use message receive time (Unix seconds with nanosecond precision)
+	receiveTime := float64(msg.ReceiveTime.UnixNano()) / 1e9
 	if mc.reactor != nil {
 		receiveTime = mc.reactor.Monotonic()
 	}
@@ -960,8 +961,12 @@ func (mc *MCUConnection) handleClockResponse(msg *mcupkg.Message) {
 
 	// Update clock offset if we have enough samples
 	if len(mc.clockSamples) >= 3 {
+		wasNotSynced := !mc.clockSynced
 		mc.updateClockOffset()
 		mc.clockSynced = true
+		if wasNotSynced {
+			mc.tracef("MCU %s: Clock synced\n", mc.name)
+		}
 	}
 }
 
