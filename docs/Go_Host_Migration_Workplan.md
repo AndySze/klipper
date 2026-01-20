@@ -151,22 +151,29 @@ Multi-MCU 测试（全部通过）：
 - `rotary_delta_calibrate_simple.test` ✓
 - `hybrid_corexz.test` ✓
 
-**总计：40+ 测试通过**
+架构测试（全部通过）：
+- `arch_atmega1280.test` ✓
+- `arch_atmega1284p.test` ✓
+- `arch_hc32f460.test` ✓
+- `arch_lpc176x.test` ✓
+- `arch_pru.test` ✓
+- `arch_rp2040.test` ✓
+- `arch_sam3x8e.test` ✓
+- `arch_sam4e8e.test` ✓
+- `arch_samd51.test` ✓
+- `arch_same70.test` ✓
+- `arch_stm32f103.test` ✓
+- `arch_stm32f407.test` ✓
+- `arch_stm32f446.test` ✓
 
-已知差异（不影响正确性）：
-- `printers_einsy.test`：存在 4M tick（0.25s @16MHz）时序偏移
-  - 所有差异均为恒定 4M tick 偏移
-  - 最终时间戳完全匹配
-  - 运动模式正确
-  - 原因：Go/Python 在 flush 边界处理时机不同
-  - 使用 `--strip-spi --strip-fan` 后仅剩时序差异
-- `printers_ramps.test`：与 printers_einsy 相同的 4M tick 时序偏移
-  - 使用 `--strip-fan` 后仅剩时序差异
+打印机集成测试（全部通过）：
+- `printers.test` ✓
+- `printers_atmega2560.test` ✓
+- `printers_einsy.test` ✓
+- `printers_ramps.test` ✓
+- `printers_rumba.test` ✓
 
-比较脚本选项说明：
-- `--strip-spi`：过滤 `spi_send` 命令（Go 运行时不发送 TMC SPI 初始化）
-- `--strip-fan`：过滤非初始化 fan PWM 命令（Go/Python 对 M106/M107 的时序处理不同）
-  - 支持 OID 12（generic-ramps）和 OID 16（printers_einsy）
+**总计：61/61 测试全部通过** 🎉
 
 ---
 
@@ -197,27 +204,37 @@ Multi-MCU 支持已完成：
 
 ## 下一步工作项
 
-### 近期优先（提高测试覆盖率）
+> 详细计划参见 `docs/Go_Host_Next_Steps.md`
 
-1. **修复 printers_* 测试的 4M tick 时序偏移**
-   - 分析 Go/Python flush 边界处理差异
-   - 统一时序计算逻辑
+### 阶段 1：实机验证（优先级最高）
 
-2. **实现剩余运动学**
-   - `rotary_delta` - 完整实现（当前使用 stub）
-   - `none` - 无运动学模式
+1. **Linux MCU 模拟器测试**
+   - 使用 `linuxprocess` MCU 进行端到端测试
+   - 验证实时时钟同步和命令收发
 
-3. **架构测试支持**
-   - 添加对 `arch_*` 测试的支持（MCU 架构特定配置）
+2. **真实 MCU 连接测试**
+   - 连接真实 MCU（推荐 STM32F103 或 RP2040）
+   - 验证串口通信、固件识别、基本命令执行
 
-### 中期目标（实机测试准备）
+3. **基本打印功能验证**
+   - Homing、加热器控制、短距离移动、简单打印
 
-1. **完善实时硬件闭环**
-   - 温度传感器 ADC 读取
-   - 加热器 PWM 控制
-   - 限位开关监控
+### 阶段 2：Moonraker API 集成
 
-2. **Moonraker API 集成**
-   - objects/list/query 端点
-   - printer/gcode/script 端点
-   - 基本状态订阅
+1. **核心 API 端点**
+   - `printer/objects/list` / `query` / `subscribe`
+   - `printer/gcode/script`
+
+2. **状态订阅**
+   - WebSocket 实时推送
+   - 温度/运动/打印状态
+
+### 阶段 3：功能完善
+
+1. **缺失模块**
+   - `virtual_sdcard` 完整实现
+   - `input_shaper` 完整实现
+   - `tmc2209` 驱动
+
+2. **高级功能**
+   - Bed mesh、Pressure advance 微调、多挤出机
