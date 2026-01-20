@@ -80,7 +80,13 @@
   - 错误 G-code 模板
   - analyze_shutdown 日志
   - 并发安全锁
-- [ ] `input_shaper` - 完整实现
+- [x] `input_shaper` - 完整实现 ✅ (2026-01-20)
+  - chelper C 函数集成 (input_shaper_alloc, input_shaper_set_sk, input_shaper_set_shaper_params)
+  - 所有 shaper 算法支持 (ZV, MZV, ZVD, EI, 2HumpEI, 3HumpEI)
+  - Stepper kinematics 包装器
+  - 动态参数更新 (SET_INPUT_SHAPER)
+  - 双挤出机 (IDEX) 支持检测
+  - 步进生成扫描窗口管理
 - [ ] `gcode_move` - GCode 移动核心
 - [ ] `tmc2209` - TMC2209 驱动
 

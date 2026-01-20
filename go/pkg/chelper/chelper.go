@@ -53,6 +53,12 @@ struct stepper_kinematics *winch_stepper_alloc(double anchor_x, double anchor_y,
 struct stepper_kinematics *dual_carriage_alloc(void);
 void dual_carriage_set_sk(struct stepper_kinematics *sk, struct stepper_kinematics *orig_sk);
 int dual_carriage_set_transform(struct stepper_kinematics *sk, char axis, double scale, double offs);
+
+// kin_shaper.c - input shaper kinematics wrapper
+struct stepper_kinematics *input_shaper_alloc(void);
+int input_shaper_set_sk(struct stepper_kinematics *sk, struct stepper_kinematics *orig_sk);
+void input_shaper_update_sk(struct stepper_kinematics *sk);
+int input_shaper_set_shaper_params(struct stepper_kinematics *sk, char axis, int n, double a[], double t[]);
 */
 import "C"
 
@@ -759,6 +765,79 @@ func (sk *StepperKinematics) DualCarriageSetTransform(axis byte, scale, offset f
 	ret := C.dual_carriage_set_transform(sk.ptr, C.char(axis), C.double(scale), C.double(offset))
 	if ret != 0 {
 		return fmt.Errorf("dual_carriage_set_transform failed for axis %c", axis)
+	}
+	return nil
+}
+
+// NewInputShaperStepperKinematics creates an input shaper wrapper for a stepper.
+// The input shaper wraps around an existing stepper kinematics and applies
+// shaping to the position calculations.
+func NewInputShaperStepperKinematics() (*StepperKinematics, error) {
+	sk := C.input_shaper_alloc()
+	if sk == nil {
+		return nil, fmt.Errorf("input_shaper_alloc failed")
+	}
+	return &StepperKinematics{ptr: sk, isExtruder: false}, nil
+}
+
+// InputShaperSetSK sets the original stepper kinematics for the input shaper
+// wrapper to delegate to.
+// Returns error if the original kinematics has no active axes (X, Y, or Z).
+func (sk *StepperKinematics) InputShaperSetSK(origSK *StepperKinematics) error {
+	if sk == nil || sk.ptr == nil {
+		return fmt.Errorf("input shaper kinematics is nil")
+	}
+	if origSK == nil || origSK.ptr == nil {
+		return fmt.Errorf("original stepper kinematics is nil")
+	}
+	ret := C.input_shaper_set_sk(sk.ptr, origSK.ptr)
+	if ret < 0 {
+		return fmt.Errorf("input_shaper_set_sk failed: stepper has no active X/Y/Z axes")
+	}
+	return nil
+}
+
+// InputShaperUpdateSK updates the input shaper's calculation callback based
+// on the current active axis flags of the original kinematics.
+// Call this after the original kinematics' active flags may have changed.
+func (sk *StepperKinematics) InputShaperUpdateSK() {
+	if sk == nil || sk.ptr == nil {
+		return
+	}
+	C.input_shaper_update_sk(sk.ptr)
+}
+
+// InputShaperSetParams sets the shaper parameters for a specific axis.
+// Parameters:
+//   - axis: 'x', 'y', or 'z'
+//   - n: number of shaper pulses (length of A and T arrays)
+//   - A: amplitude coefficients
+//   - T: time offsets
+//
+// Returns error if the axis is invalid or the number of pulses is invalid.
+func (sk *StepperKinematics) InputShaperSetParams(axis byte, n int, A, T []float64) error {
+	if sk == nil || sk.ptr == nil {
+		return fmt.Errorf("input shaper kinematics is nil")
+	}
+	if n < 0 || n > 5 {
+		return fmt.Errorf("invalid number of shaper pulses: %d (max 5)", n)
+	}
+	if axis != 'x' && axis != 'y' && axis != 'z' {
+		return fmt.Errorf("invalid axis: %c (must be x, y, or z)", axis)
+	}
+	if n > 0 && (len(A) < n || len(T) < n) {
+		return fmt.Errorf("A and T arrays must have at least %d elements", n)
+	}
+
+	var aPtr, tPtr *C.double
+	if n > 0 {
+		aPtr = (*C.double)(unsafe.Pointer(&A[0]))
+		tPtr = (*C.double)(unsafe.Pointer(&T[0]))
+	}
+
+	ret := C.input_shaper_set_shaper_params(sk.ptr, C.char(axis), C.int(n), aPtr, tPtr)
+	if ret != 0 {
+		return fmt.Errorf("input_shaper_set_shaper_params failed for axis %c", axis)
 	}
 	return nil
 }
