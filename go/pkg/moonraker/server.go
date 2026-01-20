@@ -34,6 +34,10 @@ type Server struct {
 	subscriptions map[int64]map[string][]string // clientID -> object -> attributes
 	subMu         sync.RWMutex
 
+	// File and history managers
+	fileManager    *FileManager
+	historyManager *HistoryManager
+
 	// Server state
 	running   atomic.Bool
 	startTime time.Time
@@ -71,11 +75,13 @@ type Config struct {
 // New creates a new Moonraker-compatible server.
 func New(cfg Config) *Server {
 	s := &Server{
-		printer:       cfg.Printer,
-		addr:          cfg.Addr,
-		wsClients:     make(map[int64]*WSClient),
-		subscriptions: make(map[int64]map[string][]string),
-		startTime:     time.Now(),
+		printer:        cfg.Printer,
+		addr:           cfg.Addr,
+		wsClients:      make(map[int64]*WSClient),
+		subscriptions:  make(map[int64]map[string][]string),
+		fileManager:    NewFileManager(),
+		historyManager: NewHistoryManager(),
+		startTime:      time.Now(),
 	}
 
 	s.wsUpgrader = websocket.Upgrader{
@@ -85,6 +91,16 @@ func New(cfg Config) *Server {
 	}
 
 	return s
+}
+
+// FileManager returns the file manager.
+func (s *Server) FileManager() *FileManager {
+	return s.fileManager
+}
+
+// HistoryManager returns the history manager.
+func (s *Server) HistoryManager() *HistoryManager {
+	return s.historyManager
 }
 
 // Start starts the API server.
@@ -104,6 +120,12 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/printer/objects/query", s.handleObjectsQuery)
 	mux.HandleFunc("/printer/gcode/script", s.handleGCodeScript)
 	mux.HandleFunc("/printer/emergency_stop", s.handleEmergencyStop)
+
+	// File management endpoints
+	s.fileManager.RegisterFileEndpoints(mux)
+
+	// History endpoints
+	s.historyManager.RegisterHistoryEndpoints(mux)
 
 	s.httpServer = &http.Server{
 		Addr:    s.addr,
