@@ -42,33 +42,44 @@
 
 ---
 
-### 阶段 2：Moonraker API 集成
+### 阶段 2：Moonraker API 集成 ✅ (2026-01-20 完成)
 
 #### 2.1 核心 API 端点
-- [ ] `server/info` - 服务器信息
-- [ ] `printer/objects/list` - 对象列表
-- [ ] `printer/objects/query` - 对象查询
-- [ ] `printer/objects/subscribe` - 对象订阅
-- [ ] `printer/gcode/script` - GCode 执行
+- [x] `server/info` - 服务器信息
+- [x] `printer/objects/list` - 对象列表
+- [x] `printer/objects/query` - 对象查询
+- [x] `printer/objects/subscribe` - 对象订阅
+- [x] `printer/gcode/script` - GCode 执行
 
 #### 2.2 状态订阅
-- [ ] WebSocket 实时推送
-- [ ] 温度状态
-- [ ] 运动状态
-- [ ] 打印进度
+- [x] WebSocket 实时推送 (4Hz)
+- [x] 温度状态 (extruder, heater_bed)
+- [x] 运动状态 (toolhead, motion_report)
+- [x] 打印进度 (print_stats, virtual_sdcard)
 
 #### 2.3 文件管理
-- [ ] 上传 GCode 文件
-- [ ] 列出文件
-- [ ] 删除文件
-- [ ] 开始打印
+- [x] 上传 GCode 文件
+- [x] 列出文件
+- [x] 删除文件
+- [x] 移动/复制文件
+- [x] GCode 元数据提取
+
+#### 2.4 打印历史
+- [x] 作业跟踪 (start, update, finish)
+- [x] 历史记录查询
+- [x] 统计信息 (total_jobs, print_time, filament_used)
 
 ---
 
 ### 阶段 3：功能完善
 
 #### 3.1 缺失的 extras 模块
-- [ ] `virtual_sdcard` - 完整实现（当前为 stub）
+- [x] `virtual_sdcard` - 完整实现 ✅ (2026-01-20)
+  - 工作定时器/goroutine 模式
+  - 暂停/恢复/取消支持
+  - 错误 G-code 模板
+  - analyze_shutdown 日志
+  - 并发安全锁
 - [ ] `input_shaper` - 完整实现
 - [ ] `gcode_move` - GCode 移动核心
 - [ ] `tmc2209` - TMC2209 驱动
@@ -107,17 +118,21 @@
 
 ## 建议的立即行动
 
-1. **设置 Linux MCU 模拟器测试环境**
+1. **设置 Linux MCU 模拟器测试环境** (阶段 1.1)
    ```bash
    # 构建 Linux MCU 模拟器
    make flash FLASH_DEVICE=/tmp/klipper_host_mcu
    ```
 
-2. **实现最小 Moonraker API**
-   - 从 `printer/objects/list` 开始
-   - 这将允许使用 Fluidd/Mainsail 进行测试
+2. **~~实现最小 Moonraker API~~ ✅ 已完成**
+   - Moonraker API 服务器已实现 (`go/pkg/moonraker/`)
+   - 支持 Fluidd/Mainsail 连接
 
-3. **准备真实打印机测试**
+3. **准备 Fluidd/Mainsail 集成测试**
+   - 配置 Moonraker 端点指向 Go 服务器
+   - 验证前端功能正常
+
+4. **准备真实打印机测试**
    - 选择一台测试打印机
    - 备份原有配置
    - 准备回滚方案

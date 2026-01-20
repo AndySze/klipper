@@ -9,16 +9,27 @@ package hosth4
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 var validGCodeExts = []string{"gcode", "g", "gco"}
+
+// Default error gcode template - executed on print errors
+const defaultErrorGCode = `
+; Error occurred - turning off heaters
+M104 S0 ; extruder off
+M140 S0 ; bed off
+`
 
 // VirtualSDCard handles virtual SD card file execution with loop support.
 type VirtualSDCard struct {
@@ -34,10 +45,21 @@ type VirtualSDCard struct {
 	fileSize         int64
 	nextFilePosition int64
 
-	// Print state
+	// Print state - protected by mu
+	mu            sync.Mutex
 	mustPauseWork bool
 	cmdFromSD     bool
 	workActive    bool
+
+	// Work timer context
+	workCtx    context.Context
+	workCancel context.CancelFunc
+
+	// Error handling
+	onErrorGCode string
+
+	// Stats callback
+	statsActive bool
 }
 
 // loopFrame tracks a single loop context
@@ -49,14 +71,22 @@ type loopFrame struct {
 // newVirtualSDCard creates a virtual SD card with the given base path.
 func newVirtualSDCard(rt *runtime, basePath string, macros *macroEngine) *VirtualSDCard {
 	return &VirtualSDCard{
-		rt:       rt,
-		basePath: basePath,
-		macros:   macros,
+		rt:           rt,
+		basePath:     basePath,
+		macros:       macros,
+		onErrorGCode: defaultErrorGCode,
 	}
+}
+
+// SetOnErrorGCode sets the G-code to run when a print error occurs.
+func (sd *VirtualSDCard) SetOnErrorGCode(gcode string) {
+	sd.onErrorGCode = gcode
 }
 
 // IsActive returns true if currently printing from SD card.
 func (sd *VirtualSDCard) IsActive() bool {
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
 	return sd.workActive
 }
 
@@ -88,7 +118,65 @@ func (sd *VirtualSDCard) SetFilePosition(pos int64) {
 
 // IsCmdFromSD returns true if currently executing a command from SD.
 func (sd *VirtualSDCard) IsCmdFromSD() bool {
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
 	return sd.cmdFromSD
+}
+
+// Stats returns stats information (active, description).
+// Compatible with Python's virtual_sdcard.stats() method.
+func (sd *VirtualSDCard) Stats() (bool, string) {
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+	if !sd.workActive {
+		return false, ""
+	}
+	return true, fmt.Sprintf("sd_pos=%d", sd.filePosition)
+}
+
+// HandleAnalyzeShutdown logs context around the current file position on shutdown.
+// Compatible with Python's virtual_sdcard._handle_analyze_shutdown().
+func (sd *VirtualSDCard) HandleAnalyzeShutdown(msg string, details map[string]any) {
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+
+	if !sd.workActive || sd.file == nil {
+		return
+	}
+
+	sd.mustPauseWork = true
+
+	// Read context around current position
+	readPos := sd.filePosition - 1024
+	if readPos < 0 {
+		readPos = 0
+	}
+	readCount := sd.filePosition - readPos
+
+	data := make([]byte, readCount+128)
+	_, err := sd.file.Seek(readPos, io.SeekStart)
+	if err != nil {
+		log.Printf("virtual_sdcard shutdown read seek error: %v", err)
+		return
+	}
+
+	n, err := sd.file.Read(data)
+	if err != nil && err != io.EOF {
+		log.Printf("virtual_sdcard shutdown read error: %v", err)
+		return
+	}
+	data = data[:n]
+
+	// Log the context
+	past := data
+	upcoming := []byte{}
+	if int64(n) > readCount {
+		past = data[:readCount]
+		upcoming = data[readCount:]
+	}
+
+	log.Printf("Virtual sdcard (%d): %q", readPos, past)
+	log.Printf("Upcoming (%d): %q", sd.filePosition, upcoming)
 }
 
 // GetStatus returns the current status for API queries.
@@ -103,26 +191,68 @@ func (sd *VirtualSDCard) GetStatus() map[string]any {
 }
 
 // DoPause pauses the SD card print.
+// This is blocking - it waits until the work timer actually pauses.
 func (sd *VirtualSDCard) DoPause() {
-	if sd.workActive {
-		sd.mustPauseWork = true
+	sd.mu.Lock()
+	if !sd.workActive {
+		sd.mu.Unlock()
+		return
+	}
+	sd.mustPauseWork = true
+	sd.mu.Unlock()
+
+	// Wait for work handler to acknowledge pause
+	// The work handler checks mustPauseWork and will stop
+	for {
+		sd.mu.Lock()
+		active := sd.workActive
+		fromSD := sd.cmdFromSD
+		sd.mu.Unlock()
+
+		if !active || !fromSD {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
 // DoResume resumes the SD card print.
 func (sd *VirtualSDCard) DoResume() error {
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+
 	if sd.workActive {
 		return fmt.Errorf("SD busy")
 	}
 	sd.mustPauseWork = false
 	sd.workActive = true
+	sd.statsActive = true
+
+	// Start the work handler in a goroutine
+	sd.workCtx, sd.workCancel = context.WithCancel(context.Background())
+	go sd.workHandler()
+
 	return nil
 }
 
 // DoCancel cancels the current SD card print.
 func (sd *VirtualSDCard) DoCancel() {
+	sd.mu.Lock()
 	if sd.file != nil {
-		sd.DoPause()
+		sd.mustPauseWork = true
+		if sd.workCancel != nil {
+			sd.workCancel()
+		}
+	}
+	sd.mu.Unlock()
+
+	// Wait for work handler to stop
+	sd.DoPause()
+
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+
+	if sd.file != nil {
 		sd.file.Close()
 		sd.file = nil
 		sd.reader = nil
@@ -131,6 +261,7 @@ func (sd *VirtualSDCard) DoCancel() {
 	sd.fileSize = 0
 	sd.workActive = false
 	sd.mustPauseWork = false
+	sd.statsActive = false
 }
 
 // LoopDesist clears all loop state. Safe to call outside of SD card context.
@@ -184,6 +315,21 @@ func (sd *VirtualSDCard) GetFileList(checkSubdirs bool) ([]FileEntry, error) {
 		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
+		// Filter by valid gcode extensions
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if len(ext) > 0 {
+			ext = ext[1:] // remove leading dot
+		}
+		isValid := false
+		for _, validExt := range validGCodeExts {
+			if ext == validExt {
+				isValid = true
+				break
+			}
+		}
+		if !isValid {
+			continue
+		}
 		info, err := entry.Info()
 		if err != nil {
 			continue
@@ -218,6 +364,7 @@ func (sd *VirtualSDCard) resetFile() {
 	sd.loopStack = nil
 	sd.workActive = false
 	sd.mustPauseWork = false
+	sd.statsActive = false
 }
 
 // loadFile loads a file for printing.
@@ -259,7 +406,7 @@ func (sd *VirtualSDCard) loadFile(filename string, checkSubdirs bool) error {
 	sd.nextFilePosition = 0
 
 	// Update print stats
-	if sd.rt.printStats != nil {
+	if sd.rt != nil && sd.rt.printStats != nil {
 		sd.rt.printStats.setCurrentFile(filename)
 	}
 
@@ -267,6 +414,7 @@ func (sd *VirtualSDCard) loadFile(filename string, checkSubdirs bool) error {
 }
 
 // PrintFile loads and executes a gcode file from the virtual SD card.
+// This is a synchronous version that blocks until print is complete or paused.
 func (sd *VirtualSDCard) PrintFile(filename string) error {
 	sd.resetFile()
 
@@ -274,38 +422,121 @@ func (sd *VirtualSDCard) PrintFile(filename string) error {
 		return err
 	}
 
+	sd.mu.Lock()
 	sd.workActive = true
 	sd.mustPauseWork = false
+	sd.statsActive = true
+	sd.workCtx, sd.workCancel = context.WithCancel(context.Background())
+	sd.mu.Unlock()
 
 	// Start print stats
-	if sd.rt.printStats != nil {
+	if sd.rt != nil && sd.rt.printStats != nil {
 		sd.rt.printStats.noteStart()
 	}
 
-	defer func() {
-		if sd.file != nil {
-			sd.file.Close()
-			sd.file = nil
-			sd.reader = nil
-		}
-		sd.loopStack = nil
-		sd.workActive = false
-
-		// Complete print stats
-		if sd.rt.printStats != nil {
-			if sd.mustPauseWork {
-				sd.rt.printStats.notePause()
-			} else {
-				sd.rt.printStats.noteComplete()
-			}
-		}
-	}()
-
-	return sd.runFile()
+	// Run synchronously (for tests and simple use)
+	return sd.runFileSync()
 }
 
-// runFile executes gcode from the current file position.
-func (sd *VirtualSDCard) runFile() error {
+// PrintFileAsync loads a file and starts printing in a background goroutine.
+// Returns immediately after starting. Use IsActive() to check status.
+func (sd *VirtualSDCard) PrintFileAsync(filename string) error {
+	sd.resetFile()
+
+	if err := sd.loadFile(filename, true); err != nil {
+		return err
+	}
+
+	return sd.DoResume()
+}
+
+// workHandler is the background work handler that runs print execution.
+// Called as a goroutine from DoResume.
+func (sd *VirtualSDCard) workHandler() {
+	log.Printf("Starting SD card print (position %d)", sd.filePosition)
+
+	err := sd.runFileCore()
+
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+
+	log.Printf("Exiting SD card print (position %d)", sd.filePosition)
+	sd.workActive = false
+	sd.cmdFromSD = false
+	sd.statsActive = false
+
+	if sd.workCancel != nil {
+		sd.workCancel()
+		sd.workCancel = nil
+	}
+
+	// Update print stats based on outcome
+	if err != nil {
+		if sd.rt != nil && sd.rt.printStats != nil {
+			sd.rt.printStats.noteError(err.Error())
+		}
+	} else if sd.file != nil {
+		// Still has file but stopped - must be paused
+		if sd.rt != nil && sd.rt.printStats != nil {
+			sd.rt.printStats.notePause()
+		}
+	} else {
+		// File closed - complete
+		if sd.rt != nil && sd.rt.printStats != nil {
+			sd.rt.printStats.noteComplete()
+		}
+	}
+}
+
+// runFileSync executes gcode synchronously (blocking).
+// Used by PrintFile for direct synchronous execution.
+func (sd *VirtualSDCard) runFileSync() error {
+	log.Printf("Starting SD card print (position %d)", sd.filePosition)
+
+	err := sd.runFileCore()
+
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+
+	log.Printf("Exiting SD card print (position %d)", sd.filePosition)
+
+	// Cleanup
+	if sd.file != nil {
+		sd.file.Close()
+		sd.file = nil
+		sd.reader = nil
+	}
+	sd.loopStack = nil
+	sd.workActive = false
+	sd.cmdFromSD = false
+	sd.statsActive = false
+
+	if sd.workCancel != nil {
+		sd.workCancel()
+		sd.workCancel = nil
+	}
+
+	// Update print stats based on outcome
+	if err != nil {
+		if sd.rt != nil && sd.rt.printStats != nil {
+			sd.rt.printStats.noteError(err.Error())
+		}
+		return err
+	} else if sd.mustPauseWork {
+		if sd.rt != nil && sd.rt.printStats != nil {
+			sd.rt.printStats.notePause()
+		}
+	} else {
+		if sd.rt != nil && sd.rt.printStats != nil {
+			sd.rt.printStats.noteComplete()
+		}
+	}
+	return nil
+}
+
+// runFileCore executes gcode from the current file position.
+// Shared between sync and async execution.
+func (sd *VirtualSDCard) runFileCore() error {
 	// Seek to file position
 	if _, err := sd.file.Seek(sd.filePosition, io.SeekStart); err != nil {
 		return fmt.Errorf("virtual_sdcard seek: %w", err)
@@ -313,8 +544,28 @@ func (sd *VirtualSDCard) runFile() error {
 	sd.reader.Reset(sd.file)
 
 	var partialInput string
+	var errorMessage string
 
-	for !sd.mustPauseWork {
+	for {
+		// Check for pause/cancel
+		sd.mu.Lock()
+		shouldPause := sd.mustPauseWork
+		ctx := sd.workCtx
+		sd.mu.Unlock()
+
+		if shouldPause {
+			break
+		}
+
+		// Check context cancellation
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+		}
+
 		// Read line from file
 		line, err := sd.reader.ReadString('\n')
 		if err != nil {
@@ -323,10 +574,7 @@ func (sd *VirtualSDCard) runFile() error {
 				if partialInput != "" || line != "" {
 					finalLine := partialInput + line
 					if finalLine != "" {
-						if err := sd.processLine(finalLine); err != nil {
-							if sd.rt.printStats != nil {
-								sd.rt.printStats.noteError(err.Error())
-							}
+						if err := sd.processLineWithErrorHandling(finalLine, &errorMessage); err != nil {
 							return err
 						}
 					}
@@ -342,18 +590,24 @@ func (sd *VirtualSDCard) runFile() error {
 		sd.nextFilePosition = nextPos
 
 		// Execute the line
+		sd.mu.Lock()
 		sd.cmdFromSD = true
+		sd.mu.Unlock()
+
 		fullLine := partialInput + strings.TrimRight(line, "\r\n")
 		partialInput = ""
 
-		if err := sd.processLine(fullLine); err != nil {
+		if err := sd.processLineWithErrorHandling(fullLine, &errorMessage); err != nil {
+			sd.mu.Lock()
 			sd.cmdFromSD = false
-			if sd.rt.printStats != nil {
-				sd.rt.printStats.noteError(err.Error())
-			}
+			sd.mu.Unlock()
 			return err
 		}
+
+		sd.mu.Lock()
 		sd.cmdFromSD = false
+		sd.mu.Unlock()
+
 		sd.filePosition = sd.nextFilePosition
 
 		// Check if we need to seek (file position changed externally)
@@ -364,7 +618,43 @@ func (sd *VirtualSDCard) runFile() error {
 			sd.reader.Reset(sd.file)
 		}
 	}
+
+	if errorMessage != "" {
+		return fmt.Errorf("%s", errorMessage)
+	}
 	return nil
+}
+
+// processLineWithErrorHandling processes a line and runs error gcode on failure.
+func (sd *VirtualSDCard) processLineWithErrorHandling(line string, errorMessage *string) error {
+	err := sd.processLine(line)
+	if err != nil {
+		*errorMessage = err.Error()
+		// Run error gcode
+		sd.runErrorGCode()
+		return err
+	}
+	return nil
+}
+
+// runErrorGCode executes the on_error_gcode template.
+func (sd *VirtualSDCard) runErrorGCode() {
+	if sd.onErrorGCode == "" {
+		return
+	}
+
+	log.Printf("virtual_sdcard: running error gcode")
+	lines := strings.Split(sd.onErrorGCode, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, ";") {
+			continue
+		}
+		// Execute error gcode - ignore errors
+		if err := sd.processLine(line); err != nil {
+			log.Printf("virtual_sdcard on_error: %v", err)
+		}
+	}
 }
 
 // processLine processes a single gcode line.
