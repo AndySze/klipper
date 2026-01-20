@@ -138,7 +138,20 @@
 - `delta_calibrate.test` ✓
 - `rotary_delta_calibrate.test` ✓
 
-**总计：33+ 测试通过**
+Multi-MCU 测试（全部通过）：
+- `multi_mcu_simple.test` ✓
+- `multi_mcu_extruder.test` ✓
+- `multi_mcu_dual_z.test` ✓
+
+附加测试：
+- `load_cell.test` ✓
+- `test_sensors.test` ✓
+- `sdcard_loop.test` ✓
+- `generic_cartesian.test` ✓
+- `rotary_delta_calibrate_simple.test` ✓
+- `hybrid_corexz.test` ✓
+
+**总计：40+ 测试通过**
 
 已知差异（不影响正确性）：
 - `printers_einsy.test`：存在 4M tick（0.25s @16MHz）时序偏移
@@ -147,10 +160,13 @@
   - 运动模式正确
   - 原因：Go/Python 在 flush 边界处理时机不同
   - 使用 `--strip-spi --strip-fan` 后仅剩时序差异
+- `printers_ramps.test`：与 printers_einsy 相同的 4M tick 时序偏移
+  - 使用 `--strip-fan` 后仅剩时序差异
 
 比较脚本选项说明：
 - `--strip-spi`：过滤 `spi_send` 命令（Go 运行时不发送 TMC SPI 初始化）
 - `--strip-fan`：过滤非初始化 fan PWM 命令（Go/Python 对 M106/M107 的时序处理不同）
+  - 支持 OID 12（generic-ramps）和 OID 16（printers_einsy）
 
 ---
 
@@ -158,13 +174,50 @@
 
 **目标**：从离线对齐过渡到可连接真实 MCU（单 MCU → 多 MCU），并满足基本可靠性约束（不 underrun / 可恢复）。
 
+**当前状态（2026-01 更新）**
+
+H4 基础设施已就位：
+- `go/pkg/clocksync/` - MCU 时钟同步（ClockSync 和 SecondarySync）
+- `go/pkg/reactor/` - 事件驱动异步执行框架
+- `go/pkg/hosth4/mcu_connection.go` - MCU 串口连接管理
+- `go/pkg/hosth4/mcu_manager.go` - 多 MCU 管理
+- `go/pkg/hosth4/realtime_integration.go` - 实时硬件集成层
+
+Multi-MCU 支持已完成：
+- 支持主 MCU（`[mcu]`）和辅 MCU（`[mcu name]`）配置解析
+- 支持 `mcu_name:pin` 格式的引脚解析和路由
+- 每个 MCU 独立的 OID 分配和命令队列
+- 通过所有 3 个 multi-mcu 测试
+
 **验收门禁**
 - 实机最小回归（homing/加热/短打印/取消/重连）
 - 与 Moonraker 的基础 API 互通（至少 `objects/list/query`）
 
 ---
 
-## 下一步（建议立刻开工的具体事项）
+## 下一步工作项
 
-1) 先落地 H1 的骨架：`go/cmd/klipper-go-host` + cfg 解析（含 include）+ pin spec 解析
-2) 用 `commands.test` 作为首个门禁：只要 Go 能稳定复刻 connect-phase 输出，就可以开始逐步扩展对象集与执行路径
+### 近期优先（提高测试覆盖率）
+
+1. **修复 printers_* 测试的 4M tick 时序偏移**
+   - 分析 Go/Python flush 边界处理差异
+   - 统一时序计算逻辑
+
+2. **实现剩余运动学**
+   - `rotary_delta` - 完整实现（当前使用 stub）
+   - `none` - 无运动学模式
+
+3. **架构测试支持**
+   - 添加对 `arch_*` 测试的支持（MCU 架构特定配置）
+
+### 中期目标（实机测试准备）
+
+1. **完善实时硬件闭环**
+   - 温度传感器 ADC 读取
+   - 加热器 PWM 控制
+   - 限位开关监控
+
+2. **Moonraker API 集成**
+   - objects/list/query 端点
+   - printer/gcode/script 端点
+   - 基本状态订阅
