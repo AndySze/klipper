@@ -107,7 +107,12 @@
   - 10 个单元测试
 
 #### 3.2 高级功能
-- [ ] Bed mesh 补偿
+- [x] Bed mesh 补偿 ✅ (2026-01-21)
+  - Profile 管理 (save/load/remove)
+  - BED_MESH_OUTPUT, BED_MESH_MAP, BED_MESH_CLEAR, BED_MESH_OFFSET, BED_MESH_PROFILE 命令
+  - GetStatus() API 查询 (profile_name, mesh_min/max, probed_matrix, mesh_matrix)
+  - zMesh 辅助方法
+  - 12 个单元测试
 - [ ] Pressure advance 微调
 - [ ] Input shaper 自动调谐
 - [ ] 多挤出机支持
