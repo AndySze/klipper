@@ -265,6 +265,15 @@ func (d *TMC2208Driver) GetName() string {
 	return d.name
 }
 
+// GetPhaseOffset returns the microstep phase offset and total phases.
+// TMC2208 has 1024 microsteps per electrical cycle (256 microsteps * 4 phases).
+func (d *TMC2208Driver) GetPhaseOffset() (int, int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	phases := (256 / d.microsteps) * 4 * d.microsteps // = 1024
+	return 0, phases
+}
+
 // GetStatus returns the driver status.
 func (d *TMC2208Driver) GetStatus() map[string]any {
 	d.mu.Lock()
@@ -336,9 +345,10 @@ func (d *TMC2208Driver) SetStealthchop(enable bool) error {
 
 // TMC2209 additional registers
 const (
-	tmc2209RegSGTHRS    = 0x40
-	tmc2209RegSG_RESULT = 0x41
-	tmc2209RegCOOLCONF  = 0x42
+	tmc2209RegTCOOLTHRS = 0x14 // CoolStep/StallGuard lower velocity threshold
+	tmc2209RegSGTHRS    = 0x40 // StallGuard threshold
+	tmc2209RegSG_RESULT = 0x41 // StallGuard result (read-only)
+	tmc2209RegCOOLCONF  = 0x42 // CoolStep configuration
 )
 
 // TMC2209Driver extends TMC2208Driver with StallGuard support.
@@ -346,14 +356,22 @@ type TMC2209Driver struct {
 	TMC2208Driver
 
 	// StallGuard configuration
-	sgthrs   uint8 // StallGuard threshold (0-255)
-	coolconf uint32
+	sgthrs    uint8  // StallGuard threshold (0-255)
+	tcoolthrs uint32 // CoolStep/StallGuard lower velocity threshold (TSTEP units)
+	coolconf  uint32 // COOLCONF register value
 }
 
 // TMC2209Config extends TMC2208Config with StallGuard settings.
 type TMC2209Config struct {
 	TMC2208Config
-	StallGuardThreshold uint8 // StallGuard threshold (0-255)
+	StallGuardThreshold uint8  // StallGuard threshold (0-255), driver_SGTHRS
+	CoolstepThreshold   uint32 // CoolStep/StallGuard velocity threshold (TSTEP units)
+	// COOLCONF fields (semin, seup, semax, sedn, seimin - for adaptive current)
+	Semin  uint8 // Minimum StallGuard value for CoolStep (0-15)
+	Seup   uint8 // Current increment step (0-3)
+	Semax  uint8 // Maximum StallGuard offset for CoolStep (0-15)
+	Sedn   uint8 // Current decrement step (0-3)
+	Seimin bool  // Minimum current (false=1/2, true=1/4)
 }
 
 // DefaultTMC2209Config returns default TMC2209 configuration.
@@ -376,6 +394,18 @@ func newTMC2209Driver(rt *runtime, cfg TMC2209Config) (*TMC2209Driver, error) {
 		return nil, fmt.Errorf("invalid microsteps value: %d", cfg.TMC2208Config.Microsteps)
 	}
 
+	// Build COOLCONF register:
+	// semin (bits 0-3), seup (bits 5-6), semax (bits 8-11), sedn (bits 13-14), seimin (bit 15)
+	seimin := uint32(0)
+	if cfg.Seimin {
+		seimin = 1
+	}
+	coolconf := uint32(cfg.Semin&0x0F) |
+		(uint32(cfg.Seup&0x03) << 5) |
+		(uint32(cfg.Semax&0x0F) << 8) |
+		(uint32(cfg.Sedn&0x03) << 13) |
+		(seimin << 15)
+
 	d := &TMC2209Driver{
 		TMC2208Driver: TMC2208Driver{
 			rt:            rt,
@@ -388,7 +418,9 @@ func newTMC2209Driver(rt *runtime, cfg TMC2209Config) (*TMC2209Driver, error) {
 			interpolate:   cfg.TMC2208Config.Interpolate,
 			stealthchop:   cfg.TMC2208Config.Stealthchop,
 		},
-		sgthrs: cfg.StallGuardThreshold,
+		sgthrs:    cfg.StallGuardThreshold,
+		tcoolthrs: cfg.CoolstepThreshold,
+		coolconf:  coolconf,
 	}
 
 	d.calculateRegisters()
@@ -404,9 +436,15 @@ func (d *TMC2209Driver) SetStallGuardThreshold(threshold uint8) {
 }
 
 // GetStallGuardResult returns the current StallGuard result.
-// In a full implementation, this would read the SG_RESULT register.
+// This reads the SG_RESULT register (0x41) which contains a 10-bit value (0-1023).
+// Higher values indicate more load margin (less load).
+//
+// In file output mode (golden tests), this returns 0 since there's no UART
+// communication to read the actual register value from the driver.
+// In a live system, this would query the MCU to read the SG_RESULT register.
 func (d *TMC2209Driver) GetStallGuardResult() uint16 {
-	// Placeholder - would need to read from UART
+	// In file output mode, there's no UART communication, so we return 0.
+	// A live implementation would read from UART: mcu_tmc.get_register("SG_RESULT")
 	return 0
 }
 
@@ -415,6 +453,47 @@ func (d *TMC2209Driver) GetStatus() map[string]any {
 	status := d.TMC2208Driver.GetStatus()
 	d.mu.Lock()
 	status["stallguard_threshold"] = d.sgthrs
+	status["tcoolthrs"] = d.tcoolthrs
+	status["coolconf"] = d.coolconf
 	d.mu.Unlock()
 	return status
+}
+
+// SetTCoolThrs sets the CoolStep/StallGuard velocity threshold.
+// StallGuard is only active when TSTEP is between TCOOLTHRS and THIGH.
+// Set to 0 to disable CoolStep/StallGuard velocity threshold.
+func (d *TMC2209Driver) SetTCoolThrs(tcoolthrs uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tcoolthrs = tcoolthrs
+	// In a full implementation, this would send the TCOOLTHRS register
+}
+
+// GetTCoolThrs returns the current TCOOLTHRS value.
+func (d *TMC2209Driver) GetTCoolThrs() uint32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.tcoolthrs
+}
+
+// SetCoolConf sets the CoolStep configuration register.
+func (d *TMC2209Driver) SetCoolConf(coolconf uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.coolconf = coolconf
+	// In a full implementation, this would send the COOLCONF register
+}
+
+// GetCoolConf returns the current COOLCONF value.
+func (d *TMC2209Driver) GetCoolConf() uint32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.coolconf
+}
+
+// GetStallGuardThreshold returns the current StallGuard threshold.
+func (d *TMC2209Driver) GetStallGuardThreshold() uint8 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.sgthrs
 }

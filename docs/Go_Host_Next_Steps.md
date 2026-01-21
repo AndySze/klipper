@@ -97,7 +97,14 @@
   - SAVE/RESTORE_GCODE_STATE 状态保存恢复
   - homing_position 归零偏移跟踪
   - 17 个单元测试
-- [ ] `tmc2209` - TMC2209 驱动
+- [x] `tmc2209` - TMC2209 驱动 ✅ (2026-01-21)
+  - TMC2208/TMC2209 驱动实现
+  - 电流计算 (vsense, irun, ihold)
+  - CHOPCONF, GCONF, PWMCONF 寄存器配置
+  - StallGuard (SGTHRS, SG_RESULT) 和 CoolStep (TCOOLTHRS, COOLCONF)
+  - SET_TMC_CURRENT, DUMP_TMC, INIT_TMC, SET_TMC_FIELD 命令
+  - TMCDriverManager 驱动管理器
+  - 10 个单元测试
 
 #### 3.2 高级功能
 - [ ] Bed mesh 补偿

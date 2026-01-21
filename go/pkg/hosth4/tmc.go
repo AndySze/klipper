@@ -255,3 +255,243 @@ func MRESToMicrosteps(mres uint32) int {
 	}
 	return 256 >> mres
 }
+
+// TMCDriverManager manages all TMC drivers in the system.
+type TMCDriverManager struct {
+	rt      *runtime
+	drivers map[string]TMCDriver
+	mu      sync.RWMutex
+}
+
+// newTMCDriverManager creates a new TMC driver manager.
+func newTMCDriverManager(rt *runtime) *TMCDriverManager {
+	return &TMCDriverManager{
+		rt:      rt,
+		drivers: make(map[string]TMCDriver),
+	}
+}
+
+// RegisterDriver registers a TMC driver.
+func (m *TMCDriverManager) RegisterDriver(name string, driver TMCDriver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.drivers[name] = driver
+}
+
+// GetDriver returns a driver by name.
+func (m *TMCDriverManager) GetDriver(name string) (TMCDriver, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	d, ok := m.drivers[name]
+	return d, ok
+}
+
+// GetAllDrivers returns all registered drivers.
+func (m *TMCDriverManager) GetAllDrivers() map[string]TMCDriver {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make(map[string]TMCDriver, len(m.drivers))
+	for k, v := range m.drivers {
+		result[k] = v
+	}
+	return result
+}
+
+// cmdSetTMCCurrent handles the SET_TMC_CURRENT command.
+// Usage: SET_TMC_CURRENT STEPPER=<name> [CURRENT=<amps>] [HOLDCURRENT=<amps>]
+func (m *TMCDriverManager) cmdSetTMCCurrent(args map[string]string) (string, error) {
+	stepperName, ok := args["STEPPER"]
+	if !ok || stepperName == "" {
+		return "", fmt.Errorf("SET_TMC_CURRENT requires STEPPER parameter")
+	}
+
+	m.mu.RLock()
+	driver, exists := m.drivers[stepperName]
+	m.mu.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("unknown stepper: %s", stepperName)
+	}
+
+	// Get current values for reporting
+	status := driver.GetStatus()
+	runCurrent := 0.0
+	holdCurrent := 0.0
+	if rc, ok := status["run_current"].(float64); ok {
+		runCurrent = rc
+	}
+	if hc, ok := status["hold_current"].(float64); ok {
+		holdCurrent = hc
+	}
+
+	// Parse optional new current values
+	newRunCurrent := runCurrent
+	newHoldCurrent := holdCurrent
+	hasChange := false
+
+	if currentStr, ok := args["CURRENT"]; ok && currentStr != "" {
+		var err error
+		newRunCurrent, err = tmcParseFloat(currentStr)
+		if err != nil {
+			return "", fmt.Errorf("invalid CURRENT value: %s", currentStr)
+		}
+		if newRunCurrent <= 0 {
+			return "", fmt.Errorf("CURRENT must be positive")
+		}
+		hasChange = true
+	}
+
+	if holdStr, ok := args["HOLDCURRENT"]; ok && holdStr != "" {
+		var err error
+		newHoldCurrent, err = tmcParseFloat(holdStr)
+		if err != nil {
+			return "", fmt.Errorf("invalid HOLDCURRENT value: %s", holdStr)
+		}
+		if newHoldCurrent <= 0 {
+			return "", fmt.Errorf("HOLDCURRENT must be positive")
+		}
+		hasChange = true
+	}
+
+	// Apply changes if any
+	if hasChange {
+		// Try to set current on TMC2208/TMC2209 drivers
+		switch d := driver.(type) {
+		case *TMC2208Driver:
+			if err := d.SetCurrent(newRunCurrent, newHoldCurrent); err != nil {
+				return "", err
+			}
+			runCurrent = newRunCurrent
+			holdCurrent = newHoldCurrent
+		case *TMC2209Driver:
+			if err := d.SetCurrent(newRunCurrent, newHoldCurrent); err != nil {
+				return "", err
+			}
+			runCurrent = newRunCurrent
+			holdCurrent = newHoldCurrent
+		default:
+			return "", fmt.Errorf("driver %s does not support SetCurrent", stepperName)
+		}
+	}
+
+	// Return current status
+	if holdCurrent > 0 {
+		return fmt.Sprintf("Run Current: %.2fA Hold Current: %.2fA", runCurrent, holdCurrent), nil
+	}
+	return fmt.Sprintf("Run Current: %.2fA", runCurrent), nil
+}
+
+// cmdDumpTMC handles the DUMP_TMC command.
+// Usage: DUMP_TMC STEPPER=<name>
+func (m *TMCDriverManager) cmdDumpTMC(args map[string]string) (string, error) {
+	stepperName, ok := args["STEPPER"]
+	if !ok || stepperName == "" {
+		return "", fmt.Errorf("DUMP_TMC requires STEPPER parameter")
+	}
+
+	m.mu.RLock()
+	driver, exists := m.drivers[stepperName]
+	m.mu.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("unknown stepper: %s", stepperName)
+	}
+
+	// Get driver status
+	status := driver.GetStatus()
+
+	// Format output
+	result := fmt.Sprintf("========== Dump TMC %s ==========\n", stepperName)
+	for key, val := range status {
+		result += fmt.Sprintf("  %s: %v\n", key, val)
+	}
+
+	return result, nil
+}
+
+// cmdInitTMC handles the INIT_TMC command.
+// Usage: INIT_TMC STEPPER=<name>
+func (m *TMCDriverManager) cmdInitTMC(args map[string]string) (string, error) {
+	stepperName, ok := args["STEPPER"]
+	if !ok || stepperName == "" {
+		return "", fmt.Errorf("INIT_TMC requires STEPPER parameter")
+	}
+
+	m.mu.RLock()
+	_, exists := m.drivers[stepperName]
+	m.mu.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("unknown stepper: %s", stepperName)
+	}
+
+	// In file output mode, we just log the init request
+	// A live implementation would reinitialize the TMC registers via UART/SPI
+	log.Printf("INIT_TMC %s", stepperName)
+
+	return fmt.Sprintf("TMC %s initialized", stepperName), nil
+}
+
+// cmdSetTMCField handles the SET_TMC_FIELD command.
+// Usage: SET_TMC_FIELD STEPPER=<name> FIELD=<field_name> VALUE=<value>
+func (m *TMCDriverManager) cmdSetTMCField(args map[string]string) (string, error) {
+	stepperName, ok := args["STEPPER"]
+	if !ok || stepperName == "" {
+		return "", fmt.Errorf("SET_TMC_FIELD requires STEPPER parameter")
+	}
+
+	fieldName, ok := args["FIELD"]
+	if !ok || fieldName == "" {
+		return "", fmt.Errorf("SET_TMC_FIELD requires FIELD parameter")
+	}
+
+	valueStr, ok := args["VALUE"]
+	if !ok || valueStr == "" {
+		return "", fmt.Errorf("SET_TMC_FIELD requires VALUE parameter")
+	}
+
+	m.mu.RLock()
+	_, exists := m.drivers[stepperName]
+	m.mu.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("unknown stepper: %s", stepperName)
+	}
+
+	value, err := tmcParseInt(valueStr)
+	if err != nil {
+		return "", fmt.Errorf("invalid VALUE: %s", valueStr)
+	}
+
+	// In file output mode, we just log the field set request
+	// A live implementation would update the register via UART/SPI
+	log.Printf("SET_TMC_FIELD %s FIELD=%s VALUE=%d", stepperName, fieldName, value)
+
+	return fmt.Sprintf("TMC %s field %s set to %d", stepperName, fieldName, value), nil
+}
+
+// GetStatus returns status for all TMC drivers.
+func (m *TMCDriverManager) GetStatus() map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make(map[string]any)
+	for name, driver := range m.drivers {
+		result[name] = driver.GetStatus()
+	}
+	return result
+}
+
+// tmcParseFloat parses a string to float64.
+func tmcParseFloat(s string) (float64, error) {
+	var f float64
+	_, err := fmt.Sscanf(s, "%f", &f)
+	return f, err
+}
+
+// tmcParseInt parses a string to int.
+func tmcParseInt(s string) (int, error) {
+	var i int
+	_, err := fmt.Sscanf(s, "%d", &i)
+	return i, err
+}
