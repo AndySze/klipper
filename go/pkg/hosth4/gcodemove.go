@@ -18,6 +18,7 @@ type gcodeState struct {
 	absoluteExtrude bool
 	basePosition    []float64
 	lastPosition    []float64
+	homingPosition  []float64
 	speed           float64
 	speedFactor     float64
 	extrudeFactor   float64
@@ -33,8 +34,9 @@ type gcodeMove struct {
 	absoluteCoord   bool
 	absoluteExtrude bool
 
-	basePosition []float64
-	lastPosition []float64
+	basePosition   []float64
+	lastPosition   []float64
+	homingPosition []float64
 
 	speed         float64
 	speedFactor   float64
@@ -45,6 +47,9 @@ type gcodeMove struct {
 
 	// Saved gcode states by name
 	savedStates map[string]*gcodeState
+
+	// isPrinterReady indicates whether the printer is ready for moves
+	isPrinterReady bool
 }
 
 func newGCodeMove(th *toolhead, mmPerArcSegment float64) *gcodeMove {
@@ -64,9 +69,11 @@ func newGCodeMove(th *toolhead, mmPerArcSegment float64) *gcodeMove {
 		arcPlane:        arcPlaneXY,
 		mmPerArcSegment: mmPerArcSegment,
 		savedStates:     make(map[string]*gcodeState),
+		isPrinterReady:  false,
 	}
 	gm.basePosition = make([]float64, len(th.commandedPos))
 	gm.lastPosition = append([]float64{}, th.commandedPos...)
+	gm.homingPosition = make([]float64, 4) // X, Y, Z, E
 	return gm
 }
 
@@ -114,6 +121,184 @@ func (gm *gcodeMove) cmdG91() { gm.absoluteCoord = false }
 func (gm *gcodeMove) cmdG17() { gm.arcPlane = arcPlaneXY }
 func (gm *gcodeMove) cmdG18() { gm.arcPlane = arcPlaneXZ }
 func (gm *gcodeMove) cmdG19() { gm.arcPlane = arcPlaneYZ }
+
+// cmdM82 sets absolute extrusion mode
+func (gm *gcodeMove) cmdM82() { gm.absoluteExtrude = true }
+
+// cmdM83 sets relative extrusion mode
+func (gm *gcodeMove) cmdM83() { gm.absoluteExtrude = false }
+
+// cmdG20 rejects inches mode (not supported)
+func (gm *gcodeMove) cmdG20() error {
+	return fmt.Errorf("machine does not support G20 (inches) command")
+}
+
+// cmdG21 sets millimeter mode (no-op since it's the default)
+func (gm *gcodeMove) cmdG21() {}
+
+// cmdM220 sets speed factor override percentage
+func (gm *gcodeMove) cmdM220(args map[string]string) error {
+	sVal := 100.0
+	if raw, ok := args["S"]; ok {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("bad S=%q", raw)
+		}
+		if v <= 0.0 {
+			return fmt.Errorf("M220 S value must be positive")
+		}
+		sVal = v
+	}
+	value := sVal / (60.0 * 100.0)
+	gm.speed = gm.getGcodeSpeed() * value
+	gm.speedFactor = value
+	return nil
+}
+
+// cmdM221 sets extrude factor override percentage
+func (gm *gcodeMove) cmdM221(args map[string]string) error {
+	sVal := 100.0
+	if raw, ok := args["S"]; ok {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("bad S=%q", raw)
+		}
+		if v <= 0.0 {
+			return fmt.Errorf("M221 S value must be positive")
+		}
+		sVal = v
+	}
+	newExtrudeFactor := sVal / 100.0
+	lastEPos := 0.0
+	if len(gm.lastPosition) > 3 {
+		lastEPos = gm.lastPosition[3]
+	}
+	baseE := 0.0
+	if len(gm.basePosition) > 3 {
+		baseE = gm.basePosition[3]
+	}
+	eValue := (lastEPos - baseE) / gm.extrudeFactor
+	if len(gm.basePosition) > 3 {
+		gm.basePosition[3] = lastEPos - eValue*newExtrudeFactor
+	}
+	gm.extrudeFactor = newExtrudeFactor
+	return nil
+}
+
+// getGcodeSpeed returns the current speed in gcode units (mm/min)
+func (gm *gcodeMove) getGcodeSpeed() float64 {
+	return gm.speed / gm.speedFactor
+}
+
+// getGcodeSpeedOverride returns the speed factor override (as percentage, e.g., 60 = 100%)
+func (gm *gcodeMove) getGcodeSpeedOverride() float64 {
+	return gm.speedFactor * 60.0
+}
+
+// cmdSetGcodeOffset sets a virtual offset to g-code positions
+func (gm *gcodeMove) cmdSetGcodeOffset(args map[string]string) error {
+	moveDelta := []float64{0., 0., 0., 0.}
+	axes := "XYZE"
+	for pos := 0; pos < len(axes); pos++ {
+		axis := string(axes[pos])
+		offset := math.NaN()
+		if raw, ok := args[axis]; ok {
+			v, err := strconv.ParseFloat(raw, 64)
+			if err != nil {
+				return fmt.Errorf("bad %s=%q", axis, raw)
+			}
+			offset = v
+		}
+		if math.IsNaN(offset) {
+			adjustKey := axis + "_ADJUST"
+			if raw, ok := args[adjustKey]; ok {
+				v, err := strconv.ParseFloat(raw, 64)
+				if err != nil {
+					return fmt.Errorf("bad %s=%q", adjustKey, raw)
+				}
+				if pos < len(gm.homingPosition) {
+					offset = v + gm.homingPosition[pos]
+				}
+			}
+		}
+		if math.IsNaN(offset) {
+			continue
+		}
+		if pos < len(gm.homingPosition) {
+			delta := offset - gm.homingPosition[pos]
+			moveDelta[pos] = delta
+			if pos < len(gm.basePosition) {
+				gm.basePosition[pos] += delta
+			}
+			gm.homingPosition[pos] = offset
+		}
+	}
+	// Move the toolhead the given offset if requested
+	moveVal := 0
+	if raw, ok := args["MOVE"]; ok {
+		v, err := strconv.Atoi(raw)
+		if err == nil {
+			moveVal = v
+		}
+	}
+	if moveVal != 0 {
+		moveSpeed := gm.speed
+		if raw, ok := args["MOVE_SPEED"]; ok {
+			v, err := strconv.ParseFloat(raw, 64)
+			if err == nil && v > 0.0 {
+				moveSpeed = v
+			}
+		}
+		for pos, delta := range moveDelta {
+			if pos < len(gm.lastPosition) {
+				gm.lastPosition[pos] += delta
+			}
+		}
+		if gm.moveWithTransform != nil {
+			return gm.moveWithTransform(gm.lastPosition, moveSpeed)
+		}
+	}
+	return nil
+}
+
+// cmdM114 returns the current position
+func (gm *gcodeMove) cmdM114() string {
+	p := gm.getGcodePosition()
+	if len(p) >= 4 {
+		return fmt.Sprintf("X:%.3f Y:%.3f Z:%.3f E:%.3f", p[0], p[1], p[2], p[3])
+	}
+	return ""
+}
+
+// handleReady is called when the printer becomes ready
+func (gm *gcodeMove) handleReady() {
+	gm.isPrinterReady = true
+	gm.resetFromToolhead()
+}
+
+// handleShutdown is called when the printer shuts down
+func (gm *gcodeMove) handleShutdown() {
+	gm.isPrinterReady = false
+}
+
+// handleActivateExtruder is called when the active extruder changes
+func (gm *gcodeMove) handleActivateExtruder() {
+	gm.resetFromToolhead()
+	gm.extrudeFactor = 1.0
+	if len(gm.lastPosition) > 3 && len(gm.basePosition) > 3 {
+		gm.basePosition[3] = gm.lastPosition[3]
+	}
+}
+
+// handleHomeRailsEnd is called after homing completes for given axes
+func (gm *gcodeMove) handleHomeRailsEnd(axes []int) {
+	gm.resetFromToolhead()
+	for _, axis := range axes {
+		if axis < len(gm.basePosition) && axis < len(gm.homingPosition) {
+			gm.basePosition[axis] = gm.homingPosition[axis]
+		}
+	}
+}
 
 // cmdG92 sets the current gcode position by adjusting the base position offset.
 // This doesn't move the toolhead - it just changes how gcode coordinates map to toolhead coordinates.
@@ -380,6 +565,7 @@ func (gm *gcodeMove) saveState(name string) {
 		absoluteExtrude: gm.absoluteExtrude,
 		basePosition:    append([]float64{}, gm.basePosition...),
 		lastPosition:    append([]float64{}, gm.lastPosition...),
+		homingPosition:  append([]float64{}, gm.homingPosition...),
 		speed:           gm.speed,
 		speedFactor:     gm.speedFactor,
 		extrudeFactor:   gm.extrudeFactor,
@@ -390,15 +576,17 @@ func (gm *gcodeMove) saveState(name string) {
 
 // restoreState restores a previously saved gcode state.
 // If move is true, moves to the saved position at the given speed.
+// Matches Python's cmd_RESTORE_GCODE_STATE behavior.
 func (gm *gcodeMove) restoreState(name string, move bool, moveSpeed float64) error {
 	if name == "" {
 		name = "default"
 	}
 	state, ok := gm.savedStates[name]
 	if !ok {
-		return fmt.Errorf("gcode state '%s' not found", name)
+		return fmt.Errorf("unknown g-code state: %s", name)
 	}
 
+	// Restore state
 	gm.absoluteCoord = state.absoluteCoord
 	gm.absoluteExtrude = state.absoluteExtrude
 	gm.speed = state.speed
@@ -406,43 +594,67 @@ func (gm *gcodeMove) restoreState(name string, move bool, moveSpeed float64) err
 	gm.extrudeFactor = state.extrudeFactor
 	gm.arcPlane = state.arcPlane
 
-	// Copy positions
-	gm.basePosition = append([]float64{}, state.basePosition...)
+	// Copy base position (only first 4 elements like Python)
+	if len(gm.basePosition) >= 4 && len(state.basePosition) >= 4 {
+		copy(gm.basePosition[:4], state.basePosition[:4])
+	}
+	gm.homingPosition = append([]float64{}, state.homingPosition...)
 
+	// Restore the relative E position
+	// e_diff = self.last_position[3] - state['last_position'][3]
+	// self.base_position[3] += e_diff
+	if len(gm.lastPosition) > 3 && len(state.lastPosition) > 3 && len(gm.basePosition) > 3 {
+		eDiff := gm.lastPosition[3] - state.lastPosition[3]
+		gm.basePosition[3] += eDiff
+	}
+
+	// Move the toolhead back if requested
 	if move && moveSpeed > 0 {
-		// Move to saved position
-		targetPos := append([]float64{}, state.lastPosition...)
-		// Restore XYZ but not E
-		if len(targetPos) > 3 {
-			targetPos[3] = gm.lastPosition[3]
+		// Only restore XYZ, not E
+		if len(gm.lastPosition) >= 3 && len(state.lastPosition) >= 3 {
+			gm.lastPosition[0] = state.lastPosition[0]
+			gm.lastPosition[1] = state.lastPosition[1]
+			gm.lastPosition[2] = state.lastPosition[2]
 		}
-		gm.lastPosition = targetPos
 		if gm.moveWithTransform != nil {
-			if err := gm.moveWithTransform(targetPos, moveSpeed); err != nil {
+			if err := gm.moveWithTransform(gm.lastPosition, moveSpeed); err != nil {
 				return err
 			}
 		} else if gm.toolhead != nil {
-			if err := gm.toolhead.move(targetPos, moveSpeed); err != nil {
+			if err := gm.toolhead.move(gm.lastPosition, moveSpeed); err != nil {
 				return err
 			}
 		}
-	} else {
-		gm.lastPosition = append([]float64{}, state.lastPosition...)
 	}
 
 	return nil
 }
 
 // GetStatus returns the current gcode move status for API queries.
+// Matches Python's GCodeMove.get_status() output.
 func (gm *gcodeMove) GetStatus() map[string]any {
 	gcodePos := gm.getGcodePosition()
+
+	// Build homing_origin as Coord-like structure
+	homingOrigin := make([]float64, len(gm.homingPosition))
+	copy(homingOrigin, gm.homingPosition)
+
+	// Build position (last_position)
+	position := make([]float64, len(gm.lastPosition))
+	copy(position, gm.lastPosition)
+
+	// Build axis_map
+	axisMap := map[string]int{"X": 0, "Y": 1, "Z": 2, "E": 3}
+
 	return map[string]any{
-		"speed_factor":       gm.speedFactor * 60.0,
-		"speed":              gm.speed,
-		"extrude_factor":     gm.extrudeFactor,
+		"speed_factor":         gm.getGcodeSpeedOverride(),
+		"speed":                gm.getGcodeSpeed(),
+		"extrude_factor":       gm.extrudeFactor,
 		"absolute_coordinates": gm.absoluteCoord,
-		"absolute_extrude":   gm.absoluteExtrude,
-		"position":           gcodePos,
-		"gcode_position":     gcodePos,
+		"absolute_extrude":     gm.absoluteExtrude,
+		"homing_origin":        homingOrigin,
+		"position":             position,
+		"gcode_position":       gcodePos,
+		"axis_map":             axisMap,
 	}
 }

@@ -5422,9 +5422,65 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		if err := r.gm.cmdG92(cmd.Args); err != nil {
 			return err
 		}
-	case "SAVE_GCODE_STATE", "RESTORE_GCODE_STATE":
-		// Host-side state only; no MCU output in fileoutput mode.
-		return nil
+	case "SAVE_GCODE_STATE":
+		name := cmd.Args["NAME"]
+		if name == "" {
+			name = "default"
+		}
+		r.gm.saveState(name)
+	case "RESTORE_GCODE_STATE":
+		name := cmd.Args["NAME"]
+		if name == "" {
+			name = "default"
+		}
+		move := false
+		if raw, ok := cmd.Args["MOVE"]; ok {
+			if v, err := strconv.Atoi(raw); err == nil && v != 0 {
+				move = true
+			}
+		}
+		moveSpeed := r.gm.speed
+		if raw, ok := cmd.Args["MOVE_SPEED"]; ok {
+			if v, err := strconv.ParseFloat(raw, 64); err == nil && v > 0 {
+				moveSpeed = v
+			}
+		}
+		if err := r.gm.restoreState(name, move, moveSpeed); err != nil {
+			return err
+		}
+	case "G20":
+		// Inches mode (not supported)
+		if err := r.gm.cmdG20(); err != nil {
+			return err
+		}
+	case "G21":
+		// Millimeters mode (no-op)
+		r.gm.cmdG21()
+	case "M82":
+		// Absolute extrusion
+		r.gm.cmdM82()
+	case "M83":
+		// Relative extrusion
+		r.gm.cmdM83()
+	case "M114":
+		// Get current position
+		result := r.gm.cmdM114()
+		r.tracef("M114: %s\n", result)
+	case "M220":
+		// Set speed factor override
+		if err := r.gm.cmdM220(cmd.Args); err != nil {
+			return err
+		}
+	case "M221":
+		// Set extrude factor override
+		if err := r.gm.cmdM221(cmd.Args); err != nil {
+			return err
+		}
+	case "SET_GCODE_OFFSET":
+		// Set virtual offset to g-code positions
+		if err := r.gm.cmdSetGcodeOffset(cmd.Args); err != nil {
+			return err
+		}
 	case "G90":
 		r.gm.cmdG90()
 	case "G91":

@@ -87,7 +87,16 @@
   - 动态参数更新 (SET_INPUT_SHAPER)
   - 双挤出机 (IDEX) 支持检测
   - 步进生成扫描窗口管理
-- [ ] `gcode_move` - GCode 移动核心
+- [x] `gcode_move` - GCode 移动核心 ✅ (2026-01-21)
+  - 完整坐标系统管理 (absolute/relative, extrude mode)
+  - G0/G1 移动, G2/G3 圆弧, G17/G18/G19 平面选择
+  - G90/G91 坐标模式, G92 位置设置
+  - M82/M83 挤出模式, M114 位置报告
+  - M220 速度倍率, M221 挤出倍率
+  - SET_GCODE_OFFSET 虚拟偏移
+  - SAVE/RESTORE_GCODE_STATE 状态保存恢复
+  - homing_position 归零偏移跟踪
+  - 17 个单元测试
 - [ ] `tmc2209` - TMC2209 驱动
 
 #### 3.2 高级功能
