@@ -5585,6 +5585,57 @@ func (r *runtime) exec(cmd *gcodeCommand) error {
 		if err := r.cmdBedMeshCalibrate(cmd.Args); err != nil {
 			return err
 		}
+	case "BED_MESH_OUTPUT":
+		if r.bedMesh == nil {
+			return fmt.Errorf("bed_mesh not configured")
+		}
+		result, err := r.bedMesh.cmdBedMeshOutput(cmd.Args)
+		if err != nil {
+			return err
+		}
+		if result != "" {
+			r.gcodeRespond(result)
+		}
+	case "BED_MESH_MAP":
+		if r.bedMesh == nil {
+			return fmt.Errorf("bed_mesh not configured")
+		}
+		result, err := r.bedMesh.cmdBedMeshMap(cmd.Args)
+		if err != nil {
+			return err
+		}
+		if result != "" {
+			r.gcodeRespond(result)
+		}
+	case "BED_MESH_CLEAR":
+		if r.bedMesh == nil {
+			return fmt.Errorf("bed_mesh not configured")
+		}
+		if _, err := r.bedMesh.cmdBedMeshClear(cmd.Args); err != nil {
+			return err
+		}
+	case "BED_MESH_OFFSET":
+		if r.bedMesh == nil {
+			return fmt.Errorf("bed_mesh not configured")
+		}
+		result, err := r.bedMesh.cmdBedMeshOffset(cmd.Args)
+		if err != nil {
+			return err
+		}
+		if result != "" {
+			r.gcodeRespond(result)
+		}
+	case "BED_MESH_PROFILE":
+		if r.bedMesh == nil {
+			return fmt.Errorf("bed_mesh not configured")
+		}
+		result, err := r.bedMesh.cmdBedMeshProfile(cmd.Args)
+		if err != nil {
+			return err
+		}
+		if result != "" {
+			r.gcodeRespond(result)
+		}
 	case "DELTA_CALIBRATE":
 		// Delta calibration - stub for golden testing
 		// In real Klipper this runs a probe sequence to calibrate delta parameters
@@ -6395,14 +6446,16 @@ func (r *runtime) cmdBedMeshCalibrate(args map[string]string) error {
 		MeshYPPS: 2,
 		Algo:     "lagrange",
 		Tension:  0.2,
-	})
+	}, "default")
 	if err != nil {
 		return err
 	}
 	if err := mesh.BuildMesh(probedMatrix); err != nil {
 		return err
 	}
-	r.bedMesh.SetMesh(mesh)
+	if err := r.bedMesh.SetMesh(mesh); err != nil {
+		return err
+	}
 	// Match Klippy: reset gcode_move last position after enabling a mesh.
 	if r.gm != nil {
 		r.gm.resetFromToolhead()

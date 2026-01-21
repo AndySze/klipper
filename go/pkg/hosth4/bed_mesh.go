@@ -1,8 +1,12 @@
 package hosth4
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"math"
+	"strings"
+	"sync"
 )
 
 type moveTransform interface {
@@ -17,14 +21,30 @@ type bedMesh struct {
 
 	zMesh *zMesh
 
-	fadeStart  float64
-	fadeEnd    float64
-	fadeDist   float64
-	fadeTarget float64
+	fadeStart       float64
+	fadeEnd         float64
+	fadeDist        float64
+	fadeTarget      float64
+	baseFadeTarget  *float64 // nil means auto (use mesh average)
+	horizontalMoveZ float64
 
 	toolOffset float64
 
 	splitter *moveSplitter
+
+	// Profile management
+	profiles   map[string]*bedMeshProfile
+	profilesMu sync.RWMutex
+
+	// Status cache
+	status   map[string]any
+	statusMu sync.RWMutex
+}
+
+// bedMeshProfile stores a saved mesh profile.
+type bedMeshProfile struct {
+	Points     [][]float64
+	MeshParams zMeshParams
 }
 
 func newBedMesh(cfg *configWrapper, th *toolhead) (*bedMesh, error) {
@@ -33,7 +53,8 @@ func newBedMesh(cfg *configWrapper, th *toolhead) (*bedMesh, error) {
 	}
 	fadeStart := 1.0
 	fadeEnd := 0.0
-	fadeTarget := 0.0
+	var baseFadeTarget *float64
+	horizontalMoveZ := 5.0
 	splitDeltaZ := 0.025
 	moveCheckDistance := 5.0
 	if cfg != nil {
@@ -50,7 +71,12 @@ func newBedMesh(cfg *configWrapper, th *toolhead) (*bedMesh, error) {
 			}
 			if raw := sec["fade_target"]; raw != "" {
 				if v, err := parseFloat(sec, "fade_target", nil); err == nil {
-					fadeTarget = v
+					baseFadeTarget = &v
+				}
+			}
+			if raw := sec["horizontal_move_z"]; raw != "" {
+				if v, err := parseFloat(sec, "horizontal_move_z", nil); err == nil {
+					horizontalMoveZ = v
 				}
 			}
 			if raw := sec["split_delta_z"]; raw != "" {
@@ -66,6 +92,7 @@ func newBedMesh(cfg *configWrapper, th *toolhead) (*bedMesh, error) {
 		}
 	}
 	fadeDist := fadeEnd - fadeStart
+	fadeTarget := 0.0
 	if fadeDist <= 0.0 {
 		// Match Klippy: disable fade if fade_end <= fade_start.
 		fadeStart = math.MaxFloat64
@@ -74,25 +101,291 @@ func newBedMesh(cfg *configWrapper, th *toolhead) (*bedMesh, error) {
 		fadeTarget = 0.0
 	}
 
-	return &bedMesh{
-		toolhead:     th,
-		lastPosition: append([]float64{}, th.commandedPos...),
-		zMesh:        nil,
-		fadeStart:    fadeStart,
-		fadeEnd:      fadeEnd,
-		fadeDist:     fadeDist,
-		fadeTarget:   fadeTarget,
-		toolOffset:   0.0,
-		splitter:     newMoveSplitter(splitDeltaZ, moveCheckDistance),
-	}, nil
+	bm := &bedMesh{
+		toolhead:        th,
+		lastPosition:    append([]float64{}, th.commandedPos...),
+		zMesh:           nil,
+		fadeStart:       fadeStart,
+		fadeEnd:         fadeEnd,
+		fadeDist:        fadeDist,
+		fadeTarget:      fadeTarget,
+		baseFadeTarget:  baseFadeTarget,
+		horizontalMoveZ: horizontalMoveZ,
+		toolOffset:      0.0,
+		splitter:        newMoveSplitter(splitDeltaZ, moveCheckDistance),
+		profiles:        make(map[string]*bedMeshProfile),
+		status:          make(map[string]any),
+	}
+	bm.updateStatus()
+	return bm, nil
 }
 
-func (bm *bedMesh) SetMesh(mesh *zMesh) {
+func (bm *bedMesh) SetMesh(mesh *zMesh) error {
+	if mesh != nil && bm.fadeEnd != math.MaxFloat64 {
+		// Calculate fade target
+		if bm.baseFadeTarget == nil {
+			bm.fadeTarget = mesh.GetZAverage()
+		} else {
+			bm.fadeTarget = *bm.baseFadeTarget
+			minZ, maxZ := mesh.GetZRange()
+			if bm.fadeTarget != 0.0 && (bm.fadeTarget < minZ || bm.fadeTarget > maxZ) {
+				bm.zMesh = nil
+				bm.fadeTarget = 0.0
+				return fmt.Errorf("bed_mesh: fade_target lies outside of mesh z range min: %.4f, max: %.4f, fade_target: %.4f",
+					minZ, maxZ, bm.fadeTarget)
+			}
+		}
+		// Check fade distance vs mesh range
+		minZ, maxZ := mesh.GetZRange()
+		if bm.fadeDist <= math.Max(math.Abs(minZ), math.Abs(maxZ)) {
+			bm.zMesh = nil
+			bm.fadeTarget = 0.0
+			return fmt.Errorf("bed_mesh: mesh extends outside of fade range, fade distance: %.2f mesh min: %.4f mesh max: %.4f",
+				bm.fadeDist, minZ, maxZ)
+		}
+	} else {
+		bm.fadeTarget = 0.0
+	}
+
 	bm.toolOffset = 0.0
 	bm.zMesh = mesh
 	if bm.splitter != nil {
 		bm.splitter.Initialize(mesh, bm.fadeTarget)
 	}
+	bm.updateStatus()
+	return nil
+}
+
+// GetMesh returns the current z mesh.
+func (bm *bedMesh) GetMesh() *zMesh {
+	return bm.zMesh
+}
+
+// updateStatus updates the cached status.
+func (bm *bedMesh) updateStatus() {
+	bm.statusMu.Lock()
+	defer bm.statusMu.Unlock()
+
+	bm.profilesMu.RLock()
+	profiles := make(map[string]map[string]any, len(bm.profiles))
+	for name := range bm.profiles {
+		profiles[name] = map[string]any{}
+	}
+	bm.profilesMu.RUnlock()
+
+	bm.status = map[string]any{
+		"profile_name":   "",
+		"mesh_min":       []float64{0.0, 0.0},
+		"mesh_max":       []float64{0.0, 0.0},
+		"probed_matrix":  [][]float64{{}},
+		"mesh_matrix":    [][]float64{{}},
+		"profiles":       profiles,
+	}
+
+	if bm.zMesh != nil {
+		params := bm.zMesh.GetMeshParams()
+		bm.status["profile_name"] = bm.zMesh.GetProfileName()
+		bm.status["mesh_min"] = []float64{params.MinX, params.MinY}
+		bm.status["mesh_max"] = []float64{params.MaxX, params.MaxY}
+		bm.status["probed_matrix"] = bm.zMesh.GetProbedMatrix()
+		bm.status["mesh_matrix"] = bm.zMesh.GetMeshMatrix()
+	}
+}
+
+// GetStatus returns the current bed mesh status.
+func (bm *bedMesh) GetStatus() map[string]any {
+	bm.statusMu.RLock()
+	defer bm.statusMu.RUnlock()
+	// Return a copy
+	result := make(map[string]any, len(bm.status))
+	for k, v := range bm.status {
+		result[k] = v
+	}
+	return result
+}
+
+// cmdBedMeshOutput handles the BED_MESH_OUTPUT command.
+func (bm *bedMesh) cmdBedMeshOutput(args map[string]string) (string, error) {
+	if bm.zMesh == nil {
+		return "Bed has not been probed", nil
+	}
+
+	var result strings.Builder
+	result.WriteString("Mesh Leveling Probed Z positions:\n")
+	probed := bm.zMesh.GetProbedMatrix()
+	for _, line := range probed {
+		for _, z := range line {
+			result.WriteString(fmt.Sprintf(" %f", z))
+		}
+		result.WriteString("\n")
+	}
+
+	mesh := bm.zMesh.GetMeshMatrix()
+	result.WriteString(fmt.Sprintf("Mesh X,Y: %d,%d\n", bm.zMesh.meshXCount, bm.zMesh.meshYCount))
+	result.WriteString(fmt.Sprintf("Search Height: %.0f\n", bm.horizontalMoveZ))
+	result.WriteString(fmt.Sprintf("Mesh Offsets: X=%.4f, Y=%.4f\n", bm.zMesh.meshOffsets[0], bm.zMesh.meshOffsets[1]))
+	result.WriteString(fmt.Sprintf("Mesh Average: %.2f\n", bm.zMesh.GetZAverage()))
+	minZ, maxZ := bm.zMesh.GetZRange()
+	result.WriteString(fmt.Sprintf("Mesh Range: min=%.4f max=%.4f\n", minZ, maxZ))
+	result.WriteString(fmt.Sprintf("Interpolation Algorithm: %s\n", bm.zMesh.params.Algo))
+	result.WriteString("Measured points:\n")
+	for y := bm.zMesh.meshYCount - 1; y >= 0; y-- {
+		for _, z := range mesh[y] {
+			result.WriteString(fmt.Sprintf("  %f", z))
+		}
+		result.WriteString("\n")
+	}
+
+	return result.String(), nil
+}
+
+// cmdBedMeshMap handles the BED_MESH_MAP command.
+func (bm *bedMesh) cmdBedMeshMap(args map[string]string) (string, error) {
+	if bm.zMesh == nil {
+		return "Bed has not been probed", nil
+	}
+
+	params := bm.zMesh.GetMeshParams()
+	outdict := map[string]any{
+		"mesh_min":    []float64{params.MinX, params.MinY},
+		"mesh_max":    []float64{params.MaxX, params.MaxY},
+		"z_positions": bm.zMesh.GetProbedMatrix(),
+	}
+	data, err := json.Marshal(outdict)
+	if err != nil {
+		return "", fmt.Errorf("bed_mesh: failed to serialize mesh map: %w", err)
+	}
+	return "mesh_map_output " + string(data), nil
+}
+
+// cmdBedMeshClear handles the BED_MESH_CLEAR command.
+func (bm *bedMesh) cmdBedMeshClear(args map[string]string) (string, error) {
+	if err := bm.SetMesh(nil); err != nil {
+		return "", err
+	}
+	return "", nil
+}
+
+// cmdBedMeshOffset handles the BED_MESH_OFFSET command.
+func (bm *bedMesh) cmdBedMeshOffset(args map[string]string) (string, error) {
+	if bm.zMesh == nil {
+		return "No mesh loaded to offset", nil
+	}
+
+	offsets := [2]*float64{nil, nil}
+	if xStr, ok := args["X"]; ok && xStr != "" {
+		x, err := bedMeshParseFloat(xStr)
+		if err != nil {
+			return "", fmt.Errorf("invalid X value: %s", xStr)
+		}
+		offsets[0] = &x
+	}
+	if yStr, ok := args["Y"]; ok && yStr != "" {
+		y, err := bedMeshParseFloat(yStr)
+		if err != nil {
+			return "", fmt.Errorf("invalid Y value: %s", yStr)
+		}
+		offsets[1] = &y
+	}
+	bm.zMesh.SetMeshOffsets(offsets)
+
+	if zfadeStr, ok := args["ZFADE"]; ok && zfadeStr != "" {
+		zfade, err := bedMeshParseFloat(zfadeStr)
+		if err != nil {
+			return "", fmt.Errorf("invalid ZFADE value: %s", zfadeStr)
+		}
+		bm.toolOffset = zfade
+	}
+
+	return "", nil
+}
+
+// cmdBedMeshProfile handles the BED_MESH_PROFILE command.
+func (bm *bedMesh) cmdBedMeshProfile(args map[string]string) (string, error) {
+	if loadName, ok := args["LOAD"]; ok && loadName != "" {
+		return bm.loadProfile(loadName)
+	}
+	if saveName, ok := args["SAVE"]; ok && saveName != "" {
+		if saveName == "default" {
+			return "Profile 'default' is reserved, please choose another profile name.", nil
+		}
+		return bm.saveProfile(saveName)
+	}
+	if removeName, ok := args["REMOVE"]; ok && removeName != "" {
+		return bm.removeProfile(removeName)
+	}
+	return "Invalid syntax", nil
+}
+
+// saveProfile saves the current mesh to a profile.
+func (bm *bedMesh) saveProfile(name string) (string, error) {
+	if bm.zMesh == nil {
+		return fmt.Sprintf("Unable to save to profile [%s], the bed has not been probed", name), nil
+	}
+
+	bm.profilesMu.Lock()
+	bm.profiles[name] = &bedMeshProfile{
+		Points:     bm.zMesh.GetProbedMatrix(),
+		MeshParams: bm.zMesh.GetMeshParams(),
+	}
+	bm.profilesMu.Unlock()
+
+	bm.updateStatus()
+	log.Printf("bed_mesh: profile [%s] saved", name)
+	return fmt.Sprintf("Bed Mesh state has been saved to profile [%s] for the current session.", name), nil
+}
+
+// loadProfile loads a mesh from a profile.
+func (bm *bedMesh) loadProfile(name string) (string, error) {
+	bm.profilesMu.RLock()
+	profile, ok := bm.profiles[name]
+	bm.profilesMu.RUnlock()
+
+	if !ok {
+		return "", fmt.Errorf("bed_mesh: Unknown profile [%s]", name)
+	}
+
+	mesh, err := newZMesh(profile.MeshParams, name)
+	if err != nil {
+		return "", err
+	}
+	if err := mesh.BuildMesh(profile.Points); err != nil {
+		return "", err
+	}
+	if err := bm.SetMesh(mesh); err != nil {
+		return "", err
+	}
+	log.Printf("bed_mesh: profile [%s] loaded", name)
+	return fmt.Sprintf("Bed Mesh profile [%s] loaded", name), nil
+}
+
+// removeProfile removes a mesh profile.
+func (bm *bedMesh) removeProfile(name string) (string, error) {
+	bm.profilesMu.Lock()
+	_, ok := bm.profiles[name]
+	if ok {
+		delete(bm.profiles, name)
+	}
+	bm.profilesMu.Unlock()
+
+	if !ok {
+		return fmt.Sprintf("No profile named [%s] to remove", name), nil
+	}
+
+	bm.updateStatus()
+	log.Printf("bed_mesh: profile [%s] removed", name)
+	return fmt.Sprintf("Profile [%s] removed from storage for this session.", name), nil
+}
+
+// GetProfiles returns all saved profiles.
+func (bm *bedMesh) GetProfiles() map[string]*bedMeshProfile {
+	bm.profilesMu.RLock()
+	defer bm.profilesMu.RUnlock()
+	result := make(map[string]*bedMeshProfile, len(bm.profiles))
+	for k, v := range bm.profiles {
+		result[k] = v
+	}
+	return result
 }
 
 func (bm *bedMesh) getZFactor(zPos float64) float64 {
@@ -305,7 +598,8 @@ type zMeshParams struct {
 }
 
 type zMesh struct {
-	params zMeshParams
+	params      zMeshParams
+	profileName string
 
 	meshOffsets [2]float64
 
@@ -325,7 +619,7 @@ type zMesh struct {
 	meshMatrix   [][]float64
 }
 
-func newZMesh(params zMeshParams) (*zMesh, error) {
+func newZMesh(params zMeshParams, profileName string) (*zMesh, error) {
 	if params.XCount < 2 || params.YCount < 2 {
 		return nil, fmt.Errorf("bed_mesh: invalid point counts")
 	}
@@ -346,8 +640,12 @@ func newZMesh(params zMeshParams) (*zMesh, error) {
 	}
 	meshXDist := (params.MaxX - params.MinX) / float64(meshXCount-1)
 	meshYDist := (params.MaxY - params.MinY) / float64(meshYCount-1)
+	if profileName == "" {
+		profileName = fmt.Sprintf("adaptive-%p", &params)
+	}
 	return &zMesh{
 		params:       params,
+		profileName:  profileName,
 		meshOffsets:  [2]float64{0.0, 0.0},
 		meshXMin:     params.MinX,
 		meshXMax:     params.MaxX,
@@ -362,6 +660,95 @@ func newZMesh(params zMeshParams) (*zMesh, error) {
 		probedMatrix: nil,
 		meshMatrix:   nil,
 	}, nil
+}
+
+// GetProfileName returns the profile name.
+func (zm *zMesh) GetProfileName() string {
+	return zm.profileName
+}
+
+// GetMeshParams returns the mesh parameters.
+func (zm *zMesh) GetMeshParams() zMeshParams {
+	return zm.params
+}
+
+// GetProbedMatrix returns the probed z-values (rounded to 6 decimal places).
+func (zm *zMesh) GetProbedMatrix() [][]float64 {
+	if zm.probedMatrix == nil {
+		return [][]float64{{}}
+	}
+	result := make([][]float64, len(zm.probedMatrix))
+	for i, row := range zm.probedMatrix {
+		result[i] = make([]float64, len(row))
+		for j, z := range row {
+			result[i][j] = math.Round(z*1e6) / 1e6
+		}
+	}
+	return result
+}
+
+// GetMeshMatrix returns the interpolated mesh matrix (rounded to 6 decimal places).
+func (zm *zMesh) GetMeshMatrix() [][]float64 {
+	if zm.meshMatrix == nil {
+		return [][]float64{{}}
+	}
+	result := make([][]float64, len(zm.meshMatrix))
+	for i, row := range zm.meshMatrix {
+		result[i] = make([]float64, len(row))
+		for j, z := range row {
+			result[i][j] = math.Round(z*1e6) / 1e6
+		}
+	}
+	return result
+}
+
+// GetZRange returns the min and max z values in the mesh.
+func (zm *zMesh) GetZRange() (float64, float64) {
+	if zm.meshMatrix == nil {
+		return 0.0, 0.0
+	}
+	minZ := math.MaxFloat64
+	maxZ := -math.MaxFloat64
+	for _, row := range zm.meshMatrix {
+		for _, z := range row {
+			if z < minZ {
+				minZ = z
+			}
+			if z > maxZ {
+				maxZ = z
+			}
+		}
+	}
+	return minZ, maxZ
+}
+
+// GetZAverage returns the average z value in the mesh (rounded to 2 decimal places).
+func (zm *zMesh) GetZAverage() float64 {
+	if zm.meshMatrix == nil {
+		return 0.0
+	}
+	sum := 0.0
+	count := 0
+	for _, row := range zm.meshMatrix {
+		for _, z := range row {
+			sum += z
+			count++
+		}
+	}
+	if count == 0 {
+		return 0.0
+	}
+	return math.Round((sum/float64(count))*100) / 100
+}
+
+// SetMeshOffsets sets the X/Y mesh offsets.
+func (zm *zMesh) SetMeshOffsets(offsets [2]*float64) {
+	if offsets[0] != nil {
+		zm.meshOffsets[0] = *offsets[0]
+	}
+	if offsets[1] != nil {
+		zm.meshOffsets[1] = *offsets[1]
+	}
 }
 
 func (zm *zMesh) BuildMesh(zMatrix [][]float64) error {
@@ -511,4 +898,11 @@ func constrain(v, lo, hi float64) float64 {
 
 func lerp(t, a, b float64) float64 {
 	return a + t*(b-a)
+}
+
+// bedMeshParseFloat parses a string to float64.
+func bedMeshParseFloat(s string) (float64, error) {
+	var f float64
+	_, err := fmt.Sscanf(s, "%f", &f)
+	return f, err
 }
