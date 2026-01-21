@@ -40,6 +40,15 @@ func (e *extruderAxis) GetName() string          { return e.name }
 func (e *extruderAxis) GetAxisGcodeID() string   { return "E" }
 func (e *extruderAxis) GetTrapQ() *chelper.TrapQ { return e.trapq }
 
+// FindPastPosition returns the extruder position at a given print time.
+// Note: This is a simplified implementation that returns the current position.
+// A more accurate implementation would use itersolve to calculate the position
+// at the specific print time.
+func (e *extruderAxis) FindPastPosition(printTime float64) float64 {
+	// Return the last commanded position (simplified)
+	return e.lastPosition
+}
+
 func (e *extruderAxis) ProcessMove(printTime float64, mv *move, axisIndex int) error {
 	// Add bounds check for axisIndex
 	if axisIndex >= len(mv.axesR) || axisIndex >= len(mv.startPos) || axisIndex >= len(mv.endPos) {

@@ -35,6 +35,13 @@ func newPIDCalibrate(rt *runtime) *PIDCalibrate {
 }
 
 // Calibrate runs PID auto-tuning for a heater.
+// Note: PID calibration requires a real-time heater control loop:
+// 1. Replace the heater's PID controller with ControlAutoTune
+// 2. Run heating cycles while ControlAutoTune.TemperatureUpdate() processes readings
+// 3. After ~12 peaks, CalcFinalPID() returns the optimal parameters
+// For file output mode (golden tests), PID_CALIBRATE commands are not exercised
+// since they require actual heater feedback. The ControlAutoTune algorithm is
+// fully implemented and ready for real-time integration via the reactor system.
 func (pc *PIDCalibrate) Calibrate(heaterName string, target float64, writeFile bool) (kp, ki, kd float64, err error) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
@@ -44,13 +51,13 @@ func (pc *PIDCalibrate) Calibrate(heaterName string, target float64, writeFile b
 	// Create auto-tuning controller
 	_ = newControlAutoTune(1.0, target) // Assume max power = 1.0
 
-	// Note: Full implementation would replace heater control and run heating cycles
-	// This is a simplified placeholder
+	// Full implementation needs reactor-based temperature callback integration:
+	// - Register ControlAutoTune.TemperatureUpdate as the heater's temp callback
+	// - Wait for CheckBusy() to return false (~12 heating cycles)
+	// - Call CalcFinalPID() to get the computed parameters
+	// - Optionally write to config via SAVE_CONFIG
 
-	// Wait for calibration to complete (would be driven by temperature callbacks)
-	// For now, return error indicating not fully implemented
-
-	return 0, 0, 0, fmt.Errorf("PID calibration requires runtime heater integration")
+	return 0, 0, 0, fmt.Errorf("PID calibration requires runtime heater integration (ControlAutoTune algorithm ready)")
 }
 
 // ControlAutoTune performs PID auto-tuning using Ziegler-Nichols method.

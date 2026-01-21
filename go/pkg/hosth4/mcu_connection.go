@@ -118,6 +118,9 @@ type MCUConnection struct {
 	connected      bool
 	shutdown       bool
 	shutdownReason string
+
+	// OID allocation
+	oidCount int // Next OID to allocate (starts at 0)
 	ctx            context.Context
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
@@ -403,6 +406,34 @@ func (mc *MCUConnection) MCUFreq() float64 {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 	return mc.mcuFreq
+}
+
+// CreateOID allocates and returns the next available OID for this MCU.
+// OIDs are used to identify MCU objects (steppers, heaters, sensors, etc.)
+// that need to be referenced in commands.
+// This mirrors klippy/mcu.py MCU.create_oid().
+func (mc *MCUConnection) CreateOID() int {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	oid := mc.oidCount
+	mc.oidCount++
+	return oid
+}
+
+// GetOIDCount returns the current OID count (number of OIDs allocated).
+// This is used to generate the "allocate_oids count=N" config command.
+func (mc *MCUConnection) GetOIDCount() int {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	return mc.oidCount
+}
+
+// ResetOIDCount resets the OID counter to 0.
+// This should only be called during MCU reconnection/reset.
+func (mc *MCUConnection) ResetOIDCount() {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.oidCount = 0
 }
 
 // RegisterHandler registers a handler for a specific message type.

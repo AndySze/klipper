@@ -36,10 +36,11 @@ type EddyCurrentProbe struct {
 }
 
 // EddyCalibration holds calibration data for eddy current probe.
+// Uses piecewise linear interpolation between calibration points (matching Python).
 type EddyCalibration struct {
-	frequencies []float64
-	zPositions  []float64
-	polyCoeffs  []float64 // Polynomial coefficients for freq->z conversion
+	frequencies []float64 // Sorted in ascending order
+	zPositions  []float64 // Corresponding Z positions
+	calibrated  bool      // Whether calibration data has been loaded
 }
 
 // EddyCurrentProbeConfig holds configuration for eddy current probe.
@@ -112,22 +113,55 @@ func (p *EddyCurrentProbe) SetZOffset(offset float64) {
 	p.zOffset = offset
 }
 
+const outOfRange = 99.9
+
 // FrequencyToZ converts frequency to Z position using calibration.
+// Uses piecewise linear interpolation matching Python's apply_calibration.
 func (p *EddyCurrentProbe) FrequencyToZ(freq float64) (float64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if len(p.calibration.polyCoeffs) == 0 {
+	if !p.calibration.calibrated || len(p.calibration.frequencies) < 2 {
 		return 0, fmt.Errorf("probe_eddy_current: not calibrated")
 	}
 
-	// Evaluate polynomial: z = a0 + a1*f + a2*f^2 + ...
-	z := 0.0
-	for i, coeff := range p.calibration.polyCoeffs {
-		z += coeff * math.Pow(freq, float64(i))
+	// Binary search to find position in sorted frequency list
+	pos := bisectRight(p.calibration.frequencies, freq)
+
+	// Handle out of range cases
+	if pos >= len(p.calibration.zPositions) {
+		return -outOfRange, nil
+	}
+	if pos == 0 {
+		return outOfRange, nil
 	}
 
-	return z, nil
+	// Linear interpolation between adjacent points
+	thisFreq := p.calibration.frequencies[pos]
+	prevFreq := p.calibration.frequencies[pos-1]
+	thisZPos := p.calibration.zPositions[pos]
+	prevZPos := p.calibration.zPositions[pos-1]
+
+	// Calculate gain and offset for linear interpolation
+	gain := (thisZPos - prevZPos) / (thisFreq - prevFreq)
+	offset := prevZPos - prevFreq*gain
+	z := freq*gain + offset
+
+	return math.Round(z*1000000) / 1000000, nil // Round to 6 decimal places
+}
+
+// bisectRight returns the insertion point for freq in sorted list a.
+func bisectRight(a []float64, freq float64) int {
+	lo, hi := 0, len(a)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if freq < a[mid] {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
 }
 
 // AddCalibrationPoint adds a calibration point.
@@ -146,23 +180,48 @@ func (p *EddyCurrentProbe) ClearCalibration() {
 
 	p.calibration.frequencies = nil
 	p.calibration.zPositions = nil
-	p.calibration.polyCoeffs = nil
+	p.calibration.calibrated = false
 }
 
-// FitCalibration fits polynomial to calibration data.
-func (p *EddyCurrentProbe) FitCalibration(degree int) error {
+// LoadCalibration loads calibration data from frequency:z pairs.
+// The data is sorted by frequency for efficient lookup.
+func (p *EddyCurrentProbe) LoadCalibration(cal [][2]float64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if len(p.calibration.frequencies) < degree+1 {
-		return fmt.Errorf("probe_eddy_current: need at least %d points for degree %d polynomial",
-			degree+1, degree)
+	if len(cal) < 2 {
+		return fmt.Errorf("probe_eddy_current: need at least 2 calibration points")
 	}
 
-	// Simple polynomial fitting (in real implementation would use proper least squares)
-	// For now, store placeholder coefficients
-	p.calibration.polyCoeffs = make([]float64, degree+1)
-	log.Printf("probe_eddy_current: calibration fitted with %d points", len(p.calibration.frequencies))
+	// Sort by Z position (which maps to frequency inversely) and extract freq/z
+	// Python sorts by (z, freq) then extracts freq and z separately
+	type calPoint struct {
+		freq float64
+		z    float64
+	}
+	points := make([]calPoint, len(cal))
+	for i, c := range cal {
+		points[i] = calPoint{freq: c[0], z: c[1]}
+	}
+
+	// Sort by frequency (ascending)
+	for i := 0; i < len(points)-1; i++ {
+		for j := i + 1; j < len(points); j++ {
+			if points[j].freq < points[i].freq {
+				points[i], points[j] = points[j], points[i]
+			}
+		}
+	}
+
+	p.calibration.frequencies = make([]float64, len(points))
+	p.calibration.zPositions = make([]float64, len(points))
+	for i, pt := range points {
+		p.calibration.frequencies[i] = pt.freq
+		p.calibration.zPositions[i] = pt.z
+	}
+	p.calibration.calibrated = true
+
+	log.Printf("probe_eddy_current: calibration loaded with %d points", len(cal))
 	return nil
 }
 
@@ -173,11 +232,23 @@ func (p *EddyCurrentProbe) UpdateMeasurement(freq float64) {
 
 	p.lastFreq = freq
 
-	if len(p.calibration.polyCoeffs) > 0 {
-		// Convert frequency to Z
-		z := 0.0
-		for i, coeff := range p.calibration.polyCoeffs {
-			z += coeff * math.Pow(freq, float64(i))
+	if p.calibration.calibrated && len(p.calibration.frequencies) >= 2 {
+		// Convert frequency to Z using linear interpolation
+		pos := bisectRight(p.calibration.frequencies, freq)
+
+		var z float64
+		if pos >= len(p.calibration.zPositions) {
+			z = -outOfRange
+		} else if pos == 0 {
+			z = outOfRange
+		} else {
+			thisFreq := p.calibration.frequencies[pos]
+			prevFreq := p.calibration.frequencies[pos-1]
+			thisZPos := p.calibration.zPositions[pos]
+			prevZPos := p.calibration.zPositions[pos-1]
+			gain := (thisZPos - prevZPos) / (thisFreq - prevFreq)
+			offset := prevZPos - prevFreq*gain
+			z = freq*gain + offset
 		}
 		p.lastZ = z
 
@@ -210,6 +281,6 @@ func (p *EddyCurrentProbe) GetStatus() map[string]any {
 		"last_freq":   p.lastFreq,
 		"last_z":      p.lastZ,
 		"triggered":   p.triggered,
-		"calibrated":  len(p.calibration.polyCoeffs) > 0,
+		"calibrated":  p.calibration.calibrated,
 	}
 }

@@ -214,7 +214,7 @@ def filter_fan_lines(lines: list[str], fan_oids: set[int] | None = None) -> list
         fan_oids: Set of OIDs that are fans (default: {16} for printers_einsy)
     """
     if fan_oids is None:
-        fan_oids = {16}  # Default fan OID for printers_einsy
+        fan_oids = {12, 16}  # Common fan OIDs (12=generic-ramps, 16=printers_einsy)
     result = []
     for ln in lines:
         if ln.startswith("queue_digital_out "):

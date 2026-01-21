@@ -27,6 +27,20 @@ type ledState struct {
 	colors     []ledColor // per-chain colors (or single for non-chain types)
 }
 
+// parseLEDColor parses an LED color value from config, returning 0.0 as default.
+// Returns an error if the value is present but cannot be parsed.
+func parseLEDColor(sec map[string]string, key string) (float64, error) {
+	s := strings.TrimSpace(sec[key])
+	if s == "" {
+		return 0.0, nil
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("bad LED color %s=%q: %w", key, s, err)
+	}
+	return v, nil
+}
+
 // sensorOnlyRuntime is a minimal runtime for configs without stepper kinematics.
 type sensorOnlyRuntime struct {
 	cfg     *configWrapper
@@ -150,17 +164,18 @@ func (sor *sensorOnlyRuntime) parseLEDConfigs() error {
 				colors:     make([]ledColor, chainCount),
 			}
 			// Parse initial colors
-			if s := sec["initial_red"]; s != "" {
-				ls.colors[0].R, _ = strconv.ParseFloat(s, 64)
+			var err error
+			if ls.colors[0].R, err = parseLEDColor(sec, "initial_red"); err != nil {
+				return fmt.Errorf("led %s: %w", ledName, err)
 			}
-			if s := sec["initial_green"]; s != "" {
-				ls.colors[0].G, _ = strconv.ParseFloat(s, 64)
+			if ls.colors[0].G, err = parseLEDColor(sec, "initial_green"); err != nil {
+				return fmt.Errorf("led %s: %w", ledName, err)
 			}
-			if s := sec["initial_blue"]; s != "" {
-				ls.colors[0].B, _ = strconv.ParseFloat(s, 64)
+			if ls.colors[0].B, err = parseLEDColor(sec, "initial_blue"); err != nil {
+				return fmt.Errorf("led %s: %w", ledName, err)
 			}
-			if s := sec["initial_white"]; s != "" {
-				ls.colors[0].W, _ = strconv.ParseFloat(s, 64)
+			if ls.colors[0].W, err = parseLEDColor(sec, "initial_white"); err != nil {
+				return fmt.Errorf("led %s: %w", ledName, err)
 			}
 			sor.leds[ledName] = ls
 		}
@@ -182,18 +197,21 @@ func (sor *sensorOnlyRuntime) parseLEDConfigs() error {
 				colors:     make([]ledColor, chainCount),
 			}
 			// Parse initial colors (applies to all LEDs in chain)
-			var initR, initG, initB, initW float64
-			if s := sec["initial_red"]; s != "" {
-				initR, _ = strconv.ParseFloat(s, 64)
+			initR, err := parseLEDColor(sec, "initial_red")
+			if err != nil {
+				return fmt.Errorf("neopixel %s: %w", ledName, err)
 			}
-			if s := sec["initial_green"]; s != "" {
-				initG, _ = strconv.ParseFloat(s, 64)
+			initG, err := parseLEDColor(sec, "initial_green")
+			if err != nil {
+				return fmt.Errorf("neopixel %s: %w", ledName, err)
 			}
-			if s := sec["initial_blue"]; s != "" {
-				initB, _ = strconv.ParseFloat(s, 64)
+			initB, err := parseLEDColor(sec, "initial_blue")
+			if err != nil {
+				return fmt.Errorf("neopixel %s: %w", ledName, err)
 			}
-			if s := sec["initial_white"]; s != "" {
-				initW, _ = strconv.ParseFloat(s, 64)
+			initW, err := parseLEDColor(sec, "initial_white")
+			if err != nil {
+				return fmt.Errorf("neopixel %s: %w", ledName, err)
 			}
 			for i := range ls.colors {
 				ls.colors[i] = ledColor{initR, initG, initB, initW}
@@ -218,15 +236,17 @@ func (sor *sensorOnlyRuntime) parseLEDConfigs() error {
 				colors:     make([]ledColor, chainCount),
 			}
 			// Parse initial colors
-			var initR, initG, initB float64
-			if s := sec["initial_red"]; s != "" {
-				initR, _ = strconv.ParseFloat(s, 64)
+			initR, err := parseLEDColor(sec, "initial_red")
+			if err != nil {
+				return fmt.Errorf("dotstar %s: %w", ledName, err)
 			}
-			if s := sec["initial_green"]; s != "" {
-				initG, _ = strconv.ParseFloat(s, 64)
+			initG, err := parseLEDColor(sec, "initial_green")
+			if err != nil {
+				return fmt.Errorf("dotstar %s: %w", ledName, err)
 			}
-			if s := sec["initial_blue"]; s != "" {
-				initB, _ = strconv.ParseFloat(s, 64)
+			initB, err := parseLEDColor(sec, "initial_blue")
+			if err != nil {
+				return fmt.Errorf("dotstar %s: %w", ledName, err)
 			}
 			for i := range ls.colors {
 				ls.colors[i] = ledColor{initR, initG, initB, 0}
@@ -246,17 +266,18 @@ func (sor *sensorOnlyRuntime) parseLEDConfigs() error {
 				chainCount: 1,
 				colors:     make([]ledColor, 1),
 			}
-			if s := sec["initial_red"]; s != "" {
-				ls.colors[0].R, _ = strconv.ParseFloat(s, 64)
+			var err error
+			if ls.colors[0].R, err = parseLEDColor(sec, "initial_red"); err != nil {
+				return fmt.Errorf("pca9533 %s: %w", ledName, err)
 			}
-			if s := sec["initial_green"]; s != "" {
-				ls.colors[0].G, _ = strconv.ParseFloat(s, 64)
+			if ls.colors[0].G, err = parseLEDColor(sec, "initial_green"); err != nil {
+				return fmt.Errorf("pca9533 %s: %w", ledName, err)
 			}
-			if s := sec["initial_blue"]; s != "" {
-				ls.colors[0].B, _ = strconv.ParseFloat(s, 64)
+			if ls.colors[0].B, err = parseLEDColor(sec, "initial_blue"); err != nil {
+				return fmt.Errorf("pca9533 %s: %w", ledName, err)
 			}
-			if s := sec["initial_white"]; s != "" {
-				ls.colors[0].W, _ = strconv.ParseFloat(s, 64)
+			if ls.colors[0].W, err = parseLEDColor(sec, "initial_white"); err != nil {
+				return fmt.Errorf("pca9533 %s: %w", ledName, err)
 			}
 			sor.leds[ledName] = ls
 		}
@@ -273,17 +294,18 @@ func (sor *sensorOnlyRuntime) parseLEDConfigs() error {
 				chainCount: 1,
 				colors:     make([]ledColor, 1),
 			}
-			if s := sec["initial_red"]; s != "" {
-				ls.colors[0].R, _ = strconv.ParseFloat(s, 64)
+			var err error
+			if ls.colors[0].R, err = parseLEDColor(sec, "initial_red"); err != nil {
+				return fmt.Errorf("pca9632 %s: %w", ledName, err)
 			}
-			if s := sec["initial_green"]; s != "" {
-				ls.colors[0].G, _ = strconv.ParseFloat(s, 64)
+			if ls.colors[0].G, err = parseLEDColor(sec, "initial_green"); err != nil {
+				return fmt.Errorf("pca9632 %s: %w", ledName, err)
 			}
-			if s := sec["initial_blue"]; s != "" {
-				ls.colors[0].B, _ = strconv.ParseFloat(s, 64)
+			if ls.colors[0].B, err = parseLEDColor(sec, "initial_blue"); err != nil {
+				return fmt.Errorf("pca9632 %s: %w", ledName, err)
 			}
-			if s := sec["initial_white"]; s != "" {
-				ls.colors[0].W, _ = strconv.ParseFloat(s, 64)
+			if ls.colors[0].W, err = parseLEDColor(sec, "initial_white"); err != nil {
+				return fmt.Errorf("pca9632 %s: %w", ledName, err)
 			}
 			sor.leds[ledName] = ls
 		}

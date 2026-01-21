@@ -65,14 +65,15 @@ func (qe *QueryEndstops) QueryAll() (map[string]bool, error) {
 	defer qe.mu.Unlock()
 
 	// Query each endstop
-	// Note: In a full implementation, this would send a query command to the MCU
-	// and wait for the response. For now, we return false (not triggered) for all.
 	results := make(map[string]bool)
 	for _, entry := range qe.endstops {
-		// TODO: Implement actual endstop query via MCU command
-		_ = entry.endstop // Use endstop reference
-		_ = printTime     // Use print time
-		results[entry.name] = false
+		triggered, err := entry.endstop.QueryEndstop(printTime)
+		if err != nil {
+			// Log error but continue querying other endstops
+			results[entry.name] = false
+			continue
+		}
+		results[entry.name] = triggered
 	}
 
 	// Update last state

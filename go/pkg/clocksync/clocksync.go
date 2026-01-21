@@ -1,5 +1,15 @@
 // Package clocksync provides micro-controller clock synchronization.
 // This is the Go equivalent of klippy/clocksync.py.
+//
+// For real-time MCU connection, the ClockSync type tracks the relationship
+// between host system time and MCU clock ticks using linear regression.
+// SecondarySync extends this for multi-MCU setups where secondary MCUs
+// are synchronized to a primary MCU's print_time coordinate system.
+//
+// Integration with hosth4: The clocksync package is ready for real-time use.
+// In file output mode, timing uses the simpler mcuFreq-based calculation
+// (print_time * mcuFreq = clock). For actual MCU connections, ClockSync
+// maintains drift-corrected estimates via get_clock/uptime command responses.
 package clocksync
 
 import (

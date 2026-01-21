@@ -337,15 +337,53 @@ type ConfigCommand struct {
 }
 
 // AllocateOID allocates an OID from the primary MCU.
+// OIDs are unique identifiers for MCU objects (steppers, heaters, sensors, etc.).
+// This mirrors klippy/mcu.py MCU.create_oid().
 func (m *MCUManager) AllocateOID() (int, error) {
-	// In real implementation, this would request an OID from the MCU
-	// For now, we'll use a simple counter approach
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	primary := m.primary
+	m.mu.RUnlock()
 
-	// This would typically be tracked per-MCU
-	// For now, return a simple incrementing value
-	return 0, fmt.Errorf("OID allocation not yet implemented")
+	if primary == nil {
+		return 0, fmt.Errorf("no primary MCU configured")
+	}
+	return primary.CreateOID(), nil
+}
+
+// AllocateOIDOnMCU allocates an OID from a specific MCU.
+func (m *MCUManager) AllocateOIDOnMCU(mcuName string) (int, error) {
+	m.mu.RLock()
+	mcu := m.mcus[mcuName]
+	m.mu.RUnlock()
+
+	if mcu == nil {
+		return 0, fmt.Errorf("unknown MCU: %s", mcuName)
+	}
+	return mcu.CreateOID(), nil
+}
+
+// GetOIDCount returns the number of OIDs allocated on the primary MCU.
+func (m *MCUManager) GetOIDCount() int {
+	m.mu.RLock()
+	primary := m.primary
+	m.mu.RUnlock()
+
+	if primary == nil {
+		return 0
+	}
+	return primary.GetOIDCount()
+}
+
+// GetOIDCountOnMCU returns the number of OIDs allocated on a specific MCU.
+func (m *MCUManager) GetOIDCountOnMCU(mcuName string) int {
+	m.mu.RLock()
+	mcu := m.mcus[mcuName]
+	m.mu.RUnlock()
+
+	if mcu == nil {
+		return 0
+	}
+	return mcu.GetOIDCount()
 }
 
 // GetStatus returns status information about all MCUs.

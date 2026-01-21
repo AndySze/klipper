@@ -333,6 +333,9 @@ func (r *Reader) processMessage(data []byte) {
 	var msgName string
 	var msgParams map[string]interface{}
 
+	// Debug: log received message IDs (uncomment for debugging)
+	// fmt.Printf("[Reader] Received msgID=%d (0x%x) payload=%x\n", msgID, uint32(msgID), payload)
+
 	// Check responses first
 	for format, id := range r.dict.Responses {
 		if id == int(msgID) {
