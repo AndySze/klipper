@@ -209,6 +209,10 @@ type extruderStepperCfg struct {
 	microsteps       int
 	fullSteps        int
 	rotationDistance float64
+
+	// Pressure advance settings
+	pressureAdvance           float64 // default: 0.0
+	pressureAdvanceSmoothTime float64 // default: 0.040
 }
 
 func readStepper(cfg *configWrapper, axis byte) (stepperCfg, error) {
@@ -491,15 +495,27 @@ func readExtruderStepper(cfg *configWrapper) (extruderStepperCfg, error) {
 		return extruderStepperCfg{}, err
 	}
 
+	// Read pressure advance settings (optional, default to 0.0 and 0.040)
+	pressureAdvance, err := sec.GetFloat("pressure_advance", 0.0)
+	if err != nil {
+		return extruderStepperCfg{}, err
+	}
+	pressureAdvanceSmoothTime, err := sec.GetFloat("pressure_advance_smooth_time", 0.040)
+	if err != nil {
+		return extruderStepperCfg{}, err
+	}
+
 	return extruderStepperCfg{
-		name:             secName,
-		extruderName:     "",
-		stepPin:          stepPin,
-		dirPin:           dirPin,
-		enablePin:        enablePin,
-		microsteps:       microsteps,
-		fullSteps:        fullSteps,
-		rotationDistance: rotationDistance,
+		name:                      secName,
+		extruderName:              "",
+		stepPin:                   stepPin,
+		dirPin:                    dirPin,
+		enablePin:                 enablePin,
+		microsteps:                microsteps,
+		fullSteps:                 fullSteps,
+		rotationDistance:          rotationDistance,
+		pressureAdvance:           pressureAdvance,
+		pressureAdvanceSmoothTime: pressureAdvanceSmoothTime,
 	}, nil
 }
 
@@ -538,15 +554,27 @@ func readExtruderStepperOptional(cfg *configWrapper, secName string) (extruderSt
 		return extruderStepperCfg{}, false, err
 	}
 
+	// Read pressure advance settings (optional, default to 0.0 and 0.040)
+	pressureAdvance, err := sec.GetFloat("pressure_advance", 0.0)
+	if err != nil {
+		return extruderStepperCfg{}, false, err
+	}
+	pressureAdvanceSmoothTime, err := sec.GetFloat("pressure_advance_smooth_time", 0.040)
+	if err != nil {
+		return extruderStepperCfg{}, false, err
+	}
+
 	return extruderStepperCfg{
-		name:             secName,
-		extruderName:     extruderName,
-		stepPin:          stepPin,
-		dirPin:           dirPin,
-		enablePin:        enablePin,
-		microsteps:       microsteps,
-		fullSteps:        fullSteps,
-		rotationDistance: rotationDistance,
+		name:                      secName,
+		extruderName:              extruderName,
+		stepPin:                   stepPin,
+		dirPin:                    dirPin,
+		enablePin:                 enablePin,
+		microsteps:                microsteps,
+		fullSteps:                 fullSteps,
+		rotationDistance:          rotationDistance,
+		pressureAdvance:           pressureAdvance,
+		pressureAdvanceSmoothTime: pressureAdvanceSmoothTime,
 	}, true, nil
 }
 

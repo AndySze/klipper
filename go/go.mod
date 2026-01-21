@@ -6,4 +6,7 @@ toolchain go1.24.11
 
 require golang.org/x/sys v0.40.0
 
-require github.com/gorilla/websocket v1.5.3 // indirect
+require (
+	github.com/gorilla/websocket v1.5.3 // indirect
+	gonum.org/v1/gonum v0.17.0 // indirect
+)

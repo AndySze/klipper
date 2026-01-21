@@ -1928,6 +1928,10 @@ type runtime struct {
 	extraStepperEn  *stepperEnablePin
 	pressureAdvance map[string]*pressureAdvanceState
 
+	// Dynamic extruder stepper registry (keyed by extruder name)
+	// This maps extruder names to their steppers for PA and other operations.
+	extruderSteppers map[string]*stepper
+
 	endstops [3]*endstop
 
 	gm            *gcodeMove
@@ -2028,6 +2032,47 @@ type runtime struct {
 type pressureAdvanceState struct {
 	advance    float64
 	smoothTime float64
+}
+
+// RegisterExtruderStepper adds an extruder stepper to the dynamic registry.
+// This allows SET_PRESSURE_ADVANCE to work with the stepper by name.
+func (r *runtime) RegisterExtruderStepper(name string, st *stepper) {
+	if r.extruderSteppers == nil {
+		r.extruderSteppers = make(map[string]*stepper)
+	}
+	r.extruderSteppers[name] = st
+}
+
+// GetExtruderStepper returns an extruder stepper by name from the registry.
+func (r *runtime) GetExtruderStepper(name string) *stepper {
+	if r.extruderSteppers == nil {
+		return nil
+	}
+	return r.extruderSteppers[name]
+}
+
+// ListExtruderSteppers returns a list of all registered extruder stepper names.
+func (r *runtime) ListExtruderSteppers() []string {
+	if r.extruderSteppers == nil {
+		return nil
+	}
+	names := make([]string, 0, len(r.extruderSteppers))
+	for name := range r.extruderSteppers {
+		names = append(names, name)
+	}
+	return names
+}
+
+// GetExtruderPressureAdvance returns the current PA state for an extruder.
+func (r *runtime) GetExtruderPressureAdvance(name string) (advance, smoothTime float64, ok bool) {
+	if r.pressureAdvance == nil {
+		return 0, 0, false
+	}
+	st := r.pressureAdvance[name]
+	if st == nil {
+		return 0, 0, false
+	}
+	return st.advance, st.smoothTime, true
 }
 
 // dualCarriageState stores the saved state for dual carriage operations.
@@ -3101,7 +3146,10 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		extraStepper:    extraStepper,
 		extraStepperEn:  extraStepperEn,
 		pressureAdvance: map[string]*pressureAdvanceState{
-			"extruder": &pressureAdvanceState{advance: 0.0, smoothTime: 0.040},
+			"extruder": &pressureAdvanceState{
+				advance:    extruderCfg.pressureAdvance,
+				smoothTime: extruderCfg.pressureAdvanceSmoothTime,
+			},
 		},
 		motorOffOrder:  motorOffOrder,
 		mcu:            mcu,
@@ -3111,7 +3159,10 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 		activeExtruder: "extruder",
 	}
 	if hasExtraStepper {
-		rt.pressureAdvance["my_extra_stepper"] = &pressureAdvanceState{advance: 0.0, smoothTime: 0.040}
+		rt.pressureAdvance["my_extra_stepper"] = &pressureAdvanceState{
+			advance:    extraStepperCfg.pressureAdvance,
+			smoothTime: extraStepperCfg.pressureAdvanceSmoothTime,
+		}
 	}
 
 	// Match Klippy: recompute kin_flush_delay based on itersolve scan windows
@@ -3125,6 +3176,38 @@ func newRuntime(cfgPath string, dict *protocol.Dictionary, cfg *configWrapper) (
 			allSteppers = append(allSteppers, extraStepper)
 		}
 		rt.motion.checkStepGenerationScanWindows(allSteppers)
+	}
+
+	// Initialize pressure advance from config for extruder steppers.
+	// This matches klippy/kinematics/extruder.py connect phase initialization.
+	if stE != nil && stE.sk != nil {
+		pa := extruderCfg.pressureAdvance
+		smoothTime := extruderCfg.pressureAdvanceSmoothTime
+		if pa == 0.0 {
+			smoothTime = 0.0 // When PA is disabled, smooth_time is also 0
+		}
+		if err := stE.sk.SetPressureAdvance(0.0, pa, smoothTime); err != nil {
+			return nil, fmt.Errorf("initialize extruder pressure advance: %w", err)
+		}
+	}
+	if extraStepper != nil && extraStepper.sk != nil {
+		pa := extraStepperCfg.pressureAdvance
+		smoothTime := extraStepperCfg.pressureAdvanceSmoothTime
+		if pa == 0.0 {
+			smoothTime = 0.0
+		}
+		if err := extraStepper.sk.SetPressureAdvance(0.0, pa, smoothTime); err != nil {
+			return nil, fmt.Errorf("initialize extra stepper pressure advance: %w", err)
+		}
+	}
+
+	// Initialize extruder stepper registry for dynamic PA lookup
+	rt.extruderSteppers = make(map[string]*stepper)
+	if stE != nil {
+		rt.extruderSteppers["extruder"] = stE
+	}
+	if extraStepper != nil {
+		rt.extruderSteppers["my_extra_stepper"] = extraStepper
 	}
 
 	rt.gm = newGCodeMove(th, mmPerArcSegment)
@@ -7326,7 +7409,11 @@ func (r *runtime) cmdSetExtruderRotationDistance(args map[string]string) error {
 
 func (r *runtime) cmdSetPressureAdvance(args map[string]string) error {
 	// SET_PRESSURE_ADVANCE [EXTRUDER=<name>] [ADVANCE=<value>] [SMOOTH_TIME=<value>]
-	extruderName := "extruder"
+	// Default to currently active extruder if EXTRUDER not specified
+	extruderName := r.activeExtruder
+	if extruderName == "" {
+		extruderName = "extruder"
+	}
 	if en, ok := args["EXTRUDER"]; ok && en != "" {
 		extruderName = en
 	}
@@ -7355,14 +7442,21 @@ func (r *runtime) cmdSetPressureAdvance(args map[string]string) error {
 		return fmt.Errorf("SMOOTH_TIME must be between 0.0 and 0.200")
 	}
 
+	// Look up extruder stepper from dynamic registry
 	var targetStepper *stepper
-	switch extruderName {
-	case "extruder":
-		targetStepper = r.stepperE
-	case "my_extra_stepper":
-		targetStepper = r.extraStepper
-	default:
-		return fmt.Errorf("unknown extruder %q", extruderName)
+	if r.extruderSteppers != nil {
+		targetStepper = r.extruderSteppers[extruderName]
+	}
+	// Fallback to legacy hardcoded lookup for runtimes that don't initialize the registry
+	if targetStepper == nil {
+		switch extruderName {
+		case "extruder":
+			targetStepper = r.stepperE
+		case "extruder1":
+			targetStepper = r.stepperE1
+		case "my_extra_stepper":
+			targetStepper = r.extraStepper
+		}
 	}
 	if targetStepper == nil || targetStepper.sk == nil {
 		return fmt.Errorf("pressure advance requires an extruder stepper for %q", extruderName)
@@ -7488,17 +7582,26 @@ func (r *runtime) cmdSyncExtruderMotion(args map[string]string) error {
 		return err
 	}
 
+	// Look up target stepper from dynamic registry first
 	var targetStepper *stepper
-	switch extruderName {
-	case "extruder":
-		targetStepper = r.stepperE
-	case "my_extra_stepper":
-		if !r.hasExtraStepper {
-			return fmt.Errorf("SYNC_EXTRUDER_MOTION: extruder_stepper not configured")
+	if r.extruderSteppers != nil {
+		targetStepper = r.extruderSteppers[extruderName]
+	}
+	// Fallback to legacy hardcoded lookup
+	if targetStepper == nil {
+		switch extruderName {
+		case "extruder":
+			targetStepper = r.stepperE
+		case "extruder1":
+			targetStepper = r.stepperE1
+		case "my_extra_stepper":
+			if !r.hasExtraStepper {
+				return fmt.Errorf("SYNC_EXTRUDER_MOTION: extruder_stepper not configured")
+			}
+			targetStepper = r.extraStepper
+		default:
+			return fmt.Errorf("SYNC_EXTRUDER_MOTION: unknown extruder %q", extruderName)
 		}
-		targetStepper = r.extraStepper
-	default:
-		return fmt.Errorf("SYNC_EXTRUDER_MOTION: unknown extruder %q", extruderName)
 	}
 	if targetStepper == nil || targetStepper.sk == nil {
 		return fmt.Errorf("SYNC_EXTRUDER_MOTION: missing stepper for %q", extruderName)
@@ -7510,19 +7613,27 @@ func (r *runtime) cmdSyncExtruderMotion(args map[string]string) error {
 		r.tracef("SYNC_EXTRUDER_MOTION: %s -> (disconnected)\n", extruderName)
 		return nil
 	}
-	if motionQueue != "extruder" {
+
+	// Look up target motion queue (extruder axis)
+	var targetExtruder *extruderAxis
+	switch motionQueue {
+	case "extruder":
+		targetExtruder = r.extruder
+	case "extruder1":
+		targetExtruder = r.extruder1
+	default:
 		return fmt.Errorf("SYNC_EXTRUDER_MOTION: unknown motion queue %q", motionQueue)
 	}
-	if r.extruder == nil || r.extruder.trapq == nil {
-		return fmt.Errorf("SYNC_EXTRUDER_MOTION: extruder motion queue not available")
+	if targetExtruder == nil || targetExtruder.trapq == nil {
+		return fmt.Errorf("SYNC_EXTRUDER_MOTION: motion queue %q not available", motionQueue)
 	}
 
 	// Match Klippy: set the stepper position to the extruder's last position.
 	// For extruder steppers, position is 1D (x coordinate only).
-	targetStepper.setPosition(r.extruder.lastPosition, 0.0, 0.0)
-	targetStepper.setTrapQ(r.extruder.trapq)
+	targetStepper.setPosition(targetExtruder.lastPosition, 0.0, 0.0)
+	targetStepper.setTrapQ(targetExtruder.trapq)
 	r.updateKinFlushDelay()
-	r.tracef("SYNC_EXTRUDER_MOTION: %s -> extruder (connected)\n", extruderName)
+	r.tracef("SYNC_EXTRUDER_MOTION: %s -> %s (connected)\n", extruderName, motionQueue)
 	return nil
 }
 
@@ -10516,6 +10627,8 @@ func (mrt *multiMCURuntime) free() {
 // cmdSetDualCarriage handles the SET_DUAL_CARRIAGE command.
 // This switches between the primary (CARRIAGE=0) and secondary (CARRIAGE=1) carriage.
 // cmdActivateExtruder handles the ACTIVATE_EXTRUDER command.
+// This switches the active extruder and restores the filament position.
+// Matches Python's cmd_ACTIVATE_EXTRUDER in klippy/kinematics/extruder.py
 func (r *runtime) cmdActivateExtruder(args map[string]string) error {
 	extruderName := strings.ToLower(strings.TrimSpace(args["EXTRUDER"]))
 	if extruderName == "" {
@@ -10528,15 +10641,77 @@ func (r *runtime) cmdActivateExtruder(args map[string]string) error {
 	}
 
 	// Check if extruder1 exists if trying to activate it
-	if extruderName == "extruder1" && r.stepperE1 == nil {
+	if extruderName == "extruder1" && r.extruder1 == nil {
 		return fmt.Errorf("extruder1 not configured")
 	}
 
-	// Update active extruder
-	r.activeExtruder = extruderName
-	r.tracef("ACTIVATE_EXTRUDER: activated %s\n", extruderName)
+	// Skip if already active
+	if r.activeExtruder == extruderName {
+		r.tracef("ACTIVATE_EXTRUDER: %s already active\n", extruderName)
+		return nil
+	}
 
+	// Get old and new extruder references
+	var oldExtruder, newExtruder *extruderAxis
+	if r.activeExtruder == "extruder" {
+		oldExtruder = r.extruder
+	} else {
+		oldExtruder = r.extruder1
+	}
+	if extruderName == "extruder" {
+		newExtruder = r.extruder
+	} else {
+		newExtruder = r.extruder1
+	}
+
+	if oldExtruder == nil || newExtruder == nil {
+		return fmt.Errorf("extruder reference is nil")
+	}
+
+	// Flush pending moves before switching (matches Python's toolhead.flush_step_generation())
+	if err := r.toolhead.flushStepGeneration(); err != nil {
+		return fmt.Errorf("ACTIVATE_EXTRUDER: flush failed: %w", err)
+	}
+
+	// Save current E position to old extruder's lastPosition
+	if len(r.toolhead.commandedPos) > 3 {
+		oldExtruder.lastPosition = r.toolhead.commandedPos[3]
+		r.tracef("ACTIVATE_EXTRUDER: saved %s position=%.6f\n", r.activeExtruder, oldExtruder.lastPosition)
+	}
+
+	// Update active extruder name
+	r.activeExtruder = extruderName
+
+	// Update toolhead's extra axis reference
+	if len(r.toolhead.extraAxes) > 0 {
+		r.toolhead.extraAxes[0] = newExtruder
+	}
+
+	// Restore new extruder's position to toolhead
+	if len(r.toolhead.commandedPos) > 3 {
+		r.toolhead.commandedPos[3] = newExtruder.lastPosition
+		r.tracef("ACTIVATE_EXTRUDER: restored %s position=%.6f\n", extruderName, newExtruder.lastPosition)
+	}
+
+	r.tracef("ACTIVATE_EXTRUDER: switched to %s\n", extruderName)
 	return nil
+}
+
+// getExtruderByName returns the extruder axis by name.
+func (r *runtime) getExtruderByName(name string) *extruderAxis {
+	switch name {
+	case "extruder":
+		return r.extruder
+	case "extruder1":
+		return r.extruder1
+	default:
+		return nil
+	}
+}
+
+// getActiveExtruder returns the currently active extruder axis.
+func (r *runtime) getActiveExtruder() *extruderAxis {
+	return r.getExtruderByName(r.activeExtruder)
 }
 
 func (r *runtime) cmdSetDualCarriage(args map[string]string) error {

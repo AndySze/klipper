@@ -440,3 +440,16 @@ func (m *MCUManager) ListMCUs() []MCUStatusInfo {
 	}
 	return infos
 }
+
+// GetAllMCUs returns a copy of all MCU connections.
+// The map is safe to iterate without holding locks.
+func (m *MCUManager) GetAllMCUs() map[string]*MCUConnection {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make(map[string]*MCUConnection, len(m.mcus))
+	for name, conn := range m.mcus {
+		result[name] = conn
+	}
+	return result
+}

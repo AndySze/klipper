@@ -1092,3 +1092,55 @@ func (mc *MCUConnection) tracef(format string, args ...interface{}) {
 		fmt.Fprintf(mc.config.Trace, format, args...)
 	}
 }
+
+// SendEmergencyStop sends the emergency_stop command to the MCU.
+// This command immediately halts all MCU operations.
+func (mc *MCUConnection) SendEmergencyStop() error {
+	mc.mu.RLock()
+	connected := mc.connected
+	shutdown := mc.shutdown
+	mc.mu.RUnlock()
+
+	if !connected {
+		return ErrMCUNotConnected
+	}
+
+	if shutdown {
+		// Already shutdown, send anyway to ensure MCU stops
+	}
+
+	mc.tracef("MCU %s: Sending emergency_stop\n", mc.name)
+
+	// Send emergency_stop command (no response expected)
+	return mc.SendCommand("emergency_stop", nil)
+}
+
+// ForceLocalShutdown marks the MCU as shutdown locally without sending commands.
+// This is used when the MCU is unresponsive and we need to update local state.
+func (mc *MCUConnection) ForceLocalShutdown() {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	mc.shutdown = true
+	mc.shutdownReason = "forced local shutdown"
+	mc.tracef("MCU %s: Forced local shutdown\n", mc.name)
+}
+
+// IsShutdown returns true if the MCU is in shutdown state.
+func (mc *MCUConnection) IsShutdown() bool {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	return mc.shutdown
+}
+
+// ShutdownReason returns the shutdown reason.
+func (mc *MCUConnection) ShutdownReason() string {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	return mc.shutdownReason
+}
+
+// Name returns the MCU name.
+func (mc *MCUConnection) Name() string {
+	return mc.name // immutable, no lock needed
+}

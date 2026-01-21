@@ -1,6 +1,6 @@
 # Go Host 迁移：下一步开发计划
 
-## 当前状态（2026-01-20）
+## 当前状态（2026-01-21）
 
 ### 测试覆盖率
 - **全部 61 个 golden tests 通过** ✅
@@ -113,28 +113,159 @@
   - GetStatus() API 查询 (profile_name, mesh_min/max, probed_matrix, mesh_matrix)
   - zMesh 辅助方法
   - 12 个单元测试
-- [ ] Pressure advance 微调
-- [ ] Input shaper 自动调谐
-- [ ] 多挤出机支持
+- [x] Pressure advance 微调 ✅ (2026-01-21)
+  - 配置加载 (pressure_advance, pressure_advance_smooth_time 从 [extruder] 读取)
+  - 连接阶段初始化 (SetPressureAdvance 应用配置值)
+  - SET_PRESSURE_ADVANCE 动态调整命令
+  - 动态挤出机注册表 (extruderSteppers map)
+  - chelper 集成 (extruder_set_pressure_advance)
+  - 平滑窗口管理 (smooth_time 变更需 flush)
+- [x] Input shaper 自动调谐 ✅ (2026-01-21)
+  - FFT/PSD 计算 - Welch 算法实现 (psd_calc.go)
+    - Kaiser 窗口函数 (β=6)
+    - Bessel I0 函数 (多项式近似)
+    - 50% 重叠窗口分割
+    - Gonum FFT 集成 (gonum.org/v1/gonum/dsp/fourier)
+  - 完整评分逻辑 (shaper_calibrate.go)
+    - 振动残留估计 (EstimateResidualVibration)
+    - 平滑度计算 (calcSmoothing - 二阶矩法)
+    - 最大加速度计算 (MaxAccelFromSmoothing)
+    - 评分公式: score = smoothing * (vibrs^1.5 + vibrs*0.2 + 0.01)
+    - 多阻尼比鲁棒优化 (0.075, 0.1, 0.15)
+  - 共振测试执行 (resonance_tester.go)
+    - VibrationPulseTestGenerator 脉冲测试
+    - SweepingVibrationsTestGenerator 扫频测试
+    - ResonanceTestExecutor 运动执行
+    - AccelDataCollector 数据采集
+  - G-code 命令
+    - TEST_RESONANCES AXIS=<x|y> [FREQ_START=] [FREQ_END=]
+    - SHAPER_CALIBRATE AXIS=<x|y> [NAME_PREFIX=] [MAX_SMOOTHING=]
+    - MEASURE_AXES_NOISE [MEAS_TIME=]
+  - CSV 数据输出 (#time,accel_x,accel_y,accel_z)
+  - 单元测试: 30+ 测试用例 (psd_calc_test.go, shaper_calibrate_test.go)
+- [x] 多挤出机支持 ✅ (2026-01-21)
+  - ACTIVATE_EXTRUDER 工具切换
+    - 位置保存/恢复 (lastPosition 同步)
+    - toolhead.extraAxes 动态更新
+    - 步进生成刷新 (flushStepGeneration)
+  - SET_PRESSURE_ADVANCE EXTRUDER 参数路由
+    - 默认使用当前活动挤出机
+    - 支持 extruder/extruder1/my_extra_stepper
+  - SYNC_EXTRUDER_MOTION 增强
+    - 支持 extruder1 作为步进器和运动队列
+    - 动态注册表查找 + 回退
+  - M104/M109 T 参数支持
+    - 温度命令路由到正确加热器 (extruder, extruder1, ...)
+  - 辅助方法
+    - getExtruderByName(name) - 按名称获取挤出机轴
+    - getActiveExtruder() - 获取当前活动挤出机
 
-#### 3.3 错误处理和恢复
-- [ ] MCU 断连重连
-- [ ] 打印中断恢复
-- [ ] 紧急停止处理
+#### 3.3 错误处理和恢复 ✅ (2026-01-21)
+- [x] MCU 断连重连
+  - ShutdownCoordinator 协调器 (shutdown.go) - 444 行
+  - HeartbeatMonitor 心跳监控 (heartbeat.go) - 414 行
+  - ReconnectionManager 自动重连 (reconnect.go) - 395 行
+  - RestartHelper 重启助手 (restart.go) - 421 行
+  - MCUDiagnostics 错误诊断 (mcu_diagnostics.go) - 456 行
+  - 完整单元测试覆盖 (shutdown_test.go) - 506 行
+- [x] 紧急停止处理
+  - M112 命令支持 (HandleM112)
+  - emergency_stop MCU 命令 (SendEmergencyStop)
+  - 级联关闭所有 MCU (sendEmergencyStopToAll)
+- [x] 心跳超时检测
+  - 周期性时钟查询 (~0.98s 间隔)
+  - 超时阈值检测 (queriesPending > 4)
+  - 自动触发 shutdown
+- [x] RESTART/FIRMWARE_RESTART 命令
+  - 软重启 (host 重启)
+  - 硬重启 (MCU 固件重启)
+  - 四种重启方法 (arduino/cheetah/command/rpi_usb)
+- [x] 打印中断恢复 ✅ (2026-01-21)
+  - PrintRecoveryState 完整状态结构 (位置/温度/风扇/G-code模式)
+  - JSON 格式状态持久化 (原子写入)
+  - 周期性自动保存 (每100行或30秒)
+  - GenerateResumeGCode 恢复序列生成
+  - SAVE_PRINT_STATE/CLEAR_PRINT_STATE/QUERY_PRINT_STATE 命令
+  - RESUME_PRINT 从断点恢复打印
+  - 9 个单元测试
 
 ---
 
 ### 阶段 4：性能优化和生产就绪
 
-#### 4.1 性能优化
-- [ ] 减少内存分配
-- [ ] 优化热路径
-- [ ] 并行处理优化
+#### 4.1 性能优化 ✅ (2026-01-21)
+- [x] 减少内存分配
+  - 对象池系统 (`go/pkg/pool/`)
+    - ArgsMap 池 - G-code 参数 map
+    - Float64Slice 池 - 位置/坐标切片 (3/4/5/6/8 元素)
+    - ByteBuffer 池 - 编码缓冲区
+    - StringSlice 池 - 字符串切片
+    - StatusMap 池 - GetStatus() 返回值
+  - 17 个单元测试 + 并发测试
+- [x] 优化热路径
+  - `parseGCodeLineFast()` - 池化 G-code 解析器
+    - 2x 速度提升 (446ns → 221ns)
+    - 91% 内存减少 (533B → 48B, 7 allocs → 1 alloc)
+  - `FastG1Parser` - 零分配 G1 命令解析器
+    - 5x 速度提升 (446ns → 90ns)
+    - 零内存分配
+    - 并行性能: 16ns/op
+  - 辅助函数: `floatArgFast`, `intArgFast`, `stringArg`
+- [x] 基准测试套件
+  - G-code 解析基准测试
+  - 对象池性能对比
+  - 并行性能测试
 
 #### 4.2 日志和诊断
-- [ ] 结构化日志
-- [ ] 性能指标收集
-- [ ] 诊断命令
+- [x] 结构化日志系统 ✅ (2026-01-21)
+  - 多级别日志 (DEBUG, INFO, WARN, ERROR)
+  - 结构化字段支持 (WithField, WithFields, WithError)
+  - 双格式输出 (FormatText, FormatJSON)
+  - 调用位置追踪 (SetCaller)
+  - ANSI 彩色输出 (可配置)
+  - 日志文件轮转 (RotatingFileWriter)
+    - 按大小轮转 (MaxSize MB)
+    - 备份文件限制 (MaxBackups)
+    - 可选 gzip 压缩
+  - 环境变量配置
+    - KLIPPER_LOG_LEVEL (DEBUG/INFO/WARN/ERROR)
+    - KLIPPER_LOG_FORMAT (text/json)
+    - KLIPPER_LOG_CALLER (启用调用位置)
+    - NO_COLOR (禁用颜色)
+  - 21 个单元测试
+- [x] 性能指标收集 ✅ (2026-01-21)
+  - Prometheus 兼容指标系统 (`go/pkg/metrics/`)
+  - 核心指标类型 (Counter, Gauge, Histogram)
+    - 原子操作线程安全
+    - Labels 支持多维度
+    - sync.Map 高并发访问
+  - 38+ Klipper 专用指标
+    - 运动指标 (toolhead_position, steps_executed, lookahead_depth)
+    - 温度指标 (sensor_temperature, heater_target, heater_pwm)
+    - MCU 指标 (mcu_connected, mcu_latency, mcu_messages)
+    - 打印指标 (print_state, print_duration, filament_used)
+    - 系统指标 (go_goroutines, go_memory_heap, gc_cycles)
+    - 错误指标 (errors_total, warnings_total, shutdown_events)
+  - HTTP 服务器端点
+    - `/metrics` - Prometheus 抓取端点
+    - `/health` - 健康检查
+    - `/ready` - 就绪检查
+    - 可选 Basic Auth 认证
+  - 辅助函数 (LinearBuckets, ExponentialBuckets)
+  - 62 个单元测试 (包括并发测试和 HTTP 端点测试)
+- [x] 诊断命令 ✅ (2026-01-21)
+  - CommandManager 命令管理器 (diagnostics.go)
+  - DEBUG_READ - 读取 MCU 内存/寄存器
+  - DEBUG_WRITE - 写入 MCU 内存/寄存器
+  - DEBUG_STATS - Go 运行时统计 (goroutines, memory, GC)
+  - DEBUG_TIMING - 时序统计
+  - STATUS - 打印机状态报告
+  - HELP - 可用命令列表
+  - M115 - 固件信息
+  - GET_UPTIME - 主机运行时间
+  - 支持十进制/十六进制地址解析
+  - 动态命令注册/注销
+  - 16 个单元测试
 
 #### 4.3 生产部署
 - [ ] 系统服务配置

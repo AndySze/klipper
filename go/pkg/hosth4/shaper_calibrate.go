@@ -18,10 +18,21 @@ import (
 )
 
 const (
-	calibrateMinFreq      = 5.0
-	calibrateMaxFreq      = 200.0
-	calibrateWindowTSec   = 0.5
+	calibrateMinFreq       = 5.0
+	calibrateMaxFreq       = 200.0
+	calibrateWindowTSec    = 0.5
 	calibrateMaxShaperFreq = 150.0
+
+	// Default square corner velocity for smoothing calculation
+	defaultSCV = 5.0
+
+	// Frequency resolution for shaper fitting (Hz)
+	freqStep = 1.0
+
+	// Scoring formula coefficients: score = smoothing * (vibrs^1.5 + vibrs*0.2 + 0.01)
+	vibrPower  = 1.5
+	vibrCoef   = 0.2
+	vibrOffset = 0.01
 )
 
 // Test damping ratios for calibration.
@@ -129,18 +140,27 @@ type CalibrationResult struct {
 
 // ShaperCalibrate provides input shaper calibration.
 type ShaperCalibrate struct {
-	rt *runtime
-	mu sync.Mutex
+	rt  *runtime
+	scv float64 // Square corner velocity
+	mu  sync.Mutex
 }
 
 // newShaperCalibrate creates a new shaper calibrator.
 func newShaperCalibrate(rt *runtime) *ShaperCalibrate {
 	sc := &ShaperCalibrate{
-		rt: rt,
+		rt:  rt,
+		scv: defaultSCV,
 	}
 
 	log.Printf("shaper_calibrate: initialized")
 	return sc
+}
+
+// SetSCV sets the square corner velocity used for smoothing calculations.
+func (sc *ShaperCalibrate) SetSCV(scv float64) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.scv = scv
 }
 
 // EstimateShaper estimates the best shaper for the given calibration data.
@@ -179,41 +199,86 @@ func (sc *ShaperCalibrate) EstimateShaper(calibData *CalibrationData, axis strin
 	return bestResult, nil
 }
 
-// fitShaper fits a shaper to the given PSD data.
+// fitShaper fits a shaper to the given PSD data, matching Python's fit_shaper().
+// It tests all frequency/damping combinations and returns the one with best score.
 func (sc *ShaperCalibrate) fitShaper(freqBins, psd []float64, shaperName string, shaper *InputShaperCfg, maxSmoothing float64) *CalibrationResult {
-	// Try different frequencies and damping ratios
-	var bestResult *CalibrationResult
+	freqRange := [2]float64{calibrateMinFreq, calibrateMaxFreq}
 
-	for freq := shaper.MinFreq; freq <= calibrateMaxShaperFreq; freq += 1.0 {
-		for _, dampingRatio := range testDampingRatios {
-			if dampingRatio > shaper.MaxDampingRatio {
-				continue
-			}
+	// Build arrays for all frequencies we'll evaluate
+	var testFreqs []float64
+	for freq := shaper.MinFreq; freq <= calibrateMaxShaperFreq; freq += freqStep {
+		testFreqs = append(testFreqs, freq)
+	}
 
-			// Get shaper coefficients
+	if len(testFreqs) == 0 {
+		return nil
+	}
+
+	// For each damping ratio, calculate vibrations at all test frequencies
+	var allVibrs [][]float64
+	for _, dampingRatio := range testDampingRatios {
+		if dampingRatio > shaper.MaxDampingRatio {
+			continue
+		}
+
+		vibrs := make([]float64, len(testFreqs))
+		for i, freq := range testFreqs {
 			A, T := shaper.InitFunc(freq, dampingRatio)
+			vibrs[i] = sc.calcResidualVibration(freqBins, psd, A, T, freqRange)
+		}
+		allVibrs = append(allVibrs, vibrs)
+	}
 
-			// Calculate vibration and smoothing
-			vibr := sc.estimateResidualVibration(freqBins, psd, A, T)
-			smoothing := sc.estimateSmoothing(A, T)
+	if len(allVibrs) == 0 {
+		return nil
+	}
 
-			if maxSmoothing > 0 && smoothing > maxSmoothing {
-				continue
+	// Find the "worst case" vibration across all damping ratios
+	// This ensures robustness to unknown actual damping ratio
+	worstVibrs := make([]float64, len(testFreqs))
+	for i := range testFreqs {
+		maxVibr := 0.0
+		for _, vibrs := range allVibrs {
+			if vibrs[i] > maxVibr {
+				maxVibr = vibrs[i]
 			}
+		}
+		worstVibrs[i] = maxVibr
+	}
 
-			// Calculate score (lower is better)
-			score := vibr * math.Pow(smoothing+0.1, 0.65)
+	// Calculate scores for each frequency
+	// score = smoothing * (vibrs^1.5 + vibrs*0.2 + 0.01)
+	var bestResult *CalibrationResult
+	bestScore := math.Inf(1)
 
-			if bestResult == nil || score < bestResult.Score {
-				bestResult = &CalibrationResult{
-					Name:      shaperName,
-					Freq:      freq,
-					FreqBins:  freqBins,
-					Vibrs:     []float64{vibr},
-					Smoothing: smoothing,
-					Score:     score,
-					MaxAccel:  sc.estimateMaxAccel(smoothing),
-				}
+	for i, freq := range testFreqs {
+		// Get shaper at default damping for smoothing calculation
+		A, T := shaper.InitFunc(freq, testDampingRatios[0])
+		smoothing := sc.calcSmoothing(A, T)
+
+		// Skip if exceeds max smoothing constraint
+		if maxSmoothing > 0 && smoothing > maxSmoothing {
+			continue
+		}
+
+		vibr := worstVibrs[i]
+
+		// Klipper scoring formula
+		score := smoothing * (math.Pow(vibr, vibrPower) + vibr*vibrCoef + vibrOffset)
+
+		if score < bestScore {
+			bestScore = score
+			maxAccel := sc.calcMaxAccel(A, T, smoothing)
+
+			bestResult = &CalibrationResult{
+				Name:      shaperName,
+				Freq:      freq,
+				FreqBins:  freqBins,
+				Vals:      worstVibrs,
+				Vibrs:     []float64{vibr},
+				Smoothing: smoothing,
+				Score:     score,
+				MaxAccel:  maxAccel,
 			}
 		}
 	}
@@ -221,38 +286,17 @@ func (sc *ShaperCalibrate) fitShaper(freqBins, psd []float64, shaperName string,
 	return bestResult
 }
 
-// estimateResidualVibration estimates residual vibration with the shaper.
-func (sc *ShaperCalibrate) estimateResidualVibration(freqBins, psd []float64, A, T []float64) float64 {
-	if len(A) == 0 {
-		return 1.0
-	}
-
-	// Simplified calculation - in reality this involves complex frequency response
-	totalVibr := 0.0
-	totalPsd := 0.0
-
-	for i, freq := range freqBins {
-		if freq < calibrateMinFreq || freq > calibrateMaxFreq {
-			continue
-		}
-
-		// Calculate shaper response at this frequency
-		response := sc.shaperResponse(freq, A, T)
-		totalVibr += psd[i] * response * response
-		totalPsd += psd[i]
-	}
-
-	if totalPsd == 0 {
-		return 1.0
-	}
-
-	return math.Sqrt(totalVibr / totalPsd)
+// calcResidualVibration calculates residual vibration using the proper formula.
+// This matches Python's estimate_shaper() function.
+func (sc *ShaperCalibrate) calcResidualVibration(freqBins, psd []float64, A, T []float64, freqRange [2]float64) float64 {
+	return EstimateResidualVibration(freqBins, psd, A, T, freqRange)
 }
 
-// shaperResponse calculates the frequency response of a shaper.
-func (sc *ShaperCalibrate) shaperResponse(freq float64, A, T []float64) float64 {
-	if len(A) == 0 {
-		return 1.0
+// calcSmoothing calculates the smoothing effect of a shaper.
+// This matches Python's get_shaper_smoothing() function.
+func (sc *ShaperCalibrate) calcSmoothing(A, T []float64) float64 {
+	if len(A) == 0 || len(T) == 0 {
+		return 0.0
 	}
 
 	// Normalize amplitudes
@@ -260,47 +304,39 @@ func (sc *ShaperCalibrate) shaperResponse(freq float64, A, T []float64) float64 
 	for _, a := range A {
 		sumA += a
 	}
-
-	// Calculate complex frequency response
-	omega := 2.0 * math.Pi * freq
-	realPart := 0.0
-	imagPart := 0.0
-
-	for i, a := range A {
-		phase := omega * T[i]
-		realPart += (a / sumA) * math.Cos(phase)
-		imagPart += (a / sumA) * math.Sin(phase)
-	}
-
-	return math.Sqrt(realPart*realPart + imagPart*imagPart)
-}
-
-// estimateSmoothing estimates the smoothing effect of a shaper.
-func (sc *ShaperCalibrate) estimateSmoothing(A, T []float64) float64 {
-	if len(T) == 0 {
+	if sumA == 0 {
 		return 0.0
 	}
 
-	// Smoothing is approximately the shaper duration
-	maxT := 0.0
-	for _, t := range T {
-		if t > maxT {
-			maxT = t
-		}
+	// Calculate the center of mass (T0)
+	t0 := 0.0
+	for i := 0; i < len(A); i++ {
+		t0 += (A[i] / sumA) * T[i]
 	}
 
-	return maxT
+	// Calculate second moment around T0
+	var m2 float64
+	for i := 0; i < len(A); i++ {
+		dt := T[i] - t0
+		m2 += (A[i] / sumA) * dt * dt
+	}
+
+	// Smoothing = sqrt(12) * sqrt(m2) for uniform-like distributions
+	// This gives the "equivalent uniform width" of the impulse response
+	return math.Sqrt(12.0 * m2)
 }
 
-// estimateMaxAccel estimates the maximum acceleration for a given smoothing.
-func (sc *ShaperCalibrate) estimateMaxAccel(smoothing float64) float64 {
+// calcMaxAccel calculates the maximum recommended acceleration.
+// Based on the smoothing and square corner velocity.
+func (sc *ShaperCalibrate) calcMaxAccel(A, T []float64, smoothing float64) float64 {
 	if smoothing <= 0 {
 		return 10000.0
 	}
 
-	// Rough estimate: max_accel ≈ max_velocity / smoothing
-	// Using a typical max_velocity of 500 mm/s
-	return 500.0 / smoothing
+	// Klipper formula: max_accel = scv / (0.5 * smoothing)
+	// This ensures corner velocities don't exceed scv
+	accelFactor := 0.5
+	return sc.scv / (accelFactor * smoothing)
 }
 
 // GetAutotuneResult performs auto-tuning and returns the recommended shaper.

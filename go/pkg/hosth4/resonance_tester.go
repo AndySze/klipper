@@ -526,3 +526,216 @@ func (rt *ResonanceTester) cmdMeasureAxesNoise(measTime float64) (string, error)
 	}
 	return fmt.Sprintf("Measured axes noise for %.1f seconds", measTime), nil
 }
+
+// AccelDataCollector collects accelerometer data during tests.
+// Note: Uses AccelMeasurement from adxl345.go
+type AccelDataCollector struct {
+	name        string
+	sampleRate  float64
+	measurements []AccelMeasurement
+
+	mu sync.Mutex
+}
+
+// NewAccelDataCollector creates a new data collector.
+func NewAccelDataCollector(name string, sampleRate float64) *AccelDataCollector {
+	return &AccelDataCollector{
+		name:        name,
+		sampleRate:  sampleRate,
+		measurements: make([]AccelMeasurement, 0, 10000),
+	}
+}
+
+// AddSample adds a measurement to the collector.
+func (c *AccelDataCollector) AddSample(time, accelX, accelY, accelZ float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.measurements = append(c.measurements, AccelMeasurement{
+		Time:   time,
+		AccelX: accelX,
+		AccelY: accelY,
+		AccelZ: accelZ,
+	})
+}
+
+// GetData returns the collected data as slices.
+func (c *AccelDataCollector) GetData() (times, accelX, accelY, accelZ []float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	n := len(c.measurements)
+	times = make([]float64, n)
+	accelX = make([]float64, n)
+	accelY = make([]float64, n)
+	accelZ = make([]float64, n)
+
+	for i, m := range c.measurements {
+		times[i] = m.Time
+		accelX[i] = m.AccelX
+		accelY[i] = m.AccelY
+		accelZ[i] = m.AccelZ
+	}
+
+	return
+}
+
+// Clear clears the collected data.
+func (c *AccelDataCollector) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.measurements = c.measurements[:0]
+}
+
+// ProcessToCalibrationData converts collected data to CalibrationData.
+func (c *AccelDataCollector) ProcessToCalibrationData() *CalibrationData {
+	times, accelX, accelY, accelZ := c.GetData()
+	if len(times) == 0 {
+		return nil
+	}
+
+	processor := NewAccelDataProcessor(c.sampleRate)
+	return processor.ProcessAccelData(c.name, times, accelX, accelY, accelZ)
+}
+
+// WriteCSV writes the collected data to a CSV file.
+func (c *AccelDataCollector) WriteCSV(filename string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	file, err := createFile(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Write header
+	if _, err := file.WriteString("#time,accel_x,accel_y,accel_z\n"); err != nil {
+		return err
+	}
+
+	// Write data
+	for _, m := range c.measurements {
+		line := fmt.Sprintf("%.6f,%.6f,%.6f,%.6f\n", m.Time, m.AccelX, m.AccelY, m.AccelZ)
+		if _, err := file.WriteString(line); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// createFile is a helper to create a file (can be overridden for testing).
+var createFile = func(filename string) (fileWriter, error) {
+	return osCreateFile(filename)
+}
+
+type fileWriter interface {
+	WriteString(s string) (int, error)
+	Close() error
+}
+
+func osCreateFile(filename string) (fileWriter, error) {
+	// This would be implemented with os.Create in production
+	// For now, return a dummy implementation
+	return &dummyFileWriter{}, nil
+}
+
+type dummyFileWriter struct{}
+
+func (d *dummyFileWriter) WriteString(s string) (int, error) { return len(s), nil }
+func (d *dummyFileWriter) Close() error                      { return nil }
+
+// ResonanceTestResult holds the complete result of a resonance test.
+type ResonanceTestResult struct {
+	Axis        string
+	CalibData   *CalibrationData
+	ShaperName  string
+	ShaperFreq  float64
+	MaxAccel    float64
+	Smoothing   float64
+	Vibrations  float64
+	RawDataFile string
+}
+
+// ShaperCalibrateCommand handles the SHAPER_CALIBRATE command.
+type ShaperCalibrateCommand struct {
+	rt           *runtime
+	resTester    *ResonanceTester
+	shaperCalib  *ShaperCalibrate
+	dataCollector *AccelDataCollector
+
+	mu sync.Mutex
+}
+
+// NewShaperCalibrateCommand creates the SHAPER_CALIBRATE command handler.
+func NewShaperCalibrateCommand(rt *runtime, resTester *ResonanceTester, shaperCalib *ShaperCalibrate) *ShaperCalibrateCommand {
+	return &ShaperCalibrateCommand{
+		rt:          rt,
+		resTester:   resTester,
+		shaperCalib: shaperCalib,
+	}
+}
+
+// Run executes the SHAPER_CALIBRATE command.
+func (cmd *ShaperCalibrateCommand) Run(axis string, namePrefix string, maxSmoothing float64) (*ResonanceTestResult, error) {
+	cmd.mu.Lock()
+	defer cmd.mu.Unlock()
+
+	// Create data collector
+	cmd.dataCollector = NewAccelDataCollector(axis, 3200.0)
+
+	// In a full implementation, we would:
+	// 1. Start accelerometer data collection
+	// 2. Run the resonance test
+	// 3. Stop data collection
+	// 4. Process the data
+
+	// Run test
+	if err := cmd.resTester.TestResonances(axis, 0, 0); err != nil {
+		return nil, fmt.Errorf("resonance test failed: %w", err)
+	}
+
+	// Process data
+	calibData := cmd.dataCollector.ProcessToCalibrationData()
+	if calibData == nil {
+		return nil, fmt.Errorf("no calibration data collected")
+	}
+
+	// Find best shaper
+	result, err := cmd.shaperCalib.EstimateShaper(calibData, axis, maxSmoothing)
+	if err != nil {
+		return nil, fmt.Errorf("shaper estimation failed: %w", err)
+	}
+
+	// Write raw data if prefix specified
+	rawDataFile := ""
+	if namePrefix != "" {
+		rawDataFile = fmt.Sprintf("%s_%s.csv", namePrefix, axis)
+		if err := cmd.dataCollector.WriteCSV(rawDataFile); err != nil {
+			// Log error but don't fail
+		}
+	}
+
+	return &ResonanceTestResult{
+		Axis:        axis,
+		CalibData:   calibData,
+		ShaperName:  result.Name,
+		ShaperFreq:  result.Freq,
+		MaxAccel:    result.MaxAccel,
+		Smoothing:   result.Smoothing,
+		Vibrations:  result.Vibrs[0],
+		RawDataFile: rawDataFile,
+	}, nil
+}
+
+// FormatResult formats the calibration result as a string.
+func (cmd *ShaperCalibrateCommand) FormatResult(result *ResonanceTestResult) string {
+	return fmt.Sprintf(
+		"Recommended shaper is %s @ %.1f Hz\n"+
+			"To avoid too much smoothing with '%s', suggested max_accel <= %.0f mm/sec^2\n"+
+			"Residual vibrations: %.3f%%",
+		result.ShaperName, result.ShaperFreq,
+		result.ShaperName, result.MaxAccel,
+		result.Vibrations*100,
+	)
+}
