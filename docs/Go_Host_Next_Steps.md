@@ -1,6 +1,6 @@
 # Go Host 迁移：下一步开发计划
 
-## 当前状态（2026-01-21）
+## 当前状态（2026-01-22）
 
 ### 测试覆盖率
 - **全部 61 个 golden tests 通过** ✅
@@ -23,10 +23,30 @@
 
 ### 阶段 1：实机验证（优先级最高）
 
-#### 1.1 Linux MCU 模拟器测试
-- [ ] 使用 `linuxprocess` MCU 进行端到端测试
-- [ ] 验证实时时钟同步
-- [ ] 验证命令收发完整性
+#### 1.1 Linux MCU 模拟器测试 ✅ (2026-01-22 完成)
+- [x] Docker 镜像构建 (`scripts/linux-mcu/build.sh`)
+- [x] TCP 端口模式连接 (localhost:5555)
+- [x] 验证实时时钟同步 (offset/slope 稳定)
+- [x] 验证命令收发完整性 (IDENTIFY, get_clock)
+- [x] MCU 识别成功 (50MHz Linux MCU)
+- [x] 状态查询 API 验证 (GetStatus)
+
+**测试工具**: `hardware-test`
+```bash
+# 构建 Docker 镜像
+./scripts/linux-mcu/build.sh
+
+# 启动模拟器
+docker run -d --rm -p 5555:5555 -e MCU_PORT=5555 --name klipper-linux-mcu klipper-linux-mcu
+
+# 运行测试
+./hardware-test -device localhost:5555 -tcp -test connect
+./hardware-test -device localhost:5555 -tcp -test query
+./hardware-test -device localhost:5555 -tcp -test clock -trace
+
+# 停止模拟器
+docker stop klipper-linux-mcu
+```
 
 #### 1.2 真实 MCU 连接测试
 - [ ] 连接真实 MCU（推荐 STM32F103 或 RP2040）
@@ -276,11 +296,10 @@
 
 ## 建议的立即行动
 
-1. **设置 Linux MCU 模拟器测试环境** (阶段 1.1)
-   ```bash
-   # 构建 Linux MCU 模拟器
-   make flash FLASH_DEVICE=/tmp/klipper_host_mcu
-   ```
+1. **~~设置 Linux MCU 模拟器测试环境~~ ✅ 已完成** (阶段 1.1)
+   - Docker 镜像和测试工具已就绪
+   - 使用 `./scripts/linux-mcu/build.sh` 构建
+   - 使用 `./hardware-test -tcp` 进行测试
 
 2. **~~实现最小 Moonraker API~~ ✅ 已完成**
    - Moonraker API 服务器已实现 (`go/pkg/moonraker/`)
@@ -290,10 +309,11 @@
    - 配置 Moonraker 端点指向 Go 服务器
    - 验证前端功能正常
 
-4. **准备真实打印机测试**
+4. **准备真实打印机测试** (下一步重点)
    - 选择一台测试打印机
    - 备份原有配置
    - 准备回滚方案
+   - 使用 `hardware-test` 工具验证串口连接
 
 ---
 
@@ -310,11 +330,58 @@
 
 ## 时间线估计
 
-| 阶段 | 预计工作量 | 前置条件 |
-|------|------------|----------|
-| 阶段 1 | 2-3 周 | 测试设备就绪 |
-| 阶段 2 | 3-4 周 | 阶段 1 完成 |
-| 阶段 3 | 4-6 周 | 阶段 2 完成 |
-| 阶段 4 | 2-4 周 | 阶段 3 完成 |
+| 阶段 | 预计工作量 | 状态 |
+|------|------------|------|
+| 阶段 1.1 Linux MCU | 1 周 | ✅ 完成 |
+| 阶段 1.2 真实 MCU | 1-2 周 | ⏳ 下一步 |
+| 阶段 1.3 打印验证 | 1-2 周 | ⏳ 待开始 |
+| 阶段 2 Moonraker | 3-4 周 | ✅ 完成 |
+| 阶段 3 功能完善 | 4-6 周 | ✅ 完成 |
+| 阶段 4.1-4.2 优化 | 2-3 周 | ✅ 完成 |
+| 阶段 4.3 生产部署 | 1-2 周 | ⏳ 待开始 |
 
-**总计：约 3-4 个月达到生产就绪状态**
+**当前进度：代码实现 ~95% 完成，进入硬件验证阶段**
+
+---
+
+## 附录：hardware-test 工具
+
+`hardware-test` 是用于测试 MCU 连接的命令行工具。
+
+### 支持的测试模式
+
+| 测试 | 说明 |
+|------|------|
+| `serial` | 直接串口测试（无协议） |
+| `connect` | MCU 连接和握手测试 |
+| `clock` | 时钟同步测试 |
+| `query` | MCU 能力查询 |
+| `config` | 配置验证 |
+| `stepper` | 步进电机测试 |
+| `gpio` | GPIO 测试 |
+| `endstop` | 限位开关测试 |
+| `temp` | 温度传感器测试 |
+| `temploop` | 温度循环测试 |
+| `homing` | 归零测试 |
+| `motion` | 运动测试 |
+| `stress` | 压力测试 |
+| `all` | 运行所有测试 |
+
+### 连接模式
+
+```bash
+# 串口连接
+./hardware-test -device /dev/ttyUSB0 -test connect
+
+# Unix 套接字连接
+./hardware-test -device /tmp/klipper_mcu -socket -test connect
+
+# TCP 连接（Linux MCU Docker）
+./hardware-test -device localhost:5555 -tcp -test connect
+
+# 使用 printer.cfg
+./hardware-test -config ~/printer.cfg -test connect
+
+# 启用调试跟踪
+./hardware-test -device /dev/ttyUSB0 -test connect -trace
+```
