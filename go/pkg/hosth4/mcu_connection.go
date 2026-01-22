@@ -4,7 +4,9 @@
 package hosth4
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +28,7 @@ var (
 	ErrMCUProtocolError  = errors.New("mcu: protocol error")
 	ErrMCUShutdown       = errors.New("mcu: shutdown requested")
 	ErrMCUClockNotSynced = errors.New("mcu: clock not synchronized")
+	ErrCANUUIDMismatch   = errors.New("mcu: CAN bus UUID mismatch")
 )
 
 // MCUConnectionConfig holds configuration for connecting to an MCU.
@@ -220,7 +223,8 @@ func (mc *MCUConnection) Connect() error {
 	var port *serial.Port
 	var err error
 	if mc.config.UseCAN {
-		// Connect via CAN bus (Linux SocketCAN)
+		// Connect via CAN bus (Linux SocketCAN) with retry logic
+		// The Python implementation retries for up to 90 seconds
 		canCfg := serial.CANBusConfig{
 			Interface:      mc.config.Device,
 			UUID:           mc.config.CANBusUUID,
@@ -228,18 +232,37 @@ func (mc *MCUConnection) Connect() error {
 			ConnectTimeout: mc.config.ConnectTimeout,
 			ReadTimeout:    mc.config.ResponseTimeout,
 		}
-		canbus, err := serial.NewCANBus(canCfg)
-		if err != nil {
-			mc.mu.Unlock()
-			return fmt.Errorf("mcu %s: create CAN bus: %w", mc.name, err)
+
+		startTime := time.Now()
+		retryInterval := 5 * time.Second
+		var lastErr error
+
+		for time.Since(startTime) < mc.config.ConnectTimeout {
+			canbus, err := serial.NewCANBus(canCfg)
+			if err != nil {
+				lastErr = err
+				mc.tracef("MCU %s: CAN bus create failed: %v, retrying...\n", mc.name, err)
+				time.Sleep(retryInterval)
+				continue
+			}
+
+			if err := canbus.Connect(); err != nil {
+				lastErr = err
+				mc.tracef("MCU %s: CAN bus connect failed: %v, retrying...\n", mc.name, err)
+				time.Sleep(retryInterval)
+				continue
+			}
+
+			mc.canbus = canbus
+			port = serial.WrapCANBus(canbus)
+			lastErr = nil
+			break
 		}
-		if err := canbus.Connect(); err != nil {
+
+		if lastErr != nil {
 			mc.mu.Unlock()
-			return fmt.Errorf("mcu %s: connect CAN bus: %w", mc.name, err)
+			return fmt.Errorf("mcu %s: connect CAN bus failed after %v: %w", mc.name, mc.config.ConnectTimeout, lastErr)
 		}
-		mc.canbus = canbus
-		// Create a Port wrapper for CAN bus to use with handshake
-		port = serial.WrapCANBus(canbus)
 	} else if mc.config.UseTCP {
 		// Connect via TCP (e.g., Docker-based Linux MCU simulator)
 		port, err = serial.OpenTCP(mc.config.Device, mc.config.ConnectTimeout)
@@ -366,6 +389,14 @@ func (mc *MCUConnection) Connect() error {
 	if err := mc.waitForClockSync(mc.config.HandshakeTimeout); err != nil {
 		mc.Disconnect() // Use public method since we don't hold lock
 		return fmt.Errorf("mcu %s: clock sync: %w", mc.name, err)
+	}
+
+	// For CAN bus connections, verify the UUID matches
+	if mc.config.UseCAN {
+		if err := mc.verifyCanbusUUID(); err != nil {
+			mc.Disconnect()
+			return err
+		}
 	}
 
 	mc.mu.Lock()
@@ -1182,4 +1213,51 @@ func (mc *MCUConnection) ShutdownReason() string {
 // Name returns the MCU name.
 func (mc *MCUConnection) Name() string {
 	return mc.name // immutable, no lock needed
+}
+
+// verifyCanbusUUID verifies the CAN bus UUID matches the expected value.
+// This is called after establishing a CAN bus connection to ensure we're
+// communicating with the correct MCU.
+// Returns nil if verification succeeds, ErrCANUUIDMismatch if UUIDs don't match.
+func (mc *MCUConnection) verifyCanbusUUID() error {
+	if !mc.config.UseCAN || mc.config.CANBusUUID == "" {
+		return nil // Not a CAN connection or no UUID to verify
+	}
+
+	mc.tracef("MCU %s: Verifying CAN bus UUID\n", mc.name)
+
+	// Parse expected UUID from config (12-character hex string -> 6 bytes)
+	expectedUUID, err := hex.DecodeString(mc.config.CANBusUUID)
+	if err != nil {
+		return fmt.Errorf("mcu %s: invalid CAN bus UUID '%s': %w", mc.name, mc.config.CANBusUUID, err)
+	}
+	if len(expectedUUID) != 6 {
+		return fmt.Errorf("mcu %s: CAN bus UUID must be 12 hex characters (6 bytes), got %d", mc.name, len(mc.config.CANBusUUID))
+	}
+
+	// Send get_canbus_id command and wait for canbus_id response
+	params, err := mc.SendCommandWithResponse("get_canbus_id", nil, "canbus_id", 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("mcu %s: get_canbus_id failed: %w", mc.name, err)
+	}
+
+	// Extract canbus_uuid from response
+	gotUUID, ok := params["canbus_uuid"].([]byte)
+	if !ok {
+		// Try string conversion
+		if uuidStr, ok := params["canbus_uuid"].(string); ok {
+			gotUUID = []byte(uuidStr)
+		} else {
+			return fmt.Errorf("mcu %s: canbus_id response missing canbus_uuid field", mc.name)
+		}
+	}
+
+	// Compare UUIDs
+	if !bytes.Equal(gotUUID, expectedUUID) {
+		mc.tracef("MCU %s: UUID mismatch - expected %x, got %x\n", mc.name, expectedUUID, gotUUID)
+		return fmt.Errorf("%w: expected %x, got %x", ErrCANUUIDMismatch, expectedUUID, gotUUID)
+	}
+
+	mc.tracef("MCU %s: CAN bus UUID verified successfully\n", mc.name)
+	return nil
 }

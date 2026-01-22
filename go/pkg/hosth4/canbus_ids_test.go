@@ -231,3 +231,13 @@ func TestCANBusConstants(t *testing.T) {
 		t.Errorf("Expected CANBusNodeIDFirst 4, got %d", CANBusNodeIDFirst)
 	}
 }
+
+func TestErrCANUUIDMismatch(t *testing.T) {
+	// Verify the UUID mismatch error is defined
+	if ErrCANUUIDMismatch == nil {
+		t.Error("ErrCANUUIDMismatch should not be nil")
+	}
+	if ErrCANUUIDMismatch.Error() != "mcu: CAN bus UUID mismatch" {
+		t.Errorf("Expected error message 'mcu: CAN bus UUID mismatch', got '%s'", ErrCANUUIDMismatch.Error())
+	}
+}
