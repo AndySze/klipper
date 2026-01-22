@@ -62,7 +62,9 @@ type Port struct {
 	config     Config
 	closed     bool
 	oldTermios *unix.Termios
-	isSocket   bool // true if connected via Unix socket (e.g., Linux MCU simulator)
+	isSocket   bool    // true if connected via Unix socket (e.g., Linux MCU simulator)
+	isCAN      bool    // true if this is a CAN bus connection wrapper
+	canbus     *CANBus // CAN bus connection (when isCAN is true)
 }
 
 // ListPorts returns a list of available serial port device paths.

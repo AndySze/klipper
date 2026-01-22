@@ -13,20 +13,16 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
+
+	"klipper-go-migration/pkg/serial"
 )
 
-// CAN bus constants.
+// CAN bus constants (re-exported from serial package for convenience).
 const (
-	canBusAdminID     = 0x3F0 // Admin message ID
-	canBusAdminRespID = 0x3F1 // Admin response ID
-)
-
-// CAN bus admin commands.
-const (
-	canBusCmdQueryUUID  = 0x00
-	canBusCmdSetNodeID  = 0x01
-	canBusCmdGetNodeID  = 0x02
-	canBusCmdRebootNode = 0x03
+	CANBusAdminID     = serial.CANBusAdminID
+	CANBusAdminRespID = serial.CANBusAdminRespID
+	CANBusNodeIDFirst = serial.CANBusNodeIDFirst
 )
 
 // CANBusIDs manages CAN bus node identification.
@@ -111,8 +107,27 @@ func (cids *CANBusIDs) GetNodeByID(nodeID int) (*CANNode, error) {
 
 // QueryNodes sends a query to discover CAN nodes.
 func (cids *CANBusIDs) QueryNodes() error {
-	// In real implementation, this would send CAN admin messages
-	log.Printf("canbus_ids: querying nodes on %s", cids.interface_)
+	return cids.QueryNodesWithTimeout(2 * time.Second)
+}
+
+// QueryNodesWithTimeout sends a query to discover CAN nodes with a custom timeout.
+func (cids *CANBusIDs) QueryNodesWithTimeout(timeout time.Duration) error {
+	log.Printf("canbus_ids: querying nodes on %s (timeout=%v)", cids.interface_, timeout)
+
+	uuids, err := serial.QueryCANNodes(cids.interface_, timeout)
+	if err != nil {
+		return fmt.Errorf("canbus_ids: query failed: %w", err)
+	}
+
+	for i, uuid := range uuids {
+		nodeID := CANBusNodeIDFirst + i
+		if err := cids.RegisterNode(uuid, nodeID, ""); err != nil {
+			// Node already registered, skip
+			log.Printf("canbus_ids: node %s already registered", uuid)
+		}
+	}
+
+	log.Printf("canbus_ids: discovered %d nodes", len(uuids))
 	return nil
 }
 
@@ -149,4 +164,54 @@ func (cids *CANBusIDs) GetStatus() map[string]any {
 		"interface": cids.interface_,
 		"nodes":     nodeList,
 	}
+}
+
+// AddUUID registers a CAN node UUID and returns the assigned node ID.
+// This matches the Python API: add_uuid(config, canbus_uuid, canbus_iface)
+// The node ID is automatically assigned based on the number of registered nodes.
+func (cids *CANBusIDs) AddUUID(uuid string, iface string) (int, error) {
+	cids.mu.Lock()
+	defer cids.mu.Unlock()
+
+	// Check for duplicate UUID
+	if _, exists := cids.nodes[uuid]; exists {
+		return 0, fmt.Errorf("canbus_ids: duplicate canbus_uuid %s", uuid)
+	}
+
+	// Assign node ID based on number of registered nodes (matches Python behavior)
+	newID := len(cids.nodes) + CANBusNodeIDFirst
+
+	cids.nodes[uuid] = &CANNode{
+		uuid:   uuid,
+		nodeID: newID,
+		name:   "",
+	}
+
+	log.Printf("canbus_ids: added UUID %s with node ID %d on interface %s", uuid, newID, iface)
+	return newID, nil
+}
+
+// GetNodeID returns the node ID for a given UUID.
+// This matches the Python API: get_nodeid(canbus_uuid)
+func (cids *CANBusIDs) GetNodeID(uuid string) (int, error) {
+	cids.mu.Lock()
+	defer cids.mu.Unlock()
+
+	node, exists := cids.nodes[uuid]
+	if !exists {
+		return 0, fmt.Errorf("canbus_ids: unknown canbus_uuid %s", uuid)
+	}
+	return node.nodeID, nil
+}
+
+// NodeCount returns the number of registered nodes.
+func (cids *CANBusIDs) NodeCount() int {
+	cids.mu.Lock()
+	defer cids.mu.Unlock()
+	return len(cids.nodes)
+}
+
+// Interface returns the CAN interface name.
+func (cids *CANBusIDs) Interface() string {
+	return cids.interface_
 }

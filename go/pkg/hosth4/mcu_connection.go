@@ -42,6 +42,19 @@ type MCUConnectionConfig struct {
 	// Used for connecting to Docker-based Linux MCU simulator
 	UseTCP bool
 
+	// UseCAN indicates connection via CAN bus using SocketCAN (Linux only)
+	// Device should be the CAN interface name (e.g., "can0")
+	// Requires CANBusUUID and optionally CANBusNodeID
+	UseCAN bool
+
+	// CANBusUUID is the 12-character hex UUID of the CAN MCU (e.g., "aabbccddeeff")
+	// Required when UseCAN is true
+	CANBusUUID string
+
+	// CANBusNodeID is the assigned node ID for CAN communication
+	// If 0, will be assigned by the CANBusIDs manager
+	CANBusNodeID int
+
 	// Connection timeouts
 	ConnectTimeout   time.Duration // Default: 60s
 	HandshakeTimeout time.Duration // Default: 5s
@@ -84,8 +97,11 @@ type MCUConnection struct {
 	name   string
 	config MCUConnectionConfig
 
-	// Serial connection
+	// Serial connection (for serial, socket, TCP)
 	port *serial.Port
+
+	// CAN bus connection (for CAN bus, Linux only)
+	canbus *serial.CANBus
 
 	// Protocol dictionary (from handshake)
 	dict *protocol.Dictionary
@@ -190,7 +206,9 @@ func (mc *MCUConnection) Connect() error {
 		return nil // Already connected
 	}
 
-	if mc.config.UseTCP {
+	if mc.config.UseCAN {
+		mc.tracef("MCU %s: Connecting via CAN bus %s (UUID: %s)\n", mc.name, mc.config.Device, mc.config.CANBusUUID)
+	} else if mc.config.UseTCP {
 		mc.tracef("MCU %s: Connecting to TCP %s\n", mc.name, mc.config.Device)
 	} else if mc.config.UseSocket {
 		mc.tracef("MCU %s: Connecting to socket %s\n", mc.name, mc.config.Device)
@@ -198,10 +216,31 @@ func (mc *MCUConnection) Connect() error {
 		mc.tracef("MCU %s: Connecting to %s at %d baud\n", mc.name, mc.config.Device, mc.config.BaudRate)
 	}
 
-	// Open serial port, Unix socket, or TCP connection
+	// Open serial port, Unix socket, TCP connection, or CAN bus
 	var port *serial.Port
 	var err error
-	if mc.config.UseTCP {
+	if mc.config.UseCAN {
+		// Connect via CAN bus (Linux SocketCAN)
+		canCfg := serial.CANBusConfig{
+			Interface:      mc.config.Device,
+			UUID:           mc.config.CANBusUUID,
+			NodeID:         mc.config.CANBusNodeID,
+			ConnectTimeout: mc.config.ConnectTimeout,
+			ReadTimeout:    mc.config.ResponseTimeout,
+		}
+		canbus, err := serial.NewCANBus(canCfg)
+		if err != nil {
+			mc.mu.Unlock()
+			return fmt.Errorf("mcu %s: create CAN bus: %w", mc.name, err)
+		}
+		if err := canbus.Connect(); err != nil {
+			mc.mu.Unlock()
+			return fmt.Errorf("mcu %s: connect CAN bus: %w", mc.name, err)
+		}
+		mc.canbus = canbus
+		// Create a Port wrapper for CAN bus to use with handshake
+		port = serial.WrapCANBus(canbus)
+	} else if mc.config.UseTCP {
 		// Connect via TCP (e.g., Docker-based Linux MCU simulator)
 		port, err = serial.OpenTCP(mc.config.Device, mc.config.ConnectTimeout)
 		if err != nil {
@@ -239,8 +278,8 @@ func (mc *MCUConnection) Connect() error {
 	handshakeCfg := mcupkg.DefaultHandshakeConfig()
 	handshakeCfg.Timeout = mc.config.HandshakeTimeout
 	handshakeCfg.Trace = mc.config.Trace
-	// Disable reset for socket/TCP connections (no DTR signal)
-	handshakeCfg.ResetBeforeIdentify = mc.config.ResetOnConnect && !mc.config.UseSocket && !mc.config.UseTCP
+	// Disable reset for socket/TCP/CAN connections (no DTR signal)
+	handshakeCfg.ResetBeforeIdentify = mc.config.ResetOnConnect && !mc.config.UseSocket && !mc.config.UseTCP && !mc.config.UseCAN
 	identifyData, err := mcupkg.Handshake(port, handshakeCfg)
 	if err != nil {
 		port.Close()
