@@ -1850,8 +1850,12 @@ func (e *endstop) homeStart(printTime float64, restTime float64, triggered bool)
 	sampleTicks := uint64(int64(endstopSampleTimeSec * e.mcuFreq))
 	restClk := uint64(int64((printTime + restTime) * e.mcuFreq))
 	restTicks := restClk - clock
+	// Calculate pin_value using XOR with invert flag (matches Python: triggered ^ self._invert)
+	// For inverted endstops (^! prefix), invert=true, so:
+	// - triggered=true, invert=true → pin_value = 1 XOR 1 = 0 (trigger when pin LOW)
+	// - triggered=true, invert=false → pin_value = 1 XOR 0 = 1 (trigger when pin HIGH)
 	pinValue := 0
-	if triggered {
+	if triggered != e.invert {
 		pinValue = 1
 	}
 	line := fmt.Sprintf("endstop_home oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d pin_value=%d trsync_oid=%d trigger_reason=1",
@@ -1875,8 +1879,9 @@ func (e *endstop) homeStartWithRestTicks(printTime float64, restTicks uint64, tr
 		return err
 	}
 	sampleTicks := uint64(int64(endstopSampleTimeSec * e.mcuFreq))
+	// Calculate pin_value using XOR with invert flag (matches Python: triggered ^ self._invert)
 	pinValue := 0
-	if triggered {
+	if triggered != e.invert {
 		pinValue = 1
 	}
 	line := fmt.Sprintf("endstop_home oid=%d clock=%d sample_ticks=%d sample_count=%d rest_ticks=%d pin_value=%d trsync_oid=%d trigger_reason=1",
