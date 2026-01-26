@@ -38,6 +38,10 @@ type Server struct {
 	fileManager    *FileManager
 	historyManager *HistoryManager
 
+	// Database storage (namespace -> key -> value)
+	database   map[string]map[string]any
+	databaseMu sync.RWMutex
+
 	// Server state
 	running   atomic.Bool
 	startTime time.Time
@@ -81,6 +85,7 @@ func New(cfg Config) *Server {
 		subscriptions:  make(map[int64]map[string][]string),
 		fileManager:    NewFileManager(),
 		historyManager: NewHistoryManager(),
+		database:       make(map[string]map[string]any),
 		startTime:      time.Now(),
 	}
 
@@ -121,15 +126,25 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/printer/gcode/script", s.handleGCodeScript)
 	mux.HandleFunc("/printer/emergency_stop", s.handleEmergencyStop)
 
+	// Access/authentication endpoints
+	mux.HandleFunc("/access/oneshot_token", s.handleOneshotToken)
+
+	// Database endpoints (for Fluidd/Mainsail settings storage)
+	mux.HandleFunc("/server/database/item", s.handleDatabaseItem)
+	mux.HandleFunc("/server/database/list", s.handleDatabaseList)
+
 	// File management endpoints
 	s.fileManager.RegisterFileEndpoints(mux)
 
 	// History endpoints
 	s.historyManager.RegisterHistoryEndpoints(mux)
 
+	// Wrap with CORS middleware
+	corsHandler := s.corsMiddleware(mux)
+
 	s.httpServer = &http.Server{
 		Addr:    s.addr,
-		Handler: mux,
+		Handler: corsHandler,
 	}
 
 	s.running.Store(true)
@@ -604,6 +619,102 @@ func (s *Server) handleEmergencyStop(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, map[string]any{"result": result})
 }
 
+func (s *Server) handleOneshotToken(w http.ResponseWriter, r *http.Request) {
+	// Generate a simple oneshot token for authentication
+	// In a full implementation, this would be a proper random token with expiry
+	token := fmt.Sprintf("klipper-go-%d", time.Now().UnixNano())
+	s.writeJSON(w, map[string]any{"result": token})
+}
+
+func (s *Server) handleDatabaseItem(w http.ResponseWriter, r *http.Request) {
+	namespace := r.URL.Query().Get("namespace")
+	key := r.URL.Query().Get("key")
+
+	switch r.Method {
+	case http.MethodGet:
+		// Get item from database
+		s.databaseMu.RLock()
+		ns, nsExists := s.database[namespace]
+		var value any
+		if nsExists && key != "" {
+			value = ns[key]
+		} else if nsExists && key == "" {
+			// Return entire namespace
+			value = ns
+		}
+		s.databaseMu.RUnlock()
+
+		if value == nil {
+			// Return empty object for non-existent keys (Fluidd expects this)
+			s.writeJSON(w, map[string]any{"result": map[string]any{"namespace": namespace, "key": key, "value": map[string]any{}}})
+		} else {
+			s.writeJSON(w, map[string]any{"result": map[string]any{"namespace": namespace, "key": key, "value": value}})
+		}
+
+	case http.MethodPost:
+		// Set item in database
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			s.writeJSONError(w, err)
+			return
+		}
+
+		value := body["value"]
+
+		s.databaseMu.Lock()
+		if s.database[namespace] == nil {
+			s.database[namespace] = make(map[string]any)
+		}
+		s.database[namespace][key] = value
+		s.databaseMu.Unlock()
+
+		s.writeJSON(w, map[string]any{"result": map[string]any{"namespace": namespace, "key": key, "value": value}})
+
+	case http.MethodDelete:
+		// Delete item from database
+		s.databaseMu.Lock()
+		if ns, exists := s.database[namespace]; exists {
+			delete(ns, key)
+		}
+		s.databaseMu.Unlock()
+
+		s.writeJSON(w, map[string]any{"result": map[string]any{"namespace": namespace, "key": key}})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
+	s.databaseMu.RLock()
+	namespaces := make([]string, 0, len(s.database))
+	for ns := range s.database {
+		namespaces = append(namespaces, ns)
+	}
+	s.databaseMu.RUnlock()
+
+	s.writeJSON(w, map[string]any{"result": map[string]any{"namespaces": namespaces}})
+}
+
+// CORS middleware to allow cross-origin requests from Fluidd/Mainsail
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set CORS headers
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		// Handle preflight requests
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // JSON response helpers
 
 func (s *Server) writeJSON(w http.ResponseWriter, data any) {
@@ -798,6 +909,31 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Start read and write pumps
 	go client.writePump()
+
+	// Send initial notifications after connection
+	go func() {
+		// Small delay to ensure client is ready
+		time.Sleep(100 * time.Millisecond)
+
+		// Send klippy_connected notification
+		client.Send(map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "notify_klippy_connected",
+		})
+
+		// Send klippy_ready notification if printer is ready
+		klippyState := "ready"
+		if s.printer != nil {
+			klippyState = s.printer.GetKlippyState()
+		}
+		if klippyState == "ready" {
+			client.Send(map[string]any{
+				"jsonrpc": "2.0",
+				"method":  "notify_klippy_ready",
+			})
+		}
+	}()
+
 	client.readPump() // Blocks until connection closes
 }
 

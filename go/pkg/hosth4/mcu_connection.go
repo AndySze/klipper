@@ -86,10 +86,10 @@ func DefaultMCUConnectionConfig() MCUConnectionConfig {
 		BaudRate:          250000,
 		ConnectTimeout:    60 * time.Second,
 		HandshakeTimeout:  15 * time.Second, // Allow time for reset, drain, and identify
-		ResponseTimeout:   2 * time.Second, // Match testSerial timeout
+		ResponseTimeout:   2 * time.Second,  // Match testSerial timeout
 		ClockSyncInterval: 100 * time.Millisecond,
 		ClockSyncSamples:  8,
-		ResetOnConnect:    false, // Disable reset - may cause issues with some serial adapters
+		ResetOnConnect:    false, // Disable reset - use extended drain instead
 	}
 }
 
@@ -140,9 +140,9 @@ type MCUConnection struct {
 
 	// OID allocation
 	oidCount int // Next OID to allocate (starts at 0)
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
 
 	// Command queue for outgoing messages
 	cmdQueue   chan mcuCmd
@@ -150,14 +150,14 @@ type MCUConnection struct {
 	cmdSeqLock sync.Mutex
 
 	// Pending responses - indexed by response name
-	pendingMu       sync.Mutex
-	pending         map[uint8]chan *mcupkg.Message // legacy: by seq
-	pendingByName   map[string]pendingResp         // by response name
+	pendingMu     sync.Mutex
+	pending       map[uint8]chan *mcupkg.Message // legacy: by seq
+	pendingByName map[string]pendingResp         // by response name
 }
 
 // pendingResp tracks a pending response request
 type pendingResp struct {
-	oid      *int                   // Expected OID (nil for any)
+	oid      *int // Expected OID (nil for any)
 	respChan chan *mcupkg.Message
 }
 
@@ -171,8 +171,8 @@ type clockSample struct {
 // mcuCmd represents a command to send to the MCU.
 type mcuCmd struct {
 	data     []byte
-	response string        // Expected response name (empty for no response)
-	oid      *int          // Expected OID (nil for any)
+	response string // Expected response name (empty for no response)
+	oid      *int   // Expected OID (nil for any)
 	timeout  time.Duration
 	respChan chan *mcupkg.Message
 }
@@ -339,7 +339,7 @@ func (mc *MCUConnection) Connect() error {
 
 		// Configure serialqueue
 		sq.SetWireFrequency(float64(mc.config.BaudRate) * 10) // bits per second
-		sq.SetReceiveWindow(25) // Default receive window
+		sq.SetReceiveWindow(25)                               // Default receive window
 
 		adapter, err := chelper.NewSerialQueueAdapter(sq, mc.dict)
 		if err != nil {
@@ -396,6 +396,17 @@ func (mc *MCUConnection) Connect() error {
 		if err := mc.verifyCanbusUUID(); err != nil {
 			mc.Disconnect()
 			return err
+		}
+	}
+
+	// Clear any previous shutdown state (only if the MCU reports being shutdown).
+	// Sending clear_shutdown while not in shutdown will itself trigger a shutdown
+	// ("Shutdown cleared when not shutdown").
+	if resp, err := mc.SendCommandWithResponse("get_config", nil, "config", 2*time.Second); err != nil {
+		mc.tracef("MCU %s: Warning: get_config failed during connect: %v\n", mc.name, err)
+	} else if isShutdown, ok := resp["is_shutdown"].(int); ok && isShutdown != 0 {
+		if err := mc.clearShutdown(); err != nil {
+			mc.tracef("MCU %s: Warning: clear_shutdown failed: %v\n", mc.name, err)
 		}
 	}
 
@@ -623,6 +634,20 @@ func (mc *MCUConnection) EstimatedPrintTime() float64 {
 	return mc.clockOffset
 }
 
+// GetLastMCUClock returns the last known MCU clock value.
+// This returns the raw clock value from the most recent clock sample, without
+// requiring full clock synchronization. Returns 0 if no samples available.
+func (mc *MCUConnection) GetLastMCUClock() uint64 {
+	mc.clockSyncMu.RLock()
+	defer mc.clockSyncMu.RUnlock()
+
+	if len(mc.clockSamples) == 0 {
+		return 0
+	}
+
+	return mc.clockSamples[len(mc.clockSamples)-1].mcuClock
+}
+
 // SetReactor sets the reactor for timing and scheduling.
 func (mc *MCUConnection) SetReactor(r *reactor.Reactor) {
 	mc.mu.Lock()
@@ -799,6 +824,10 @@ func (mc *MCUConnection) registerStandardHandlers() {
 	mc.reader.RegisterHandler("shutdown", nil, func(msg *mcupkg.Message) {
 		mc.handleShutdown(msg)
 	})
+	// Shutdown state query response (sent while in shutdown)
+	mc.reader.RegisterHandler("is_shutdown", nil, func(msg *mcupkg.Message) {
+		mc.handleIsShutdown(msg)
+	})
 
 	// Clock response for synchronization
 	mc.reader.RegisterHandler("clock", nil, func(msg *mcupkg.Message) {
@@ -843,6 +872,10 @@ func (mc *MCUConnection) registerSerialQueueHandlers() {
 	mc.sqAdapter.RegisterHandler("shutdown", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
 		mc.handleShutdownSQ(params)
 	})
+	// Shutdown state query response (sent while in shutdown)
+	mc.sqAdapter.RegisterHandler("is_shutdown", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.handleIsShutdownSQ(params)
+	})
 
 	// Clock response for synchronization
 	mc.sqAdapter.RegisterHandler("clock", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
@@ -866,6 +899,7 @@ func (mc *MCUConnection) registerSerialQueueHandlers() {
 
 	// ADC responses
 	mc.sqAdapter.RegisterHandler("analog_in_state", func(name string, params map[string]interface{}, sentTime, receiveTime float64) {
+		mc.tracef("MCU %s: ADC response received: %v\n", mc.name, params)
 		mc.dispatchSQMessage(name, params, receiveTime)
 	})
 
@@ -938,11 +972,22 @@ func (mc *MCUConnection) handleShutdownSQ(params map[string]interface{}) {
 	defer mc.mu.Unlock()
 
 	mc.shutdown = true
-	if reason, ok := params["static_string_id"].(int); ok {
-		mc.shutdownReason = fmt.Sprintf("static_string_id=%d", reason)
-	}
+	mc.shutdownReason = mc.decodeShutdownReasonLocked(params)
 
 	mc.tracef("MCU %s: Shutdown received: %s\n", mc.name, mc.shutdownReason)
+}
+
+// handleIsShutdownSQ handles MCU shutdown state report via SerialQueueAdapter.
+func (mc *MCUConnection) handleIsShutdownSQ(params map[string]interface{}) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	// MCU is in shutdown state - record it locally so callers can react.
+	mc.shutdown = true
+	if mc.shutdownReason == "" {
+		mc.shutdownReason = mc.decodeShutdownReasonLocked(params)
+	}
+	mc.tracef("MCU %s: is_shutdown received: %s\n", mc.name, mc.shutdownReason)
 }
 
 // handleClockResponseSQ handles clock synchronization response via SerialQueueAdapter.
@@ -1026,11 +1071,38 @@ func (mc *MCUConnection) handleShutdown(msg *mcupkg.Message) {
 	defer mc.mu.Unlock()
 
 	mc.shutdown = true
-	if reason, ok := msg.Params["static_string_id"].(int); ok {
-		mc.shutdownReason = fmt.Sprintf("static_string_id=%d", reason)
-	}
+	mc.shutdownReason = mc.decodeShutdownReasonLocked(msg.Params)
 
 	mc.tracef("MCU %s: Shutdown received: %s\n", mc.name, mc.shutdownReason)
+}
+
+// handleIsShutdown handles MCU shutdown state report (sent while in shutdown).
+func (mc *MCUConnection) handleIsShutdown(msg *mcupkg.Message) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	mc.shutdown = true
+	if mc.shutdownReason == "" {
+		mc.shutdownReason = mc.decodeShutdownReasonLocked(msg.Params)
+	}
+	mc.tracef("MCU %s: is_shutdown received: %s\n", mc.name, mc.shutdownReason)
+}
+
+func (mc *MCUConnection) decodeShutdownReasonLocked(params map[string]interface{}) string {
+	// The protocol may decode static_string_id as either an enum string or a raw int.
+	if s, ok := params["static_string_id"].(string); ok && s != "" {
+		return s
+	}
+	if reason, ok := params["static_string_id"].(int); ok {
+		return fmt.Sprintf("static_string_id=%d", reason)
+	}
+	if reason, ok := params["static_string_id"].(int32); ok {
+		return fmt.Sprintf("static_string_id=%d", reason)
+	}
+	if reason, ok := params["static_string_id"].(int64); ok {
+		return fmt.Sprintf("static_string_id=%d", reason)
+	}
+	return "unknown shutdown reason"
 }
 
 // handleClockResponse handles clock synchronization response.
@@ -1208,6 +1280,22 @@ func (mc *MCUConnection) ShutdownReason() string {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 	return mc.shutdownReason
+}
+
+// clearShutdown sends clear_shutdown command to MCU to clear any previous shutdown state.
+func (mc *MCUConnection) clearShutdown() error {
+	mc.tracef("MCU %s: Clearing shutdown state\n", mc.name)
+	if err := mc.SendCommand("clear_shutdown", nil); err != nil {
+		return fmt.Errorf("clear_shutdown: %w", err)
+	}
+
+	// Reset local shutdown state
+	mc.mu.Lock()
+	mc.shutdown = false
+	mc.shutdownReason = ""
+	mc.mu.Unlock()
+
+	return nil
 }
 
 // Name returns the MCU name.

@@ -156,7 +156,7 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 	}
 	drainBuf := make([]byte, protocol.MESSAGE_MAX)
 	drainCount := 0
-	for drainCount < 10 { // Max 10 reads
+	for drainCount < 50 { // Max 50 reads to clear queued messages from configured MCU
 		n, err := port.Read(drainBuf)
 		if err != nil || n == 0 {
 			break // No more data available, stop draining
@@ -165,6 +165,7 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 			fmt.Fprintf(cfg.Trace, "Handshake: Drained %d bytes: %x\n", n, drainBuf[:n])
 		}
 		drainCount++
+		time.Sleep(50 * time.Millisecond) // Allow more data to arrive
 	}
 	if cfg.Trace != nil {
 		fmt.Fprintf(cfg.Trace, "Handshake: Drain complete after %d reads\n", drainCount)
@@ -175,7 +176,7 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 	seq := 0
 	iteration := 0
 	unexpectedCount := 0
-	const maxUnexpected = 50 // Allow many unexpected messages (MCU may be sending status)
+	const maxUnexpected = 200 // Allow many unexpected messages (MCU may be in configured state sending ADC data)
 
 	if cfg.Trace != nil {
 		remaining := time.Until(deadline)

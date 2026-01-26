@@ -7,6 +7,7 @@ package chelper
 import (
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 
@@ -263,6 +264,12 @@ func (a *SerialQueueAdapter) receiveLoop() {
 
 // decodeAndDispatch decodes a raw message and calls the appropriate handler.
 func (a *SerialQueueAdapter) decodeAndDispatch(pqm PullQueueMessage) {
+	// Validate message length before slicing
+	if pqm.Len <= 0 || pqm.Len > len(pqm.Msg) {
+		atomic.AddUint64(&a.decodeErrors, 1)
+		return
+	}
+
 	// Extract message data (skip msgblock header if present)
 	data := pqm.Msg[:pqm.Len]
 
@@ -308,6 +315,8 @@ func (a *SerialQueueAdapter) decodeMessage(data []byte) (string, map[string]inte
 	// Look up the response format
 	format, ok := a.responseFormats[int(cmdID)]
 	if !ok {
+		// Debug: log unknown message IDs
+		log.Printf("SerialQueue: Unknown response ID: %d (data=%x)", cmdID, data[:min(len(data), 16)])
 		return "", nil, fmt.Errorf("unknown response ID: %d", cmdID)
 	}
 

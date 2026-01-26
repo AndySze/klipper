@@ -67,6 +67,7 @@ func main() {
 	socket := flag.Bool("socket", false, "Connect via Unix socket instead of serial port (for Linux MCU simulator)")
 	tcp := flag.Bool("tcp", false, "Connect via TCP (e.g., -device localhost:5555 -tcp)")
 	linux := flag.Bool("linux", false, "Use Linux-style GPIO pins (gpio0, gpio1) instead of ARM-style (PA0, PA1)")
+	moonraker := flag.String("moonraker", "", "Moonraker API server address (e.g., ':7125' or '0.0.0.0:7125')")
 
 	flag.Parse()
 
@@ -115,6 +116,12 @@ func main() {
 	ri := hosth4.NewRealtimeIntegration()
 	if *trace {
 		ri.SetTrace(os.Stdout)
+	}
+
+	// Configure Moonraker API server if requested
+	if *moonraker != "" {
+		ri.SetMoonrakerAddr(*moonraker)
+		fmt.Printf("Moonraker API server will start on %s\n", *moonraker)
 	}
 
 	// Add MCU

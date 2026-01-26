@@ -48,6 +48,10 @@ type RealtimeIntegration struct {
 
 	// Callbacks
 	onShutdown []func(reason string)
+
+	// Moonraker API server
+	moonraker     *MoonrakerIntegration
+	moonrakerAddr string
 }
 
 // realtimeTempSensor holds state for an MCU-connected temperature sensor.
@@ -162,6 +166,14 @@ func (ri *RealtimeIntegration) SetRuntime(rt *runtime) {
 	ri.runtime = rt
 }
 
+// SetMoonrakerAddr sets the address for the Moonraker API server.
+// Format: ":7125" or "0.0.0.0:7125". Empty string disables Moonraker.
+func (ri *RealtimeIntegration) SetMoonrakerAddr(addr string) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	ri.moonrakerAddr = addr
+}
+
 // MCUManager returns the underlying MCU manager.
 func (ri *RealtimeIntegration) MCUManager() *MCUManager {
 	return ri.mcuManager
@@ -181,12 +193,44 @@ func (ri *RealtimeIntegration) Connect() error {
 	// Register message handlers for all MCU types
 	ri.registerMessageHandlers()
 
+	// Start Moonraker API server if configured
+	ri.mu.RLock()
+	moonrakerAddr := ri.moonrakerAddr
+	runtime := ri.runtime
+	ri.mu.RUnlock()
+
+	if moonrakerAddr != "" {
+		ri.mu.Lock()
+		// Moonraker can work without runtime (with limited functionality)
+		ri.moonraker = NewMoonrakerIntegration(runtime, ri.mcuManager, moonrakerAddr)
+		ri.mu.Unlock()
+
+		if err := ri.moonraker.Start(); err != nil {
+			return fmt.Errorf("failed to start Moonraker server: %w", err)
+		}
+	}
+
 	return nil
 }
 
 // Disconnect closes all MCU connections.
 func (ri *RealtimeIntegration) Disconnect() error {
+	// Stop Moonraker server if running
+	ri.mu.Lock()
+	if ri.moonraker != nil {
+		ri.moonraker.Stop()
+		ri.moonraker = nil
+	}
+	ri.mu.Unlock()
+
 	return ri.mcuManager.Disconnect()
+}
+
+// Moonraker returns the MoonrakerIntegration for setting callbacks.
+func (ri *RealtimeIntegration) Moonraker() *MoonrakerIntegration {
+	ri.mu.RLock()
+	defer ri.mu.RUnlock()
+	return ri.moonraker
 }
 
 // registerMessageHandlers sets up handlers for common MCU messages.
@@ -408,6 +452,16 @@ func (ri *RealtimeIntegration) GetTempSensorReading(name string) (temp float64, 
 	sensor.mu.RUnlock()
 
 	return temp, readTime, nil
+}
+
+// GetTemperature returns the current temperature for a named sensor.
+// Returns the temperature and true if the sensor exists, or 0.0 and false if not.
+func (ri *RealtimeIntegration) GetTemperature(name string) (float64, bool) {
+	temp, _, err := ri.GetTempSensorReading(name)
+	if err != nil {
+		return 0.0, false
+	}
+	return temp, true
 }
 
 // ============================================================================

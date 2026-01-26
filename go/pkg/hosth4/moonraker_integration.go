@@ -11,19 +11,30 @@ import (
 
 // MoonrakerIntegration manages the Moonraker API server integration.
 type MoonrakerIntegration struct {
-	rt       *runtime
-	server   *moonraker.Server
-	adapter  *moonraker.PrinterAdapter
-	addr     string
-	running  bool
+	rt         *runtime
+	mcuManager *MCUManager
+	server     *moonraker.Server
+	adapter    *moonraker.PrinterAdapter
+	addr       string
+	running    bool
+
+	// Callbacks for external integration
+	gcodeCallback       func(string) error
+	tempCallback        func(name string) (temp, target float64)
+	emergencyCallback   func()
+	positionCallback    func() [4]float64          // Returns [X, Y, Z, E] position
+	homedAxesCallback   func() string              // Returns "xyz" style string
+	feedrateCallback    func() float64             // Returns feedrate in mm/s
+	absoluteCallback    func() (coords, extrude bool)
 }
 
 // NewMoonrakerIntegration creates a new Moonraker integration.
-func NewMoonrakerIntegration(rt *runtime, addr string) *MoonrakerIntegration {
+func NewMoonrakerIntegration(rt *runtime, mcuManager *MCUManager, addr string) *MoonrakerIntegration {
 	mi := &MoonrakerIntegration{
-		rt:      rt,
-		addr:    addr,
-		adapter: moonraker.NewPrinterAdapter(),
+		rt:         rt,
+		mcuManager: mcuManager,
+		addr:       addr,
+		adapter:    moonraker.NewPrinterAdapter(),
 	}
 
 	// Register status providers
@@ -56,7 +67,7 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 
 	// Print stats
 	mi.adapter.RegisterStatusProvider("print_stats", func(attrs []string) map[string]any {
-		if mi.rt.printStats != nil {
+		if mi.rt != nil && mi.rt.printStats != nil {
 			return moonraker.FilterStatus(mi.rt.printStats.GetStatus(), attrs)
 		}
 		return map[string]any{
@@ -71,7 +82,7 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 
 	// Virtual SD card
 	mi.adapter.RegisterStatusProvider("virtual_sdcard", func(attrs []string) map[string]any {
-		if mi.rt.sdcard != nil {
+		if mi.rt != nil && mi.rt.sdcard != nil {
 			return moonraker.FilterStatus(mi.rt.sdcard.GetStatus(), attrs)
 		}
 		return map[string]any{
@@ -85,7 +96,7 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 
 	// Pause/Resume
 	mi.adapter.RegisterStatusProvider("pause_resume", func(attrs []string) map[string]any {
-		if mi.rt.pauseResume != nil {
+		if mi.rt != nil && mi.rt.pauseResume != nil {
 			return moonraker.FilterStatus(mi.rt.pauseResume.GetStatus(), attrs)
 		}
 		return map[string]any{"is_paused": false}
@@ -101,27 +112,56 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 
 	// GCode move
 	mi.adapter.RegisterStatusProvider("gcode_move", func(attrs []string) map[string]any {
-		if mi.rt.gm != nil {
+		if mi.rt != nil && mi.rt.gm != nil {
 			return moonraker.FilterStatus(mi.rt.gm.GetStatus(), attrs)
 		}
+		// Use callbacks for position and mode
+		pos := []float64{0, 0, 0, 0}
+		absCoords := true
+		absExtrude := false
+		speed := 0.0
+
+		if mi.positionCallback != nil {
+			p := mi.positionCallback()
+			pos = []float64{p[0], p[1], p[2], p[3]}
+		}
+		if mi.absoluteCallback != nil {
+			absCoords, absExtrude = mi.absoluteCallback()
+		}
+		if mi.feedrateCallback != nil {
+			speed = mi.feedrateCallback() * 60.0 // Convert to mm/min
+		}
+
 		return map[string]any{
 			"speed_factor":         1.0,
-			"speed":                0.0,
+			"speed":                speed,
 			"extrude_factor":       1.0,
-			"absolute_coordinates": true,
-			"absolute_extrude":     false,
+			"absolute_coordinates": absCoords,
+			"absolute_extrude":     absExtrude,
 			"homing_origin":        []float64{0, 0, 0, 0},
-			"position":             []float64{0, 0, 0, 0},
-			"gcode_position":       []float64{0, 0, 0, 0},
+			"position":             pos,
+			"gcode_position":       pos,
 		}
 	})
 
 	// Toolhead
 	mi.adapter.RegisterStatusProvider("toolhead", func(attrs []string) map[string]any {
+		// Get position and homed axes from callbacks
+		pos := []float64{0, 0, 0, 0}
+		homedAxes := ""
+
+		if mi.positionCallback != nil {
+			p := mi.positionCallback()
+			pos = []float64{p[0], p[1], p[2], p[3]}
+		}
+		if mi.homedAxesCallback != nil {
+			homedAxes = mi.homedAxesCallback()
+		}
+
 		status := map[string]any{
-			"position":               []float64{0, 0, 0, 0},
+			"position":               pos,
 			"extruder":               "extruder",
-			"homed_axes":             "",
+			"homed_axes":             homedAxes,
 			"print_time":             0.0,
 			"estimated_print_time":   0.0,
 			"max_velocity":           500.0,
@@ -129,7 +169,7 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 			"max_accel_to_decel":     1500.0,
 			"square_corner_velocity": 5.0,
 		}
-		if mi.rt.toolhead != nil {
+		if mi.rt != nil && mi.rt.toolhead != nil {
 			status["max_velocity"] = mi.rt.toolhead.maxVelocity
 			status["max_accel"] = mi.rt.toolhead.maxAccel
 			status["square_corner_velocity"] = mi.rt.toolhead.squareCornerV
@@ -151,10 +191,18 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 			"pressure_advance": 0.0,
 			"smooth_time":      0.04,
 		}
-		// Try to get heater data if available
-		if mi.rt.heaterManager != nil {
+		// Try callback first
+		if mi.tempCallback != nil {
+			temp, target := mi.tempCallback("extruder")
+			status["temperature"] = temp
+			status["target"] = target
+			if temp > 170 { // Typical extrusion threshold
+				status["can_extrude"] = true
+			}
+		} else if mi.rt != nil && mi.rt.heaterManager != nil {
+			// Try to get heater data from runtime
 			if heater, err := mi.rt.heaterManager.GetHeater("extruder"); err == nil && heater != nil {
-				temp, target := heater.GetTemp(0.0) // eventtime = 0 for now
+				temp, target := heater.GetTemp(0.0)
 				status["temperature"] = temp
 				status["target"] = target
 			}
@@ -169,9 +217,14 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 			"target":      0.0,
 			"power":       0.0,
 		}
-		if mi.rt.heaterManager != nil {
+		// Try callback first
+		if mi.tempCallback != nil {
+			temp, target := mi.tempCallback("heater_bed")
+			status["temperature"] = temp
+			status["target"] = target
+		} else if mi.rt != nil && mi.rt.heaterManager != nil {
 			if heater, err := mi.rt.heaterManager.GetHeater("heater_bed"); err == nil && heater != nil {
-				temp, target := heater.GetTemp(0.0) // eventtime = 0 for now
+				temp, target := heater.GetTemp(0.0)
 				status["temperature"] = temp
 				status["target"] = target
 			}
@@ -215,7 +268,7 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 			"live_extruder_velocity": 0.0,
 		}
 		// Get position from toolhead if available
-		if mi.rt.toolhead != nil && len(mi.rt.toolhead.commandedPos) > 0 {
+		if mi.rt != nil && mi.rt.toolhead != nil && len(mi.rt.toolhead.commandedPos) > 0 {
 			status["live_position"] = mi.rt.toolhead.commandedPos
 		}
 		return moonraker.FilterStatus(status, attrs)
@@ -292,29 +345,85 @@ func (mi *MoonrakerIntegration) Stop() error {
 	return mi.server.Stop()
 }
 
+// SetGCodeCallback sets the callback for G-code execution.
+func (mi *MoonrakerIntegration) SetGCodeCallback(cb func(string) error) {
+	mi.gcodeCallback = cb
+}
+
+// SetTempCallback sets the callback for temperature reading.
+func (mi *MoonrakerIntegration) SetTempCallback(cb func(name string) (temp, target float64)) {
+	mi.tempCallback = cb
+}
+
+// SetEmergencyCallback sets the callback for emergency stop.
+func (mi *MoonrakerIntegration) SetEmergencyCallback(cb func()) {
+	mi.emergencyCallback = cb
+}
+
+// SetPositionCallback sets the callback for getting current position.
+func (mi *MoonrakerIntegration) SetPositionCallback(cb func() [4]float64) {
+	mi.positionCallback = cb
+}
+
+// SetHomedAxesCallback sets the callback for getting homed axes.
+func (mi *MoonrakerIntegration) SetHomedAxesCallback(cb func() string) {
+	mi.homedAxesCallback = cb
+}
+
+// SetFeedrateCallback sets the callback for getting current feedrate.
+func (mi *MoonrakerIntegration) SetFeedrateCallback(cb func() float64) {
+	mi.feedrateCallback = cb
+}
+
+// SetAbsoluteCallback sets the callback for getting coordinate mode.
+func (mi *MoonrakerIntegration) SetAbsoluteCallback(cb func() (coords, extrude bool)) {
+	mi.absoluteCallback = cb
+}
+
 // executeGCode executes a G-code script.
 func (mi *MoonrakerIntegration) executeGCode(line string) error {
-	// Log the gcode execution request
 	log.Printf("Moonraker: executing gcode: %s", line)
-	// In a full implementation, this would execute via the runtime's gcode handler
+	if mi.gcodeCallback != nil {
+		return mi.gcodeCallback(line)
+	}
+	// Fallback: log only
+	log.Printf("Moonraker: no gcode handler, command ignored: %s", line)
 	return nil
 }
 
 // emergencyStop triggers an emergency stop.
 func (mi *MoonrakerIntegration) emergencyStop() {
 	log.Println("Moonraker: emergency stop triggered")
-	// In a full implementation, this would trigger the runtime's emergency stop
+	if mi.emergencyCallback != nil {
+		mi.emergencyCallback()
+	}
 }
 
 // getKlippyState returns the current Klippy state.
 func (mi *MoonrakerIntegration) getKlippyState() string {
-	if mi.rt == nil {
-		return "disconnected"
+	// Check runtime state first if available
+	if mi.rt != nil {
+		if mi.rt.closed {
+			return "shutdown"
+		}
+		return "ready"
 	}
-	if mi.rt.closed {
-		return "shutdown"
+
+	// Fall back to MCU manager state if no runtime
+	if mi.mcuManager != nil {
+		// Check if any MCU is connected
+		mcus := mi.mcuManager.ListMCUs()
+		if len(mcus) > 0 {
+			for _, mcuInfo := range mcus {
+				mcu := mi.mcuManager.GetMCU(mcuInfo.Name)
+				if mcu != nil && mcu.IsConnected() {
+					return "ready"
+				}
+			}
+		}
 	}
-	return "ready"
+
+	return "disconnected"
 }
 
 // getStateMessage returns a human-readable state message.
