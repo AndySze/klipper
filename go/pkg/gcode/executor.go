@@ -129,10 +129,20 @@ func (e *Executor) Configure() error {
 	}
 
 	if v, ok := resp["is_config"].(int); ok && v != 0 {
-		log.Println("MCU already configured")
-		e.isConfigured = true
-		return nil
+		// When the MCU is already configured, we don't know the OID map and
+		// cannot safely start ADC queries / motion. Require a reset to get a
+		// clean session (this matches upstream behavior).
+		return fmt.Errorf("MCU already configured; restart/reset the MCU and reconnect")
 	}
+
+	// Reduce serial traffic during configuration. On slower MCUs (eg, AVR), a
+	// burst of config commands plus frequent get_clock polling can cause the MCU
+	// to fall behind and enter shutdown ("timer too close" / "rescheduled timer
+	// in the past"). We'll resume full clock polling after configuration.
+	e.mcu.SetClockSyncEnabled(false)
+	defer e.mcu.SetClockSyncEnabled(true)
+	e.mcu.SetSendSpacing(2 * time.Millisecond)
+	defer e.mcu.SetSendSpacing(0)
 
 	// Count required OIDs
 	oidCount := 0
@@ -187,6 +197,13 @@ func (e *Executor) Configure() error {
 	// Finalize configuration
 	if err := e.mcu.SendCommand("finalize_config", map[string]interface{}{"crc": 0}); err != nil {
 		return fmt.Errorf("finalize_config: %w", err)
+	}
+
+	// If the MCU immediately enters shutdown after finalize_config, fail fast so
+	// temperature doesn't silently stay at 0.0.
+	time.Sleep(200 * time.Millisecond)
+	if e.mcu.IsShutdown() {
+		return fmt.Errorf("MCU entered shutdown after finalize_config: %s", e.mcu.ShutdownReason())
 	}
 
 	e.isConfigured = true
@@ -478,19 +495,25 @@ func (e *Executor) configureExtruder() error {
 	e.nextOid++
 	e.pwmOids["extruder"] = pwmOid
 
-	cycleTime := 0.1 // 100ms default
-	cycleTicks := int(cycleTime * e.mcuFreq)
-	if err := e.mcu.SendCommand("config_pwm_out", map[string]interface{}{
+	// Use soft PWM via digital_out for maximum pin compatibility (AVR hard PWM
+	// only supports a subset of pins and will shutdown on invalid pins).
+	if err := e.mcu.SendCommand("config_digital_out", map[string]interface{}{
 		"oid":           pwmOid,
 		"pin":           cfg.HeaterPin,
-		"cycle_ticks":   cycleTicks,
 		"value":         0,
 		"default_value": 0,
 		"max_duration":  0,
 	}); err != nil {
-		return fmt.Errorf("config_pwm_out: %w", err)
+		return fmt.Errorf("config_digital_out (heater): %w", err)
 	}
-	log.Printf("  config_pwm_out oid=%d (extruder heater) pin=%s", pwmOid, cfg.HeaterPin)
+	cycleTicks := int(0.1 * e.mcuFreq) // 100ms default
+	if err := e.mcu.SendCommand("set_digital_out_pwm_cycle", map[string]interface{}{
+		"oid":         pwmOid,
+		"cycle_ticks": cycleTicks,
+	}); err != nil {
+		return fmt.Errorf("set_digital_out_pwm_cycle (heater): %w", err)
+	}
+	log.Printf("  config_digital_out oid=%d (extruder heater) pin=%s", pwmOid, cfg.HeaterPin)
 
 	return nil
 }
@@ -517,19 +540,24 @@ func (e *Executor) configureHeaterBed() error {
 	e.nextOid++
 	e.pwmOids["heater_bed"] = pwmOid
 
-	cycleTime := 0.1 // 100ms default
-	cycleTicks := int(cycleTime * e.mcuFreq)
-	if err := e.mcu.SendCommand("config_pwm_out", map[string]interface{}{
+	// Use soft PWM via digital_out for maximum pin compatibility.
+	if err := e.mcu.SendCommand("config_digital_out", map[string]interface{}{
 		"oid":           pwmOid,
 		"pin":           cfg.HeaterPin,
-		"cycle_ticks":   cycleTicks,
 		"value":         0,
 		"default_value": 0,
 		"max_duration":  0,
 	}); err != nil {
-		return fmt.Errorf("config_pwm_out: %w", err)
+		return fmt.Errorf("config_digital_out (heater_bed): %w", err)
 	}
-	log.Printf("  config_pwm_out oid=%d (heater_bed) pin=%s", pwmOid, cfg.HeaterPin)
+	cycleTicks := int(0.1 * e.mcuFreq) // 100ms default
+	if err := e.mcu.SendCommand("set_digital_out_pwm_cycle", map[string]interface{}{
+		"oid":         pwmOid,
+		"cycle_ticks": cycleTicks,
+	}); err != nil {
+		return fmt.Errorf("set_digital_out_pwm_cycle (heater_bed): %w", err)
+	}
+	log.Printf("  config_digital_out oid=%d (heater_bed heater) pin=%s", pwmOid, cfg.HeaterPin)
 
 	return nil
 }
@@ -551,30 +579,23 @@ func (e *Executor) configureFan(name string, cfg *config.FanConfig) error {
 	}
 	cycleTicks := int(cycleTime * e.mcuFreq)
 
-	// Use hardware PWM for fans (soft PWM not available on all MCUs)
-	if err := e.mcu.SendCommand("config_pwm_out", map[string]interface{}{
+	// Use soft PWM via digital_out to avoid MCU shutdown on invalid hard PWM pins.
+	if err := e.mcu.SendCommand("config_digital_out", map[string]interface{}{
 		"oid":           pwmOid,
 		"pin":           cfg.Pin,
-		"cycle_ticks":   cycleTicks,
 		"value":         0,
 		"default_value": 0,
 		"max_duration":  0,
 	}); err != nil {
-		// Fall back to digital out if PWM fails
-		log.Printf("  Warning: PWM failed for fan %s, trying digital out", name)
-		if err := e.mcu.SendCommand("config_digital_out", map[string]interface{}{
-			"oid":           pwmOid,
-			"pin":           cfg.Pin,
-			"value":         0,
-			"default_value": 0,
-			"max_duration":  0,
-		}); err != nil {
-			return fmt.Errorf("config_digital_out: %w", err)
-		}
-		log.Printf("  config_digital_out oid=%d (%s) pin=%s", pwmOid, name, cfg.Pin)
-		return nil
+		return fmt.Errorf("config_digital_out (fan): %w", err)
 	}
-	log.Printf("  config_pwm_out oid=%d (%s) pin=%s", pwmOid, name, cfg.Pin)
+	if err := e.mcu.SendCommand("set_digital_out_pwm_cycle", map[string]interface{}{
+		"oid":         pwmOid,
+		"cycle_ticks": cycleTicks,
+	}); err != nil {
+		return fmt.Errorf("set_digital_out_pwm_cycle (fan): %w", err)
+	}
+	log.Printf("  config_digital_out oid=%d (%s) pin=%s", pwmOid, name, cfg.Pin)
 
 	return nil
 }

@@ -31,6 +31,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -47,6 +48,8 @@ func main() {
 	trace := flag.Bool("trace", false, "Enable debug tracing")
 	logFile := flag.String("logfile", "", "Log file path (default: stdout)")
 	reset := flag.Bool("reset", false, "Reset MCU on connect (DTR signal)")
+	defaultSerialQueue := runtime.GOOS != "darwin"
+	serialqueue := flag.Bool("serialqueue", defaultSerialQueue, "Use chelper serialqueue transport (off by default on macOS)")
 
 	flag.Parse()
 
@@ -107,7 +110,7 @@ func main() {
 	cfg.BaudRate = printerCfg.Baud
 	cfg.ConnectTimeout = 60 * time.Second
 	cfg.ResetOnConnect = *reset
-	// Note: UseSerialQueue=false uses simple reader; set to true for chelper serialqueue
+	cfg.UseSerialQueue = *serialqueue
 
 	if *trace {
 		cfg.Trace = os.Stdout
@@ -132,84 +135,113 @@ func main() {
 	// Set up signal handler for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	shutdownCh := make(chan struct{})
+	go func() {
+		<-sigCh
+		close(shutdownCh)
+	}()
 
-	// Connect to MCU
-	log.Println("Connecting to MCU...")
-	if err := ri.Connect(); err != nil {
-		log.Fatalf("Failed to connect to MCU: %v", err)
+	// Run startup in a goroutine so Ctrl+C works even if connect/handshake blocks.
+	type startupResult struct {
+		executor *gcode.Executor
+		err      error
+	}
+	startCh := make(chan startupResult, 1)
+	go func() {
+		// Connect to MCU
+		log.Println("Connecting to MCU...")
+		if err := ri.Connect(); err != nil {
+			startCh <- startupResult{err: fmt.Errorf("failed to connect to MCU: %w", err)}
+			return
+		}
+
+		// Wait for MCU to be ready
+		log.Println("Waiting for MCU ready...")
+		if err := ri.WaitReady(60 * time.Second); err != nil {
+			startCh <- startupResult{err: fmt.Errorf("MCU not ready: %w", err)}
+			return
+		}
+
+		// Get MCU info
+		mcu := ri.MCUManager().GetMCU("mcu")
+		if mcu != nil {
+			log.Printf("MCU frequency: %.0f Hz", mcu.MCUFreq())
+		}
+
+		// Create G-code executor
+		executor := gcode.NewExecutor(printerCfg, ri)
+
+		// Configure hardware on MCU
+		log.Println("Configuring printer hardware...")
+		if err := executor.Configure(); err != nil {
+			startCh <- startupResult{err: fmt.Errorf("failed to configure hardware: %w", err)}
+			return
+		}
+		log.Println("Hardware configuration complete")
+
+		// Set up Moonraker callbacks
+		if moonraker := ri.Moonraker(); moonraker != nil {
+			// G-code execution callback
+			moonraker.SetGCodeCallback(func(gcodeCmd string) error {
+				log.Printf("G-code received: %s", gcodeCmd)
+				// Execute each line
+				for _, line := range strings.Split(gcodeCmd, "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+					if err := executor.Execute(line); err != nil {
+						log.Printf("G-code error: %v", err)
+						return err
+					}
+				}
+				return nil
+			})
+
+			// Temperature reading callback
+			moonraker.SetTempCallback(func(name string) (temp, target float64) {
+				return executor.GetTemperature(name)
+			})
+
+			// Position callback
+			moonraker.SetPositionCallback(func() [4]float64 {
+				return executor.GetPosition()
+			})
+
+			// Homed axes callback
+			moonraker.SetHomedAxesCallback(func() string {
+				return executor.GetHomedAxesString()
+			})
+
+			// Feedrate callback
+			moonraker.SetFeedrateCallback(func() float64 {
+				return executor.GetFeedrate()
+			})
+
+			// Coordinate mode callback
+			moonraker.SetAbsoluteCallback(func() (coords, extrude bool) {
+				return executor.IsAbsoluteCoords(), executor.IsAbsoluteExtrude()
+			})
+
+			log.Println("Moonraker callbacks configured")
+		}
+
+		startCh <- startupResult{executor: executor, err: nil}
+	}()
+
+	select {
+	case <-shutdownCh:
+		log.Printf("Received shutdown signal, exiting...")
+		_ = ri.Disconnect()
+		return
+	case res := <-startCh:
+		if res.err != nil {
+			_ = ri.Disconnect()
+			log.Fatalf("%v", res.err)
+		}
+		_ = res.executor
 	}
 	defer ri.Disconnect()
-
-	log.Println("MCU connected successfully")
-
-	// Wait for MCU to be ready
-	log.Println("Waiting for MCU ready...")
-	if err := ri.WaitReady(60 * time.Second); err != nil {
-		log.Fatalf("MCU not ready: %v", err)
-	}
-
-	// Get MCU info
-	mcu := ri.MCUManager().GetMCU("mcu")
-	if mcu != nil {
-		log.Printf("MCU frequency: %.0f Hz", mcu.MCUFreq())
-	}
-
-	// Create G-code executor
-	executor := gcode.NewExecutor(printerCfg, ri)
-
-	// Configure hardware on MCU
-	log.Println("Configuring printer hardware...")
-	if err := executor.Configure(); err != nil {
-		log.Fatalf("Failed to configure hardware: %v", err)
-	}
-	log.Println("Hardware configuration complete")
-
-	// Set up Moonraker callbacks
-	if moonraker := ri.Moonraker(); moonraker != nil {
-		// G-code execution callback
-		moonraker.SetGCodeCallback(func(gcodeCmd string) error {
-			log.Printf("G-code received: %s", gcodeCmd)
-			// Execute each line
-			for _, line := range strings.Split(gcodeCmd, "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				if err := executor.Execute(line); err != nil {
-					log.Printf("G-code error: %v", err)
-					return err
-				}
-			}
-			return nil
-		})
-
-		// Temperature reading callback
-		moonraker.SetTempCallback(func(name string) (temp, target float64) {
-			return executor.GetTemperature(name)
-		})
-
-		// Position callback
-		moonraker.SetPositionCallback(func() [4]float64 {
-			return executor.GetPosition()
-		})
-
-		// Homed axes callback
-		moonraker.SetHomedAxesCallback(func() string {
-			return executor.GetHomedAxesString()
-		})
-
-		// Feedrate callback
-		moonraker.SetFeedrateCallback(func() float64 {
-			return executor.GetFeedrate()
-		})
-
-		// Coordinate mode callback
-		moonraker.SetAbsoluteCallback(func() (coords, extrude bool) {
-			return executor.IsAbsoluteCoords(), executor.IsAbsoluteExtrude()
-		})
-
-		log.Println("Moonraker callbacks configured")
-	}
 
 	log.Println("========================================")
 	log.Println("Klipper-Go Host Ready")
@@ -218,7 +250,7 @@ func main() {
 	log.Println("========================================")
 
 	// Main loop - wait for shutdown signal
-	<-sigCh
+	<-shutdownCh
 
 	log.Println("")
 	log.Println("Shutting down...")

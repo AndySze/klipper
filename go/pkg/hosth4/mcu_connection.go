@@ -85,9 +85,9 @@ func DefaultMCUConnectionConfig() MCUConnectionConfig {
 	return MCUConnectionConfig{
 		BaudRate:          250000,
 		ConnectTimeout:    60 * time.Second,
-		HandshakeTimeout:  15 * time.Second, // Allow time for reset, drain, and identify
+		HandshakeTimeout:  60 * time.Second, // Allow time for reset, drain, and identify on noisy links
 		ResponseTimeout:   2 * time.Second,  // Match testSerial timeout
-		ClockSyncInterval: 100 * time.Millisecond,
+		ClockSyncInterval: 250 * time.Millisecond,
 		ClockSyncSamples:  8,
 		ResetOnConnect:    false, // Disable reset - use extended drain instead
 	}
@@ -127,6 +127,7 @@ type MCUConnection struct {
 	clockSynced   bool
 	clockSamples  []clockSample
 	clockSyncStop chan struct{}
+	clockSyncEnabled bool
 
 	// Message handlers
 	handlers    map[string]MCUMessageHandler
@@ -137,6 +138,13 @@ type MCUConnection struct {
 	connected      bool
 	shutdown       bool
 	shutdownReason string
+
+	// Legacy send pacing (used when UseSerialQueue=false). This can help avoid
+	// flooding slower MCUs during configuration.
+	sendSpacing time.Duration
+
+	// Cached reverse mapping for shutdown reasons (static_string_id -> string)
+	staticStringByID map[int]string
 
 	// OID allocation
 	oidCount int // Next OID to allocate (starts at 0)
@@ -188,6 +196,7 @@ func NewMCUConnection(name string, cfg MCUConnectionConfig) *MCUConnection {
 		config:        cfg,
 		handlers:      make(map[string]MCUMessageHandler),
 		oidHandlers:   make(map[int]map[string]MCUMessageHandler),
+		clockSyncEnabled: true,
 		ctx:           ctx,
 		cancel:        cancel,
 		cmdQueue:      make(chan mcuCmd, 100),
@@ -309,6 +318,9 @@ func (mc *MCUConnection) Connect() error {
 		return fmt.Errorf("mcu %s: identify: %w", mc.name, err)
 	}
 	mc.dict = identifyData.Dictionary
+	// When connecting without a reset, the MCU's internal frame sequence counter
+	// may not be 0. Initialize our legacy sender sequence based on the handshake.
+	mc.cmdSeq = uint8(identifyData.NextSequence) & protocol.MESSAGE_SEQ_MASK
 
 	// Extract MCU frequency from config
 	if freq, ok := mc.dict.Config["CLOCK_FREQ"].(float64); ok {
@@ -321,6 +333,7 @@ func (mc *MCUConnection) Connect() error {
 
 	mc.tracef("MCU %s: Identified - version: %s, freq: %.0f Hz\n",
 		mc.name, identifyData.Version, mc.mcuFreq)
+	mc.tracef("MCU %s: Initial tx sequence=%d\n", mc.name, mc.cmdSeq)
 
 	// Initialize clock conversion factor (MCU clocks per second)
 	mc.clockConv = mc.mcuFreq
@@ -378,6 +391,7 @@ func (mc *MCUConnection) Connect() error {
 
 	// Initialize clock synchronization
 	mc.clockSyncStop = make(chan struct{})
+	mc.clockSyncEnabled = true
 	mc.wg.Add(1)
 	go mc.clockSyncLoop()
 
@@ -696,6 +710,7 @@ func (mc *MCUConnection) sendCommandDirect(cmd mcuCmd) {
 	useSerialQueue := mc.config.UseSerialQueue
 	sqAdapter := mc.sqAdapter
 	port := mc.port
+	sendSpacing := mc.sendSpacing
 	mc.mu.RUnlock()
 
 	if useSerialQueue && sqAdapter != nil {
@@ -718,8 +733,27 @@ func (mc *MCUConnection) sendCommandDirect(cmd mcuCmd) {
 		}
 
 		msg := protocol.EncodeMsgblock(int(seq), cmd.data)
-		port.Write(msg)
+		_, _ = port.Write(msg)
+		if sendSpacing > 0 {
+			time.Sleep(sendSpacing)
+		}
 	}
+}
+
+// SetSendSpacing adds a small delay after each legacy (non-serialqueue) send.
+// This is useful on slow MCUs (eg, AVR) to avoid flooding during configuration.
+func (mc *MCUConnection) SetSendSpacing(d time.Duration) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.sendSpacing = d
+}
+
+// SetClockSyncEnabled enables or disables periodic get_clock polling.
+// Disabling this during configuration can reduce serial traffic on slow MCUs.
+func (mc *MCUConnection) SetClockSyncEnabled(enabled bool) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.clockSyncEnabled = enabled
 }
 
 // encodeCommand encodes a command with parameters.
@@ -1094,15 +1128,56 @@ func (mc *MCUConnection) decodeShutdownReasonLocked(params map[string]interface{
 		return s
 	}
 	if reason, ok := params["static_string_id"].(int); ok {
+		if mc.staticStringByID == nil {
+			mc.staticStringByID = mc.buildStaticStringByIDLocked()
+		}
+		if mc.staticStringByID != nil {
+			if s, ok := mc.staticStringByID[reason]; ok && s != "" {
+				return s
+			}
+		}
 		return fmt.Sprintf("static_string_id=%d", reason)
 	}
 	if reason, ok := params["static_string_id"].(int32); ok {
-		return fmt.Sprintf("static_string_id=%d", reason)
+		id := int(reason)
+		if mc.staticStringByID == nil {
+			mc.staticStringByID = mc.buildStaticStringByIDLocked()
+		}
+		if mc.staticStringByID != nil {
+			if s, ok := mc.staticStringByID[id]; ok && s != "" {
+				return s
+			}
+		}
+		return fmt.Sprintf("static_string_id=%d", id)
 	}
 	if reason, ok := params["static_string_id"].(int64); ok {
-		return fmt.Sprintf("static_string_id=%d", reason)
+		id := int(reason)
+		if mc.staticStringByID == nil {
+			mc.staticStringByID = mc.buildStaticStringByIDLocked()
+		}
+		if mc.staticStringByID != nil {
+			if s, ok := mc.staticStringByID[id]; ok && s != "" {
+				return s
+			}
+		}
+		return fmt.Sprintf("static_string_id=%d", id)
 	}
 	return "unknown shutdown reason"
+}
+
+func (mc *MCUConnection) buildStaticStringByIDLocked() map[int]string {
+	if mc.dict == nil {
+		return nil
+	}
+	enums := mc.dict.Enumerations["static_string_id"]
+	if enums == nil {
+		return nil
+	}
+	out := make(map[int]string, len(enums))
+	for name, id := range enums {
+		out[id] = name
+	}
+	return out
 }
 
 // handleClockResponse handles clock synchronization response.
@@ -1209,6 +1284,12 @@ func (mc *MCUConnection) clockSyncLoop() {
 
 // sendClockRequest sends a get_clock command to the MCU.
 func (mc *MCUConnection) sendClockRequest() {
+	mc.mu.RLock()
+	enabled := mc.clockSyncEnabled
+	mc.mu.RUnlock()
+	if !enabled {
+		return
+	}
 	mc.SendCommand("get_clock", nil)
 }
 

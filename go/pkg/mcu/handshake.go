@@ -17,10 +17,10 @@ import (
 
 // Common errors
 var (
-	ErrTimeout          = errors.New("mcu: handshake timeout")
+	ErrTimeout            = errors.New("mcu: handshake timeout")
 	ErrDictionaryMismatch = errors.New("mcu: dictionary CRC mismatch")
-	ErrInvalidResponse  = errors.New("mcu: invalid identify response")
-	ErrNoResponse       = errors.New("mcu: no response from MCU")
+	ErrInvalidResponse    = errors.New("mcu: invalid identify response")
+	ErrNoResponse         = errors.New("mcu: no response from MCU")
 )
 
 // HandshakeConfig holds configuration for the handshake process.
@@ -73,6 +73,11 @@ type IdentifyData struct {
 
 	// BuildVersions contains build version info
 	BuildVersions string
+
+	// NextSequence is the next expected host message sequence (0-15). This is
+	// needed when connecting without resetting the MCU, as the MCU enforces a
+	// shared sequence counter for all frames.
+	NextSequence int
 }
 
 // Handshake performs the MCU identification handshake.
@@ -177,6 +182,7 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 	iteration := 0
 	unexpectedCount := 0
 	const maxUnexpected = 200 // Allow many unexpected messages (MCU may be in configured state sending ADC data)
+	var rxStream []byte
 
 	if cfg.Trace != nil {
 		remaining := time.Until(deadline)
@@ -187,35 +193,17 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 		iteration++
 		offset := len(identifyData)
 
-		// Build identify command manually for debugging
-		// Format: identify offset=%u count=%c (message ID 1)
-		var cmd []byte
-		protocol.EncodeUint32(&cmd, 1) // Message ID 1
-		protocol.EncodeUint32(&cmd, int32(offset))
-		protocol.EncodeUint32(&cmd, int32(cfg.ReadChunkSize))
-		// Use EncodeMsgblock which sets MESSAGE_DEST - required for MCU to process the message
-		msgBlock := protocol.EncodeMsgblock(seq, cmd)
-		// Don't increment seq yet - only do so on valid response
-
-		if cfg.Trace != nil {
-			fmt.Fprintf(cfg.Trace, "Handshake[%d]: TX offset=%d seq=%d: %x (cmd: %x)\n",
-				iteration, offset, seq, msgBlock, cmd)
-		}
-
-		resp, err := sendWithRetry(port, msgBlock, cfg.MaxRetries, cfg.RetryDelay, deadline, cfg.Trace)
+		resp, newSeq, err := identifyChunk(port, &rxStream, seq, offset, cfg.ReadChunkSize, deadline, cfg.Trace)
+		seq = newSeq
 		if err != nil {
 			if cfg.Trace != nil {
-				fmt.Fprintf(cfg.Trace, "Handshake[%d]: sendWithRetry error: %v\n", iteration, err)
+				fmt.Fprintf(cfg.Trace, "Handshake[%d]: identifyChunk error: %v\n", iteration, err)
 			}
 			if errors.Is(err, ErrTimeout) && len(identifyData) == 0 {
-				// No response at all - MCU might not be connected
+				// No identify_response at all - MCU might not be connected or is stuck
 				return nil, ErrNoResponse
 			}
 			return nil, fmt.Errorf("mcu: identify failed: %w", err)
-		}
-
-		if cfg.Trace != nil {
-			fmt.Fprintf(cfg.Trace, "Handshake[%d]: RX len=%d: %x\n", iteration, len(resp), resp)
 		}
 
 		// Parse identify_response
@@ -234,10 +222,6 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 			}
 			continue
 		}
-
-		// Got valid identify_response - now increment seq for next request
-		seq = (seq + 1) & protocol.MESSAGE_SEQ_MASK
-
 		if cfg.Trace != nil {
 			fmt.Fprintf(cfg.Trace, "Handshake[%d]: parsed OK, respOffset=%d, dataLen=%d\n",
 				iteration, respOffset, len(data))
@@ -304,7 +288,135 @@ func Handshake(port *serial.Port, cfg HandshakeConfig) (*IdentifyData, error) {
 		Dictionary:    dict,
 		Version:       version,
 		BuildVersions: buildVersions,
+		NextSequence:  seq,
 	}, nil
+}
+
+// identifyChunk sends an identify command and waits for a valid identify_response.
+// It auto-resynchronizes the host->MCU sequence number by observing incoming
+// frames (including ack/nak), which is required when connecting to an MCU that
+// was not reset and has an advanced sequence counter.
+func identifyChunk(port *serial.Port, rxStream *[]byte, seq, offset, count int, deadline time.Time, trace io.Writer) ([]byte, int, error) {
+	// Build identify command payload:
+	//   identify offset=%u count=%c
+	var cmd []byte
+	protocol.EncodeUint32(&cmd, 1) // Message ID 1
+	protocol.EncodeUint32(&cmd, int32(offset))
+	protocol.EncodeUint32(&cmd, int32(count))
+
+	// In a noisy environment (configured MCU streaming stats), we may need to
+	// retry the identify request a few times until the correct host sequence is
+	// used and the identify_response is observed.
+	resendDelay := 10 * time.Millisecond
+	resendDeadline := time.Now()
+	for time.Now().Before(deadline) {
+		// Re-send identify periodically; most of the time one send is enough,
+		// but if our seq was wrong we'll receive a NAK/acknak with the expected
+		// sequence and must retry.
+		if time.Now().After(resendDeadline) {
+			msgBlock := protocol.EncodeMsgblock(seq, cmd)
+			if trace != nil {
+				fmt.Fprintf(trace, "Handshake: TX identify offset=%d seq=%d: %x (cmd: %x)\n",
+					offset, seq, msgBlock, cmd)
+			}
+			if _, err := port.Write(msgBlock); err != nil {
+				return nil, seq, err
+			}
+			// Exponential-ish backoff, capped.
+			resendDeadline = time.Now().Add(resendDelay)
+			if resendDelay < 200*time.Millisecond {
+				resendDelay *= 2
+			}
+		}
+
+		frame, err := readNextFrame(port, rxStream, deadline, trace)
+		if err != nil {
+			if errors.Is(err, ErrTimeout) {
+				continue
+			}
+			return nil, seq, err
+		}
+		if frame == nil {
+			continue
+		}
+
+		// MCU uses a single sequence counter for both rx validation and tx
+		// frames; any valid frame reveals the next expected host sequence.
+		seq = int(frame[protocol.MESSAGE_POS_SEQ] & protocol.MESSAGE_SEQ_MASK)
+
+		// Filter: identify_response is msgid 0.
+		if _, _, perr := parseIdentifyResponse(frame); perr == nil {
+			return frame, seq, nil
+		}
+	}
+	return nil, seq, ErrTimeout
+}
+
+func readNextFrame(port *serial.Port, rxStream *[]byte, deadline time.Time, trace io.Writer) ([]byte, error) {
+	buf := make([]byte, protocol.MESSAGE_MAX)
+	for time.Now().Before(deadline) {
+		// Try to extract a full frame from buffered data first.
+		if frame := popFrame(rxStream); frame != nil {
+			return frame, nil
+		}
+		// Need more data.
+		n, err := port.Read(buf)
+		if trace != nil {
+			fmt.Fprintf(trace, "  handshake: Read returned n=%d, err=%v\n", n, err)
+			if n > 0 {
+				fmt.Fprintf(trace, "  handshake: RX chunk: %x\n", buf[:n])
+			}
+		}
+		if n > 0 {
+			*rxStream = append(*rxStream, buf[:n]...)
+			continue
+		}
+		if err != nil {
+			if errors.Is(err, serial.ErrTimeout) || err.Error() == "serial: operation timed out" {
+				// No data right now; keep waiting until the overall deadline.
+				continue
+			}
+			return nil, err
+		}
+	}
+	return nil, ErrTimeout
+}
+
+func popFrame(stream *[]byte) []byte {
+	s := *stream
+
+	// Drop leading sync bytes.
+	for len(s) > 0 && s[0] == protocol.MESSAGE_SYNC {
+		s = s[1:]
+	}
+
+	for len(s) >= protocol.MESSAGE_MIN {
+		msgLen := int(s[protocol.MESSAGE_POS_LEN])
+		if msgLen < protocol.MESSAGE_MIN || msgLen > protocol.MESSAGE_MAX {
+			s = s[1:]
+			continue
+		}
+		if len(s) < msgLen {
+			break
+		}
+		frame := s[:msgLen]
+		s = s[msgLen:]
+
+		// Validate sync byte and CRC.
+		if frame[msgLen-protocol.MESSAGE_TRAILER_SYNC] != protocol.MESSAGE_SYNC {
+			continue
+		}
+		crcHi, crcLo := protocol.CRC16CCITT(frame[:msgLen-protocol.MESSAGE_TRAILER_SIZE])
+		if frame[msgLen-protocol.MESSAGE_TRAILER_CRC] != crcHi || frame[msgLen-protocol.MESSAGE_TRAILER_CRC+1] != crcLo {
+			continue
+		}
+
+		*stream = s
+		return frame
+	}
+
+	*stream = s
+	return nil
 }
 
 // encodeIdentifyCommand creates the "identify offset=%u count=%c" command.
@@ -394,11 +506,11 @@ func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay tim
 			continue
 		}
 
-		// Read response, accumulating bytes until we have a complete message
-		resp := make([]byte, 0, protocol.MESSAGE_MAX)
+		// Read responses until we find an identify_response frame.
+		// Real MCUs may emit other messages (e.g. stats/shutdown/is_shutdown)
+		// interleaved with identify_response, so we must filter.
 		buf := make([]byte, protocol.MESSAGE_MAX)
-		expectedLen := 0
-		msgStart := 0 // Start position of current message in resp
+		stream := make([]byte, 0, protocol.MESSAGE_MAX*2)
 
 		for time.Now().Before(deadline) {
 			n, err = port.Read(buf)
@@ -408,43 +520,51 @@ func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay tim
 					fmt.Fprintf(trace, "  sendWithRetry[%d]: RX chunk: %x\n", retry, buf[:n])
 				}
 			}
-
 			if n > 0 {
-				resp = append(resp, buf[:n]...)
+				stream = append(stream, buf[:n]...)
+			}
 
-				// Skip leading sync bytes (may be from previous messages)
-				for msgStart < len(resp) && resp[msgStart] == protocol.MESSAGE_SYNC {
-					msgStart++
+			// Extract complete frames from stream and look for identify_response.
+			for {
+				// Drop leading sync bytes.
+				for len(stream) > 0 && stream[0] == protocol.MESSAGE_SYNC {
+					stream = stream[1:]
+				}
+				if len(stream) < protocol.MESSAGE_MIN {
+					break
 				}
 
-				// Once we have the length byte, we know expected message size
-				if expectedLen == 0 && len(resp) > msgStart {
-					expectedLen = int(resp[msgStart])
-					if trace != nil {
-						fmt.Fprintf(trace, "  sendWithRetry[%d]: Expected msg len: %d (msgStart=%d)\n", retry, expectedLen, msgStart)
-					}
+				msgLen := int(stream[protocol.MESSAGE_POS_LEN])
+				if msgLen < protocol.MESSAGE_MIN || msgLen > protocol.MESSAGE_MAX {
+					// Not a valid start; drop one byte and resync.
+					stream = stream[1:]
+					continue
+				}
+				if len(stream) < msgLen {
+					break
 				}
 
-				// Check if we have a complete message
-				if expectedLen > 0 && len(resp) >= msgStart+expectedLen {
-					// Verify sync byte
-					if resp[msgStart+expectedLen-1] == protocol.MESSAGE_SYNC {
-						return resp[msgStart : msgStart+expectedLen], nil
-					}
-					// Bad sync - try to find next valid message start
-					if trace != nil {
-						fmt.Fprintf(trace, "  sendWithRetry[%d]: Bad sync at pos %d, got 0x%02x\n",
-							retry, msgStart+expectedLen-1, resp[msgStart+expectedLen-1])
-					}
+				frame := stream[:msgLen]
+				stream = stream[msgLen:]
+
+				// Validate CRC and sync byte.
+				if frame[msgLen-protocol.MESSAGE_TRAILER_SYNC] != protocol.MESSAGE_SYNC {
+					continue
+				}
+				crcHi, crcLo := protocol.CRC16CCITT(frame[:msgLen-protocol.MESSAGE_TRAILER_SIZE])
+				if frame[msgLen-protocol.MESSAGE_TRAILER_CRC] != crcHi || frame[msgLen-protocol.MESSAGE_TRAILER_CRC+1] != crcLo {
+					continue
+				}
+
+				// identify_response is msgid 0; parseIdentifyResponse validates that.
+				if _, _, perr := parseIdentifyResponse(frame); perr == nil {
+					return frame, nil
 				}
 			}
 
 			if err != nil {
 				if errors.Is(err, serial.ErrTimeout) || err.Error() == "serial: operation timed out" {
-					if len(resp) == 0 {
-						break // No data at all, retry
-					}
-					// Got partial data, keep waiting if we haven't hit deadline
+					// No data available right now; keep waiting until overall deadline.
 					continue
 				}
 				lastErr = err
@@ -452,16 +572,7 @@ func sendWithRetry(port *serial.Port, cmd []byte, maxRetries int, retryDelay tim
 			}
 		}
 
-		if len(resp) > 0 && trace != nil {
-			fmt.Fprintf(trace, "  sendWithRetry[%d]: Accumulated: %x (len=%d, msgStart=%d, expected=%d)\n",
-				retry, resp, len(resp), msgStart, expectedLen)
-		}
-
-		if len(resp) == 0 {
-			lastErr = ErrTimeout
-		} else {
-			lastErr = ErrNoResponse
-		}
+		lastErr = ErrTimeout
 
 		if retry < maxRetries {
 			time.Sleep(delay)
