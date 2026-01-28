@@ -203,6 +203,11 @@ func main() {
 				return executor.GetTemperature(name)
 			})
 
+			// Heater power callback
+			moonraker.SetHeaterPowerCallback(func(name string) float64 {
+				return executor.GetHeaterPower(name)
+			})
+
 			// Position callback
 			moonraker.SetPositionCallback(func() [4]float64 {
 				return executor.GetPosition()

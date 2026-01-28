@@ -21,6 +21,7 @@ type MoonrakerIntegration struct {
 	// Callbacks for external integration
 	gcodeCallback       func(string) error
 	tempCallback        func(name string) (temp, target float64)
+	heaterPowerCallback func(name string) float64  // Returns heater power 0.0-1.0
 	emergencyCallback   func()
 	positionCallback    func() [4]float64          // Returns [X, Y, Z, E] position
 	homedAxesCallback   func() string              // Returns "xyz" style string
@@ -207,6 +208,10 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 				status["target"] = target
 			}
 		}
+		// Get heater power
+		if mi.heaterPowerCallback != nil {
+			status["power"] = mi.heaterPowerCallback("extruder")
+		}
 		return moonraker.FilterStatus(status, attrs)
 	})
 
@@ -228,6 +233,10 @@ func (mi *MoonrakerIntegration) registerStatusProviders() {
 				status["temperature"] = temp
 				status["target"] = target
 			}
+		}
+		// Get heater power
+		if mi.heaterPowerCallback != nil {
+			status["power"] = mi.heaterPowerCallback("heater_bed")
 		}
 		return moonraker.FilterStatus(status, attrs)
 	})
@@ -353,6 +362,12 @@ func (mi *MoonrakerIntegration) SetGCodeCallback(cb func(string) error) {
 // SetTempCallback sets the callback for temperature reading.
 func (mi *MoonrakerIntegration) SetTempCallback(cb func(name string) (temp, target float64)) {
 	mi.tempCallback = cb
+}
+
+// SetHeaterPowerCallback sets the callback for heater power reading.
+// The callback should return power as 0.0-1.0 (0-100%).
+func (mi *MoonrakerIntegration) SetHeaterPowerCallback(cb func(name string) float64) {
+	mi.heaterPowerCallback = cb
 }
 
 // SetEmergencyCallback sets the callback for emergency stop.

@@ -79,6 +79,10 @@ type Executor struct {
 	// Heater on/off state tracking (to avoid repeated commands)
 	extruderHeaterOn bool
 	bedHeaterOn      bool
+
+	// Heater power tracking (0.0-1.0 for PWM duty cycle)
+	extruderPower float64
+	bedPower      float64
 }
 
 // NewExecutor creates a new G-code executor.
@@ -499,16 +503,19 @@ func (e *Executor) updateHeaterPWM_PID(heater string, currentTemp, target float6
 		log.Printf("Heater %s PWM error: %v", heater, err)
 	}
 
-	// Update heater state (for turnOffHeater tracking)
+	// Update heater state and power tracking
 	if heater == "extruder" {
 		e.extruderHeaterOn = onTicks > 0
+		e.extruderPower = power
 	} else if heater == "heater_bed" {
 		e.bedHeaterOn = onTicks > 0
+		e.bedPower = power
 	}
 }
 
 // updateHeaterPWM_BangBang implements simple bang-bang/watermark control.
 // Used when control=watermark in config.
+// Uses update_digital_out for direct on/off control (more reliable than PWM for bang-bang).
 func (e *Executor) updateHeaterPWM_BangBang(heater string, currentTemp, target float64) {
 	pwmOid, ok := e.pwmOids[heater]
 	if !ok {
@@ -516,49 +523,64 @@ func (e *Executor) updateHeaterPWM_BangBang(heater string, currentTemp, target f
 		return
 	}
 
-	cycleTicks := int(0.1 * e.mcuFreq) // 100ms cycle
-	var onTicks int
-
-	if target <= 0 {
-		onTicks = 0
-	} else if currentTemp >= target {
-		// At or above target: off
-		onTicks = 0
-	} else if currentTemp < target-1.0 {
+	// Determine if heater should be on or off
+	heaterOn := false
+	if target > 0 && currentTemp < target-1.0 {
 		// Below target with hysteresis: full power
-		onTicks = cycleTicks
+		heaterOn = true
 	}
-	// In hysteresis band (target-1 to target): maintain previous state (keep onTicks as calculated)
+	// At or above target-1: off (hysteresis prevents oscillation)
 
-	clock := e.mcu.GetLastMCUClock()
-	if clock == 0 {
-		log.Printf("Heater %s: MCU clock not available", heater)
+	// Check if state changed to avoid flooding MCU with commands
+	currentState := false
+	if heater == "extruder" {
+		currentState = e.extruderHeaterOn
+	} else if heater == "heater_bed" {
+		currentState = e.bedHeaterOn
+	}
+
+	if heaterOn == currentState {
+		// No change needed
 		return
 	}
 
-	scheduleClock := uint32(clock) + uint32(e.mcuFreq*0.5)
-
-	log.Printf("Heater %s BangBang: temp=%.1f target=%.1f on_ticks=%d/%d",
-		heater, currentTemp, target, onTicks, cycleTicks)
-
-	err := e.mcu.SendCommand("queue_digital_out", map[string]interface{}{
-		"oid":      pwmOid,
-		"clock":    scheduleClock,
-		"on_ticks": onTicks,
-	})
-	if err != nil {
-		log.Printf("Heater %s PWM error: %v", heater, err)
+	value := 0
+	if heaterOn {
+		value = 1
 	}
 
-	// Update heater state (for turnOffHeater tracking)
+	log.Printf("Heater %s BangBang: temp=%.1f target=%.1f -> %s",
+		heater, currentTemp, target, map[bool]string{true: "ON", false: "OFF"}[heaterOn])
+
+	// Use update_digital_out for direct on/off control (like hardware-test)
+	err := e.mcu.SendCommand("update_digital_out", map[string]interface{}{
+		"oid":   pwmOid,
+		"value": value,
+	})
+	if err != nil {
+		log.Printf("Heater %s error: %v", heater, err)
+		return
+	}
+
+	// Update heater state and power (BangBang is always 0% or 100%)
 	if heater == "extruder" {
-		e.extruderHeaterOn = onTicks > 0
+		e.extruderHeaterOn = heaterOn
+		if heaterOn {
+			e.extruderPower = 1.0
+		} else {
+			e.extruderPower = 0.0
+		}
 	} else if heater == "heater_bed" {
-		e.bedHeaterOn = onTicks > 0
+		e.bedHeaterOn = heaterOn
+		if heaterOn {
+			e.bedPower = 1.0
+		} else {
+			e.bedPower = 0.0
+		}
 	}
 }
 
-// turnOffHeater turns off a heater by setting PWM to 0.
+// turnOffHeater turns off a heater by setting output to 0.
 // This is called when target temperature is set to 0.
 // Only sends command if heater state actually changes.
 func (e *Executor) turnOffHeater(heater string) {
@@ -575,30 +597,25 @@ func (e *Executor) turnOffHeater(heater string) {
 		return
 	}
 
-	clock := e.mcu.GetLastMCUClock()
-	if clock == 0 {
-		return
-	}
-
-	scheduleClock := uint32(clock) + uint32(e.mcuFreq*0.1) // 100ms from now
-
 	log.Printf("Heater %s: turning OFF", heater)
 
-	err := e.mcu.SendCommand("queue_digital_out", map[string]interface{}{
-		"oid":      pwmOid,
-		"clock":    scheduleClock,
-		"on_ticks": 0, // OFF
+	// Use update_digital_out for immediate off (like hardware-test)
+	err := e.mcu.SendCommand("update_digital_out", map[string]interface{}{
+		"oid":   pwmOid,
+		"value": 0, // OFF
 	})
 	if err != nil {
 		log.Printf("Heater %s turn off error: %v", heater, err)
 		return
 	}
 
-	// Update state
+	// Update state and power
 	if heater == "extruder" {
 		e.extruderHeaterOn = false
+		e.extruderPower = 0.0
 	} else if heater == "heater_bed" {
 		e.bedHeaterOn = false
+		e.bedPower = 0.0
 	}
 }
 
@@ -1968,6 +1985,21 @@ func (e *Executor) GetTemperature(name string) (temp, target float64) {
 		return e.bedTemp, e.bedTarget
 	}
 	return 0, 0
+}
+
+// GetHeaterPower returns heater power (0.0-1.0).
+// For PID control this is the PWM duty cycle, for BangBang it's 0.0 or 1.0.
+func (e *Executor) GetHeaterPower(name string) float64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	switch name {
+	case "extruder":
+		return e.extruderPower
+	case "heater_bed":
+		return e.bedPower
+	}
+	return 0.0
 }
 
 // GetHomedAxesString returns a string of homed axes (e.g., "xy" or "xyz").
