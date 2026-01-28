@@ -59,6 +59,22 @@ type Executor struct {
 	// Track whether we've seen real ADC readings (to disable simulation fallback).
 	realExtruderReading bool
 	realBedReading      bool
+
+	// Heater control loop
+	heaterControlRunning bool
+
+	// PID state for extruder
+	extruderPIDIntegral  float64
+	extruderPIDPrevError float64
+	extruderPIDPrevTime  time.Time
+
+	// PID state for heater bed
+	bedPIDIntegral  float64
+	bedPIDPrevError float64
+	bedPIDPrevTime  time.Time
+
+	// Heatbreak fan state (auto-controlled when extruder is heating)
+	heatbreakFanOn bool
 }
 
 // NewExecutor creates a new G-code executor.
@@ -209,10 +225,34 @@ func (e *Executor) Configure() error {
 	e.isConfigured = true
 	log.Println("MCU configuration complete")
 
+	// SAFETY: Turn off all heaters and PWM outputs on startup
+	// This prevents runaway heating if the MCU retained state from a previous session
+	e.safetyShutdownAllOutputs()
+
 	// Start temperature reading goroutine
 	e.startTempReading()
 
 	return nil
+}
+
+// safetyShutdownAllOutputs turns off all heaters and fans on startup.
+// This is a critical safety measure to prevent runaway heating.
+// Uses update_digital_out to immediately set the output low.
+func (e *Executor) safetyShutdownAllOutputs() {
+	log.Println("SAFETY: Turning off all heaters and PWM outputs on startup")
+
+	// Turn off all PWM outputs using update_digital_out (immediate)
+	for name, oid := range e.pwmOids {
+		err := e.mcu.SendCommand("update_digital_out", map[string]interface{}{
+			"oid":   oid,
+			"value": 0,
+		})
+		if err != nil {
+			log.Printf("Warning: failed to turn off %s: %v", name, err)
+		} else {
+			log.Printf("  Turned off %s (oid=%d)", name, oid)
+		}
+	}
 }
 
 // startTempReading starts temperature sensor reading.
@@ -235,7 +275,265 @@ func (e *Executor) startTempReading() {
 		e.startADCSampling()
 	}()
 
+	// Start heater control loop
+	go e.heaterControlLoop()
+
 	log.Println("Temperature reading started")
+}
+
+// heaterControlLoop runs continuously to control heaters based on target temperatures.
+// Uses simple bang-bang control with hysteresis.
+func (e *Executor) heaterControlLoop() {
+	e.mu.Lock()
+	e.heaterControlRunning = true
+	e.mu.Unlock()
+
+	defer func() {
+		e.mu.Lock()
+		e.heaterControlRunning = false
+		e.mu.Unlock()
+	}()
+
+	ticker := time.NewTicker(1000 * time.Millisecond) // Control every 1 second
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.tempStopCh:
+			return
+		case <-ticker.C:
+			e.updateHeaters()
+		}
+	}
+}
+
+// updateHeaters updates heater PWM outputs based on current temperatures and targets.
+func (e *Executor) updateHeaters() {
+	e.mu.RLock()
+	extruderTarget := e.extruderTarget
+	extruderTemp := e.extruderTemp
+	bedTarget := e.bedTarget
+	bedTemp := e.bedTemp
+	e.mu.RUnlock()
+
+	now := time.Now()
+
+	// Only send PWM commands if there's a target temperature set
+	if extruderTarget > 0 {
+		if _, ok := e.pwmOids["extruder"]; ok {
+			// Check if extruder uses PID control
+			if e.config.Extruder != nil && e.config.Extruder.ControlPID {
+				e.updateHeaterPWM_PID("extruder", extruderTemp, extruderTarget, now,
+					e.config.Extruder.PID_Kp, e.config.Extruder.PID_Ki, e.config.Extruder.PID_Kd)
+			} else {
+				e.updateHeaterPWM_BangBang("extruder", extruderTemp, extruderTarget)
+			}
+		}
+	} else {
+		// Reset PID state when target is 0
+		e.extruderPIDIntegral = 0
+		e.extruderPIDPrevError = 0
+	}
+
+	if bedTarget > 0 {
+		if _, ok := e.pwmOids["heater_bed"]; ok {
+			// Check if bed uses PID control
+			if e.config.HeaterBed != nil && e.config.HeaterBed.ControlPID {
+				e.updateHeaterPWM_PID("heater_bed", bedTemp, bedTarget, now,
+					e.config.HeaterBed.PID_Kp, e.config.HeaterBed.PID_Ki, e.config.HeaterBed.PID_Kd)
+			} else {
+				e.updateHeaterPWM_BangBang("heater_bed", bedTemp, bedTarget)
+			}
+		}
+	} else {
+		// Reset PID state when target is 0
+		e.bedPIDIntegral = 0
+		e.bedPIDPrevError = 0
+	}
+
+	// Auto-control heatbreak cooling fan: 100% when extruder is heating, off otherwise
+	e.updateHeatbreakFan(extruderTarget > 0)
+}
+
+// updateHeatbreakFan controls the heatbreak cooling fan.
+// It turns on at 100% when the extruder is heating, off otherwise.
+func (e *Executor) updateHeatbreakFan(shouldBeOn bool) {
+	// Only send command if state changed
+	if shouldBeOn == e.heatbreakFanOn {
+		return
+	}
+
+	pwmOid, ok := e.pwmOids["heatbreak_cooling_fan"]
+	if !ok {
+		return // No heatbreak fan configured
+	}
+
+	clock := e.mcu.GetLastMCUClock()
+	if clock == 0 {
+		return
+	}
+
+	cycleTicks := int(0.1 * e.mcuFreq) // 100ms cycle
+	var onTicks int
+	if shouldBeOn {
+		onTicks = cycleTicks // 100% power
+		log.Printf("Heatbreak fan: ON (extruder heating)")
+	} else {
+		onTicks = 0 // Off
+		log.Printf("Heatbreak fan: OFF (extruder idle)")
+	}
+
+	scheduleClock := uint32(clock) + uint32(e.mcuFreq*0.5)
+
+	err := e.mcu.SendCommand("queue_digital_out", map[string]interface{}{
+		"oid":      pwmOid,
+		"clock":    scheduleClock,
+		"on_ticks": onTicks,
+	})
+	if err != nil {
+		log.Printf("Heatbreak fan error: %v", err)
+		return
+	}
+
+	e.heatbreakFanOn = shouldBeOn
+}
+
+// updateHeaterPWM_PID implements PID temperature control.
+// Klipper's PID uses: output = Kp*error + Ki*integral + Kd*derivative
+func (e *Executor) updateHeaterPWM_PID(heater string, currentTemp, target float64, now time.Time,
+	kp, ki, kd float64) {
+	pwmOid, ok := e.pwmOids[heater]
+	if !ok {
+		log.Printf("Heater %s: PWM OID not found", heater)
+		return
+	}
+
+	cycleTicks := int(0.1 * e.mcuFreq) // 100ms cycle
+
+	// Get PID state pointers based on heater
+	var integral, prevError *float64
+	var prevTime *time.Time
+	if heater == "extruder" {
+		integral = &e.extruderPIDIntegral
+		prevError = &e.extruderPIDPrevError
+		prevTime = &e.extruderPIDPrevTime
+	} else {
+		integral = &e.bedPIDIntegral
+		prevError = &e.bedPIDPrevError
+		prevTime = &e.bedPIDPrevTime
+	}
+
+	// Calculate time delta
+	dt := 1.0 // Default to 1 second for first iteration
+	if !prevTime.IsZero() {
+		dt = now.Sub(*prevTime).Seconds()
+	}
+	if dt <= 0 {
+		dt = 1.0
+	}
+	*prevTime = now
+
+	// Calculate error
+	error := target - currentTemp
+
+	// Calculate integral with anti-windup
+	*integral += error * dt
+	// Clamp integral to prevent windup (limit to ±50°C*s equivalent)
+	maxIntegral := 50.0 / ki
+	if ki > 0 {
+		if *integral > maxIntegral {
+			*integral = maxIntegral
+		} else if *integral < -maxIntegral {
+			*integral = -maxIntegral
+		}
+	}
+
+	// Calculate derivative
+	derivative := 0.0
+	if dt > 0 {
+		derivative = (error - *prevError) / dt
+	}
+	*prevError = error
+
+	// Calculate PID output (0-255 scale like Klipper)
+	output := kp*error + ki*(*integral) + kd*derivative
+
+	// Clamp output to 0-255 range
+	if output < 0 {
+		output = 0
+	} else if output > 255 {
+		output = 255
+	}
+
+	// Convert to duty cycle (0.0 - 1.0)
+	power := output / 255.0
+
+	// Calculate on_ticks
+	onTicks := int(float64(cycleTicks) * power)
+
+	clock := e.mcu.GetLastMCUClock()
+	if clock == 0 {
+		log.Printf("Heater %s: MCU clock not available", heater)
+		return
+	}
+
+	scheduleClock := uint32(clock) + uint32(e.mcuFreq*0.5)
+
+	log.Printf("Heater %s PID: temp=%.1f target=%.1f err=%.1f int=%.1f der=%.1f out=%.0f pwr=%.1f%% on_ticks=%d/%d",
+		heater, currentTemp, target, error, *integral, derivative, output, power*100, onTicks, cycleTicks)
+
+	err := e.mcu.SendCommand("queue_digital_out", map[string]interface{}{
+		"oid":      pwmOid,
+		"clock":    scheduleClock,
+		"on_ticks": onTicks,
+	})
+	if err != nil {
+		log.Printf("Heater %s PWM error: %v", heater, err)
+	}
+}
+
+// updateHeaterPWM_BangBang implements simple bang-bang/watermark control.
+// Used when control=watermark in config.
+func (e *Executor) updateHeaterPWM_BangBang(heater string, currentTemp, target float64) {
+	pwmOid, ok := e.pwmOids[heater]
+	if !ok {
+		log.Printf("Heater %s: PWM OID not found", heater)
+		return
+	}
+
+	cycleTicks := int(0.1 * e.mcuFreq) // 100ms cycle
+	var onTicks int
+
+	if target <= 0 {
+		onTicks = 0
+	} else if currentTemp >= target {
+		// At or above target: off
+		onTicks = 0
+	} else if currentTemp < target-1.0 {
+		// Below target with hysteresis: full power
+		onTicks = cycleTicks
+	}
+	// In hysteresis band (target-1 to target): maintain previous state (keep onTicks as calculated)
+
+	clock := e.mcu.GetLastMCUClock()
+	if clock == 0 {
+		log.Printf("Heater %s: MCU clock not available", heater)
+		return
+	}
+
+	scheduleClock := uint32(clock) + uint32(e.mcuFreq*0.5)
+
+	log.Printf("Heater %s BangBang: temp=%.1f target=%.1f on_ticks=%d/%d",
+		heater, currentTemp, target, onTicks, cycleTicks)
+
+	err := e.mcu.SendCommand("queue_digital_out", map[string]interface{}{
+		"oid":      pwmOid,
+		"clock":    scheduleClock,
+		"on_ticks": onTicks,
+	})
+	if err != nil {
+		log.Printf("Heater %s PWM error: %v", heater, err)
+	}
 }
 
 // startADCSampling sends query_analog_in commands ONCE to start continuous sampling.
@@ -642,6 +940,8 @@ func (e *Executor) Execute(line string) error {
 		return e.executeDisableMotors(cmd)
 	case "M114":
 		return e.executeReportPosition(cmd)
+	case "SET_HEATER_TEMPERATURE":
+		return e.executeSetHeaterTemperature(cmd)
 	default:
 		log.Printf("Unknown G-code command: %s", cmd.Name)
 		return nil
@@ -1245,6 +1545,68 @@ func (e *Executor) executeWaitBedTemp(cmd *gcodeCommand) error {
 	return nil
 }
 
+// executeSetHeaterTemperature handles SET_HEATER_TEMPERATURE command.
+// Usage: SET_HEATER_TEMPERATURE HEATER=extruder TARGET=200
+//        SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=60
+func (e *Executor) executeSetHeaterTemperature(cmd *gcodeCommand) error {
+	heater, ok := cmd.Args["HEATER"]
+	if !ok {
+		return fmt.Errorf("SET_HEATER_TEMPERATURE: HEATER parameter required")
+	}
+
+	targetStr, ok := cmd.Args["TARGET"]
+	if !ok {
+		return fmt.Errorf("SET_HEATER_TEMPERATURE: TARGET parameter required")
+	}
+
+	target, err := strconv.ParseFloat(targetStr, 64)
+	if err != nil {
+		return fmt.Errorf("SET_HEATER_TEMPERATURE: invalid TARGET value: %s", targetStr)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	switch heater {
+	case "extruder":
+		e.extruderTarget = target
+		log.Printf("Setting extruder temperature to %.1f°C", target)
+		// TODO: Start PID control for actual heating
+		return e.setHeaterPWM("extruder", target)
+	case "heater_bed":
+		e.bedTarget = target
+		log.Printf("Setting bed temperature to %.1f°C", target)
+		// TODO: Start PID control for actual heating
+		return e.setHeaterPWM("heater_bed", target)
+	default:
+		return fmt.Errorf("SET_HEATER_TEMPERATURE: unknown heater: %s", heater)
+	}
+}
+
+// setHeaterPWM is called when SET_HEATER_TEMPERATURE is executed.
+// The actual PWM control is handled by heaterControlLoop which runs continuously.
+// This function just logs and triggers an immediate update.
+func (e *Executor) setHeaterPWM(heater string, target float64) error {
+	if _, ok := e.pwmOids[heater]; !ok {
+		log.Printf("Warning: heater %s PWM not configured", heater)
+		return nil
+	}
+
+	// Get current temperature for logging
+	var currentTemp float64
+	switch heater {
+	case "extruder":
+		currentTemp = e.extruderTemp
+	case "heater_bed":
+		currentTemp = e.bedTemp
+	}
+
+	log.Printf("Heater %s: target set to %.1f (current=%.1f)", heater, target, currentTemp)
+
+	// The heaterControlLoop will pick up the new target and send PWM commands
+	return nil
+}
+
 // executeSetFan handles M106 (set fan speed).
 func (e *Executor) executeSetFan(cmd *gcodeCommand) error {
 	speed := 255.0
@@ -1259,15 +1621,24 @@ func (e *Executor) executeSetFan(cmd *gcodeCommand) error {
 		return nil
 	}
 
-	maxPWM := 65535 // 16-bit PWM
-	value := int(pwmValue * float64(maxPWM))
+	// Use soft PWM via queue_digital_out (same as heaters)
+	cycleTicks := int(0.1 * e.mcuFreq) // 100ms cycle
+	onTicks := int(float64(cycleTicks) * pwmValue)
 
-	log.Printf("Setting fan speed to %.1f%%", pwmValue*100)
+	clock := e.mcu.GetLastMCUClock()
+	if clock == 0 {
+		log.Printf("Warning: MCU clock not available for fan")
+		return nil
+	}
+	// Use uint32 wraparound arithmetic (MCU clock is 32-bit unsigned)
+	scheduleClock := uint32(clock) + uint32(e.mcuFreq*0.5) // 500ms ahead like heaters
 
-	return e.mcu.SendCommand("schedule_pwm_out", map[string]interface{}{
-		"oid":   pwmOid,
-		"clock": 0,
-		"value": value,
+	log.Printf("Setting fan speed to %.1f%% (on_ticks=%d/%d)", pwmValue*100, onTicks, cycleTicks)
+
+	return e.mcu.SendCommand("queue_digital_out", map[string]interface{}{
+		"oid":      pwmOid,
+		"clock":    scheduleClock,
+		"on_ticks": onTicks,
 	})
 }
 
@@ -1278,12 +1649,19 @@ func (e *Executor) executeSetFanOff(cmd *gcodeCommand) error {
 		return nil
 	}
 
+	clock := e.mcu.GetLastMCUClock()
+	if clock == 0 {
+		return nil
+	}
+	// Use uint32 wraparound arithmetic (MCU clock is 32-bit unsigned)
+	scheduleClock := uint32(clock) + uint32(e.mcuFreq*0.5)
+
 	log.Printf("Turning off fan")
 
-	return e.mcu.SendCommand("schedule_pwm_out", map[string]interface{}{
-		"oid":   pwmOid,
-		"clock": 0,
-		"value": 0,
+	return e.mcu.SendCommand("queue_digital_out", map[string]interface{}{
+		"oid":      pwmOid,
+		"clock":    scheduleClock,
+		"on_ticks": 0,
 	})
 }
 

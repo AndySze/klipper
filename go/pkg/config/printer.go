@@ -217,10 +217,10 @@ func ParsePrinterConfig(path string) (*PrinterConfig, error) {
 		// Parse key: value or key = value
 		var key, value string
 		if idx := strings.Index(line, ":"); idx > 0 {
-			key = strings.TrimSpace(line[:idx])
+			key = strings.ToLower(strings.TrimSpace(line[:idx]))
 			value = strings.TrimSpace(line[idx+1:])
 		} else if idx := strings.Index(line, "="); idx > 0 {
-			key = strings.TrimSpace(line[:idx])
+			key = strings.ToLower(strings.TrimSpace(line[:idx]))
 			value = strings.TrimSpace(line[idx+1:])
 		} else {
 			continue

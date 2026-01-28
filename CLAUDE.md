@@ -63,6 +63,34 @@ CGO_ENABLED=1 go test ./...
 go run ./cmd/klipper-go-golden -mode host-h4 -only out_of_bounds -dictdir ../dict
 ```
 
+### Go host hardware testing (klipper-go)
+
+**IMPORTANT: Serial port limitations**
+- The serial port only supports ONE connection at a time
+- Only ONE klipper-go process can run simultaneously
+- Before starting a new service, always kill existing processes first
+- Code updates require restarting the service
+- Always run the service in background mode (using nohup ... &)
+
+```bash
+cd go
+
+# Kill any existing klipper-go processes before starting
+pkill -9 -f klipper-go 2>/dev/null || true
+
+# Build and run
+go build -o klipper-go ./cmd/klipper-go
+nohup ./klipper-go -config test/hardware_config/printer.cfg > /tmp/klipper-go.log 2>&1 &
+
+# Check logs
+tail -f /tmp/klipper-go.log
+
+# After code changes, rebuild and restart
+pkill -9 -f klipper-go; sleep 1
+go build -o klipper-go ./cmd/klipper-go
+nohup ./klipper-go -config test/hardware_config/printer.cfg > /tmp/klipper-go.log 2>&1 &
+```
+
 ## Test Commands
 
 ```bash
