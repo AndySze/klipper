@@ -1165,14 +1165,10 @@ func (e *Executor) queueSteps(name string, steps int64, moveTime float64) error 
 	}
 
 	// Set direction
+	// NOTE: Do NOT apply DirInvert here - the !dir_pin is handled by MCU firmware
 	dirValue := 0
 	if steps < 0 {
 		dirValue = 1
-	}
-	// Apply direction inversion from config
-	stepper := e.config.Steppers[name]
-	if stepper != nil && stepper.DirInvert {
-		dirValue = 1 - dirValue
 	}
 
 	// Get current MCU clock using synchronized clock (no command needed)
@@ -1192,7 +1188,15 @@ func (e *Executor) queueSteps(name string, steps int64, moveTime float64) error 
 		return fmt.Errorf("set_next_step_dir: %w", err)
 	}
 
-	// Queue steps
+	// Reset step clock FIRST (before queue_step)
+	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
+		"oid":   stepperOid,
+		"clock": uint32(startClock),
+	}); err != nil {
+		return fmt.Errorf("reset_step_clock: %w", err)
+	}
+
+	// Queue steps (after reset_step_clock)
 	if err := e.mcu.SendCommand("queue_step", map[string]interface{}{
 		"oid":      stepperOid,
 		"interval": intervalTicks,
@@ -1200,14 +1204,6 @@ func (e *Executor) queueSteps(name string, steps int64, moveTime float64) error 
 		"add":      0,
 	}); err != nil {
 		return fmt.Errorf("queue_step: %w", err)
-	}
-
-	// Reset step clock to start the move
-	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
-		"oid":   stepperOid,
-		"clock": uint32(startClock),
-	}); err != nil {
-		return fmt.Errorf("reset_step_clock: %w", err)
 	}
 
 	// Wait for move to complete
@@ -1429,12 +1425,10 @@ func (e *Executor) homeAxis(name string, axisIndex int) error {
 	}
 
 	// Set direction
+	// NOTE: Do NOT apply DirInvert here - the !dir_pin is handled by MCU firmware
 	dirValue := 0
 	if homingDir < 0 {
 		dirValue = 1
-	}
-	if stepper.DirInvert {
-		dirValue = 1 - dirValue
 	}
 	if err := e.mcu.SendCommand("set_next_step_dir", map[string]interface{}{
 		"oid": stepperOid,
@@ -1443,7 +1437,16 @@ func (e *Executor) homeAxis(name string, axisIndex int) error {
 		return fmt.Errorf("set_next_step_dir: %w", err)
 	}
 
-	// Queue steps
+	// Reset step clock FIRST (before queue_step)
+	log.Printf("  reset_step_clock: oid=%d clock=%d", stepperOid, uint32(startClock))
+	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
+		"oid":   stepperOid,
+		"clock": uint32(startClock),
+	}); err != nil {
+		return fmt.Errorf("reset_step_clock: %w", err)
+	}
+
+	// Queue steps (after reset_step_clock)
 	log.Printf("  queue_step: oid=%d interval=%d count=%d", stepperOid, intervalTicks, stepCount)
 	if err := e.mcu.SendCommand("queue_step", map[string]interface{}{
 		"oid":      stepperOid,
@@ -1452,15 +1455,6 @@ func (e *Executor) homeAxis(name string, axisIndex int) error {
 		"add":      0,
 	}); err != nil {
 		return fmt.Errorf("queue_step: %w", err)
-	}
-
-	// Start move
-	log.Printf("  reset_step_clock: oid=%d clock=%d", stepperOid, uint32(startClock))
-	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
-		"oid":   stepperOid,
-		"clock": uint32(startClock),
-	}); err != nil {
-		return fmt.Errorf("reset_step_clock: %w", err)
 	}
 
 	// Wait for homing to complete
@@ -1606,17 +1600,22 @@ func (e *Executor) homeCoreXYAxis(axis string) error {
 
 	// Set direction for BOTH steppers
 	// CoreXY: X = same direction, Y = opposite direction
+	// NOTE: Do NOT apply DirInvert here - the !dir_pin is handled by MCU firmware
 	dirX := 0
 	dirY := 0
 
 	if axis == "X" {
 		// X homing: both motors same direction
+		// Endstop at min (position_endstop=0): home toward X- requires dir=1 for both
+		// Endstop at max: home toward X+ requires dir=0 for both
 		if homingDir < 0 {
 			dirX = 1
 			dirY = 1
 		}
 	} else {
 		// Y homing: motors opposite direction
+		// Endstop at min (position_endstop=0): home toward Y- requires dirX=1, dirY=0
+		// Endstop at max (position_endstop=300): home toward Y+ requires dirX=0, dirY=1
 		if homingDir < 0 {
 			dirX = 1
 			dirY = 0
@@ -1624,14 +1623,6 @@ func (e *Executor) homeCoreXYAxis(axis string) error {
 			dirX = 0
 			dirY = 1
 		}
-	}
-
-	// Apply direction inversion
-	if stepperX.DirInvert {
-		dirX = 1 - dirX
-	}
-	if stepperY.DirInvert {
-		dirY = 1 - dirY
 	}
 
 	log.Printf("  CoreXY setting directions: X=%d Y=%d", dirX, dirY)
@@ -1649,7 +1640,22 @@ func (e *Executor) homeCoreXYAxis(axis string) error {
 		return fmt.Errorf("set_next_step_dir Y: %w", err)
 	}
 
-	// Queue steps for BOTH steppers
+	// Reset step clock for BOTH steppers FIRST (before queue_step)
+	log.Printf("  CoreXY reset_step_clock: clock=%d", uint32(startClock))
+	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
+		"oid":   stepperXOid,
+		"clock": uint32(startClock),
+	}); err != nil {
+		return fmt.Errorf("reset_step_clock X: %w", err)
+	}
+	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
+		"oid":   stepperYOid,
+		"clock": uint32(startClock),
+	}); err != nil {
+		return fmt.Errorf("reset_step_clock Y: %w", err)
+	}
+
+	// Queue steps for BOTH steppers (after reset_step_clock)
 	log.Printf("  CoreXY queue_step: interval=%d count=%d", intervalTicks, stepCount)
 	if err := e.mcu.SendCommand("queue_step", map[string]interface{}{
 		"oid":      stepperXOid,
@@ -1666,21 +1672,6 @@ func (e *Executor) homeCoreXYAxis(axis string) error {
 		"add":      0,
 	}); err != nil {
 		return fmt.Errorf("queue_step Y: %w", err)
-	}
-
-	// Reset step clock for BOTH steppers with same clock
-	log.Printf("  CoreXY reset_step_clock: clock=%d", uint32(startClock))
-	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
-		"oid":   stepperXOid,
-		"clock": uint32(startClock),
-	}); err != nil {
-		return fmt.Errorf("reset_step_clock X: %w", err)
-	}
-	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
-		"oid":   stepperYOid,
-		"clock": uint32(startClock),
-	}); err != nil {
-		return fmt.Errorf("reset_step_clock Y: %w", err)
 	}
 
 	// Wait for homing to complete
