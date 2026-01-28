@@ -75,6 +75,10 @@ type Executor struct {
 
 	// Heatbreak fan state (auto-controlled when extruder is heating)
 	heatbreakFanOn bool
+
+	// Heater on/off state tracking (to avoid repeated commands)
+	extruderHeaterOn bool
+	bedHeaterOn      bool
 }
 
 // NewExecutor creates a new G-code executor.
@@ -330,9 +334,11 @@ func (e *Executor) updateHeaters() {
 			}
 		}
 	} else {
-		// Reset PID state when target is 0
+		// Reset PID state and TURN OFF heater when target is 0
 		e.extruderPIDIntegral = 0
 		e.extruderPIDPrevError = 0
+		// CRITICAL: Must turn off heater when target is 0!
+		e.turnOffHeater("extruder")
 	}
 
 	if bedTarget > 0 {
@@ -346,9 +352,11 @@ func (e *Executor) updateHeaters() {
 			}
 		}
 	} else {
-		// Reset PID state when target is 0
+		// Reset PID state and TURN OFF heater when target is 0
 		e.bedPIDIntegral = 0
 		e.bedPIDPrevError = 0
+		// CRITICAL: Must turn off heater when target is 0!
+		e.turnOffHeater("heater_bed")
 	}
 
 	// Auto-control heatbreak cooling fan: 100% when extruder is heating, off otherwise
@@ -490,6 +498,13 @@ func (e *Executor) updateHeaterPWM_PID(heater string, currentTemp, target float6
 	if err != nil {
 		log.Printf("Heater %s PWM error: %v", heater, err)
 	}
+
+	// Update heater state (for turnOffHeater tracking)
+	if heater == "extruder" {
+		e.extruderHeaterOn = onTicks > 0
+	} else if heater == "heater_bed" {
+		e.bedHeaterOn = onTicks > 0
+	}
 }
 
 // updateHeaterPWM_BangBang implements simple bang-bang/watermark control.
@@ -533,6 +548,57 @@ func (e *Executor) updateHeaterPWM_BangBang(heater string, currentTemp, target f
 	})
 	if err != nil {
 		log.Printf("Heater %s PWM error: %v", heater, err)
+	}
+
+	// Update heater state (for turnOffHeater tracking)
+	if heater == "extruder" {
+		e.extruderHeaterOn = onTicks > 0
+	} else if heater == "heater_bed" {
+		e.bedHeaterOn = onTicks > 0
+	}
+}
+
+// turnOffHeater turns off a heater by setting PWM to 0.
+// This is called when target temperature is set to 0.
+// Only sends command if heater state actually changes.
+func (e *Executor) turnOffHeater(heater string) {
+	// Check if heater is already off (to avoid repeated commands)
+	if heater == "extruder" && !e.extruderHeaterOn {
+		return
+	}
+	if heater == "heater_bed" && !e.bedHeaterOn {
+		return
+	}
+
+	pwmOid, ok := e.pwmOids[heater]
+	if !ok {
+		return
+	}
+
+	clock := e.mcu.GetLastMCUClock()
+	if clock == 0 {
+		return
+	}
+
+	scheduleClock := uint32(clock) + uint32(e.mcuFreq*0.1) // 100ms from now
+
+	log.Printf("Heater %s: turning OFF", heater)
+
+	err := e.mcu.SendCommand("queue_digital_out", map[string]interface{}{
+		"oid":      pwmOid,
+		"clock":    scheduleClock,
+		"on_ticks": 0, // OFF
+	})
+	if err != nil {
+		log.Printf("Heater %s turn off error: %v", heater, err)
+		return
+	}
+
+	// Update state
+	if heater == "extruder" {
+		e.extruderHeaterOn = false
+	} else if heater == "heater_bed" {
+		e.bedHeaterOn = false
 	}
 }
 
