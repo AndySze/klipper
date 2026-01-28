@@ -562,7 +562,7 @@ func (e *Executor) startADCSampling() {
 
 		err := e.mcu.SendCommand("query_analog_in", map[string]interface{}{
 			"oid":               oid,
-			"clock":             int(startClock),
+			"clock":             uint32(startClock),
 			"sample_ticks":      sampleTicks,
 			"sample_count":      sampleCount,
 			"rest_ticks":        restTicks,
@@ -1205,7 +1205,7 @@ func (e *Executor) queueSteps(name string, steps int64, moveTime float64) error 
 	// Reset step clock to start the move
 	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
 		"oid":   stepperOid,
-		"clock": int(startClock),
+		"clock": uint32(startClock),
 	}); err != nil {
 		return fmt.Errorf("reset_step_clock: %w", err)
 	}
@@ -1243,10 +1243,16 @@ func (e *Executor) enableMotor(name string, enable bool) error {
 		}
 	}
 
-	return e.mcu.SendCommand("update_digital_out", map[string]interface{}{
+	log.Printf("  Enabling motor %s: oid=%d value=%d (enable=%v invert=%v)", name, enableOid, value, enable, stepper.EnableInvert)
+
+	err := e.mcu.SendCommand("update_digital_out", map[string]interface{}{
 		"oid":   enableOid,
 		"value": value,
 	})
+	if err != nil {
+		log.Printf("  Warning: enable motor %s failed: %v", name, err)
+	}
+	return err
 }
 
 // executeHome handles G28 homing command.
@@ -1384,7 +1390,7 @@ func (e *Executor) homeAxis(name string, axisIndex int) error {
 
 	if err := e.mcu.SendCommand("trsync_start", map[string]interface{}{
 		"oid":           trsyncOid,
-		"report_clock":  int(startClock),
+		"report_clock":  uint32(startClock),
 		"report_ticks":  int(e.mcuFreq * 0.1), // Report every 100ms
 		"expire_reason": 0,
 	}); err != nil {
@@ -1394,7 +1400,7 @@ func (e *Executor) homeAxis(name string, axisIndex int) error {
 	// Set expire time
 	if err := e.mcu.SendCommand("trsync_set_timeout", map[string]interface{}{
 		"oid":   trsyncOid,
-		"clock": int(expireClock),
+		"clock": uint32(expireClock),
 	}); err != nil {
 		return fmt.Errorf("trsync_set_timeout: %w", err)
 	}
@@ -1403,7 +1409,7 @@ func (e *Executor) homeAxis(name string, axisIndex int) error {
 	triggerReason := 1 // Trigger reason code
 	if err := e.mcu.SendCommand("endstop_home", map[string]interface{}{
 		"oid":            endstopOid,
-		"clock":          int(startClock),
+		"clock":          uint32(startClock),
 		"sample_ticks":   int(e.mcuFreq * 0.000015), // 15us sample time
 		"sample_count":   4,
 		"rest_ticks":     int(e.mcuFreq * 0.0001), // 100us between samples
@@ -1438,6 +1444,7 @@ func (e *Executor) homeAxis(name string, axisIndex int) error {
 	}
 
 	// Queue steps
+	log.Printf("  queue_step: oid=%d interval=%d count=%d", stepperOid, intervalTicks, stepCount)
 	if err := e.mcu.SendCommand("queue_step", map[string]interface{}{
 		"oid":      stepperOid,
 		"interval": intervalTicks,
@@ -1448,9 +1455,10 @@ func (e *Executor) homeAxis(name string, axisIndex int) error {
 	}
 
 	// Start move
+	log.Printf("  reset_step_clock: oid=%d clock=%d", stepperOid, uint32(startClock))
 	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
 		"oid":   stepperOid,
-		"clock": int(startClock),
+		"clock": uint32(startClock),
 	}); err != nil {
 		return fmt.Errorf("reset_step_clock: %w", err)
 	}
@@ -1483,15 +1491,19 @@ func (e *Executor) homeCoreXYAxis(axis string) error {
 		return fmt.Errorf("stepper_x or stepper_y not configured")
 	}
 
+	// Determine which endstop to use
 	var endstopName string
-
+	var endstopStepper *config.StepperConfig
 	if axis == "X" {
 		endstopName = "stepper_x"
+		endstopStepper = stepperX
 	} else {
 		endstopName = "stepper_y"
+		endstopStepper = stepperY
 	}
 
 	// Enable both motors (CoreXY requires both for any XY movement)
+	log.Printf("  CoreXY %s homing: enabling both motors", axis)
 	if err := e.enableMotor("stepper_x", true); err != nil {
 		return err
 	}
@@ -1499,8 +1511,193 @@ func (e *Executor) homeCoreXYAxis(axis string) error {
 		return err
 	}
 
-	// Use the single-axis homing but with both motors
-	return e.homeAxis(endstopName, map[string]int{"X": 0, "Y": 1}[axis])
+	// Get OIDs for both steppers
+	stepperXOid := e.stepperOids["stepper_x"]
+	stepperYOid := e.stepperOids["stepper_y"]
+	endstopOid := e.endstopOids[endstopName]
+	trsyncOid := e.trsyncOids[endstopName] // Use endstop's trsync
+
+	// Query endstop state (optional)
+	pinValue := 0
+	resp, err := e.mcu.SendCommandWithResponse("endstop_query_state", map[string]interface{}{
+		"oid": endstopOid,
+	}, "endstop_state", 2*time.Second)
+	if err != nil {
+		log.Printf("  Warning: endstop_query_state failed for %s: %v (proceeding)", endstopName, err)
+	} else {
+		pinValue = resp["pin_value"].(int)
+		if endstopStepper.EndstopInvert {
+			pinValue = 1 - pinValue
+		}
+		if pinValue == 1 {
+			log.Printf("  %s endstop already triggered, skipping homing", axis)
+			return nil
+		}
+	}
+
+	// Calculate homing parameters
+	homingDir := endstopStepper.HomingDirection()
+	homingSpeed := endstopStepper.HomingSpeed
+	stepsPerMM := endstopStepper.StepsPerMM()
+	maxTravel := endstopStepper.PositionMax - endstopStepper.PositionMin + 10
+
+	log.Printf("  CoreXY %s homing: dir=%d speed=%.1f mm/s max_travel=%.1f mm", axis, homingDir, homingSpeed, maxTravel)
+
+	// Get current MCU clock
+	clock := e.mcu.GetLastMCUClock()
+	if clock == 0 {
+		return fmt.Errorf("MCU clock not synchronized")
+	}
+
+	// Calculate timing
+	homingTime := maxTravel / homingSpeed
+	stepCount := int(maxTravel * stepsPerMM)
+	intervalTicks := int(homingTime * e.mcuFreq / float64(stepCount))
+
+	// Start trsync
+	expireTimeout := 10.0
+	expireTicks := int(expireTimeout * e.mcuFreq)
+	startClock := clock + uint64(e.mcuFreq*0.1)
+	expireClock := startClock + uint64(expireTicks)
+
+	if err := e.mcu.SendCommand("trsync_start", map[string]interface{}{
+		"oid":           trsyncOid,
+		"report_clock":  uint32(startClock),
+		"report_ticks":  int(e.mcuFreq * 0.1),
+		"expire_reason": 0,
+	}); err != nil {
+		return fmt.Errorf("trsync_start: %w", err)
+	}
+
+	if err := e.mcu.SendCommand("trsync_set_timeout", map[string]interface{}{
+		"oid":   trsyncOid,
+		"clock": uint32(expireClock),
+	}); err != nil {
+		return fmt.Errorf("trsync_set_timeout: %w", err)
+	}
+
+	// Add endstop trigger
+	if err := e.mcu.SendCommand("endstop_home", map[string]interface{}{
+		"oid":            endstopOid,
+		"clock":          uint32(startClock),
+		"sample_ticks":   int(e.mcuFreq * 0.000015),
+		"sample_count":   4,
+		"rest_ticks":     int(e.mcuFreq * 0.0001),
+		"pin_value":      1 - pinValue,
+		"trsync_oid":     trsyncOid,
+		"trigger_reason": 1,
+	}); err != nil {
+		return fmt.Errorf("endstop_home: %w", err)
+	}
+
+	// Bind BOTH steppers to trsync (this is the key difference!)
+	if err := e.mcu.SendCommand("stepper_stop_on_trigger", map[string]interface{}{
+		"oid":        stepperXOid,
+		"trsync_oid": trsyncOid,
+	}); err != nil {
+		return fmt.Errorf("stepper_stop_on_trigger X: %w", err)
+	}
+	if err := e.mcu.SendCommand("stepper_stop_on_trigger", map[string]interface{}{
+		"oid":        stepperYOid,
+		"trsync_oid": trsyncOid,
+	}); err != nil {
+		return fmt.Errorf("stepper_stop_on_trigger Y: %w", err)
+	}
+
+	// Set direction for BOTH steppers
+	// CoreXY: X = same direction, Y = opposite direction
+	dirX := 0
+	dirY := 0
+
+	if axis == "X" {
+		// X homing: both motors same direction
+		if homingDir < 0 {
+			dirX = 1
+			dirY = 1
+		}
+	} else {
+		// Y homing: motors opposite direction
+		if homingDir < 0 {
+			dirX = 1
+			dirY = 0
+		} else {
+			dirX = 0
+			dirY = 1
+		}
+	}
+
+	// Apply direction inversion
+	if stepperX.DirInvert {
+		dirX = 1 - dirX
+	}
+	if stepperY.DirInvert {
+		dirY = 1 - dirY
+	}
+
+	log.Printf("  CoreXY setting directions: X=%d Y=%d", dirX, dirY)
+
+	if err := e.mcu.SendCommand("set_next_step_dir", map[string]interface{}{
+		"oid": stepperXOid,
+		"dir": dirX,
+	}); err != nil {
+		return fmt.Errorf("set_next_step_dir X: %w", err)
+	}
+	if err := e.mcu.SendCommand("set_next_step_dir", map[string]interface{}{
+		"oid": stepperYOid,
+		"dir": dirY,
+	}); err != nil {
+		return fmt.Errorf("set_next_step_dir Y: %w", err)
+	}
+
+	// Queue steps for BOTH steppers
+	log.Printf("  CoreXY queue_step: interval=%d count=%d", intervalTicks, stepCount)
+	if err := e.mcu.SendCommand("queue_step", map[string]interface{}{
+		"oid":      stepperXOid,
+		"interval": intervalTicks,
+		"count":    stepCount,
+		"add":      0,
+	}); err != nil {
+		return fmt.Errorf("queue_step X: %w", err)
+	}
+	if err := e.mcu.SendCommand("queue_step", map[string]interface{}{
+		"oid":      stepperYOid,
+		"interval": intervalTicks,
+		"count":    stepCount,
+		"add":      0,
+	}); err != nil {
+		return fmt.Errorf("queue_step Y: %w", err)
+	}
+
+	// Reset step clock for BOTH steppers with same clock
+	log.Printf("  CoreXY reset_step_clock: clock=%d", uint32(startClock))
+	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
+		"oid":   stepperXOid,
+		"clock": uint32(startClock),
+	}); err != nil {
+		return fmt.Errorf("reset_step_clock X: %w", err)
+	}
+	if err := e.mcu.SendCommand("reset_step_clock", map[string]interface{}{
+		"oid":   stepperYOid,
+		"clock": uint32(startClock),
+	}); err != nil {
+		return fmt.Errorf("reset_step_clock Y: %w", err)
+	}
+
+	// Wait for homing to complete
+	log.Printf("  CoreXY waiting for endstop trigger...")
+	time.Sleep(time.Duration(homingTime*1000+500) * time.Millisecond)
+
+	// Query trsync state
+	resp, err = e.mcu.SendCommandWithResponse("trsync_trigger", map[string]interface{}{
+		"oid":    trsyncOid,
+		"reason": 2,
+	}, "trsync_state", 2*time.Second)
+	if err != nil {
+		log.Printf("  Warning: trsync_trigger query failed: %v", err)
+	}
+
+	log.Printf("  CoreXY %s homing complete", axis)
+	return nil
 }
 
 // executeSetExtruderTemp handles M104 (set extruder temperature).
